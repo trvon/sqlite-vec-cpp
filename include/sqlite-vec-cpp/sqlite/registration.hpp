@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sqlite3.h>
+
 #include "../utils/error.hpp"
 #include "enhanced_functions.hpp"
 #include "functions.hpp"

@@ -25,7 +25,7 @@ test_sqlite_functions = executable(
   'test_sqlite_functions',
   'test_sqlite_functions.cpp',
   include_directories: inc_dirs,
-  dependencies: [sqlite3_dep],
+  dependencies: [sqlite3_dep, dependency('sqlite-vec-cpp')],
 )
 
 test('Concepts and VectorView', test_concepts)

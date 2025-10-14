@@ -2,11 +2,9 @@
 // Maintains backward compatibility with original sqlite-vec C API
 // while leveraging modern C++20/23 implementation internally
 
-#include <sqlite3ext.h>
+#include <sqlite3.h>
 #include <sqlite-vec-cpp/sqlite/registration.hpp>
 #include <sqlite-vec-cpp/sqlite_vec.hpp>
-
-SQLITE_EXTENSION_INIT1
 
 // External C API entry point (maintains compatibility)
 extern "C" {
@@ -19,7 +17,7 @@ int sqlite3_vec_init(
     char **pzErrMsg,
     const sqlite3_api_routines *pApi
 ) {
-    SQLITE_EXTENSION_INIT2(pApi);
+    (void)pApi; // not using extension API; direct sqlite3.h
 
     try {
         // Register all vector functions from C++ implementation

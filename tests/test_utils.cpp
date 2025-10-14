@@ -1,5 +1,6 @@
 #include <cassert>
 #include <iostream>
+#include <numeric>
 #include <sqlite-vec-cpp/utils/array.hpp>
 
 using namespace sqlite_vec_cpp;

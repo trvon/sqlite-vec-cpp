@@ -2,6 +2,7 @@
 
 #include <array>
 #include <bit>
+#include <cassert>
 #include <climits>
 #include <cstdint>
 #include <span>

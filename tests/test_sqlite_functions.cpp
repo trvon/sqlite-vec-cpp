@@ -1,4 +1,6 @@
 #include <sqlite3.h>
+#include <sqlite-vec-cpp/sqlite_vec.hpp>
+
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -141,6 +143,7 @@ void test_vec_f32_json() {
     std::cout << "Testing vec_f32 with JSON input..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Create from JSON array
@@ -162,6 +165,7 @@ void test_vec_f32_blob() {
     std::cout << "Testing vec_f32 with blob input..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Create table with blob
@@ -186,6 +190,7 @@ void test_vec_int8() {
     std::cout << "Testing vec_int8..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     std::string length = db.exec_scalar("SELECT vec_length(vec_int8('[1, 2, 3, 4, 5]'))");
@@ -201,6 +206,7 @@ void test_vec_length() {
     std::cout << "Testing vec_length..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     assert(db.exec_scalar("SELECT vec_length(vec_f32('[1]'))") == "1");
@@ -214,6 +220,7 @@ void test_vec_to_json() {
     std::cout << "Testing vec_to_json..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     std::string json = db.exec_scalar("SELECT vec_to_json(vec_f32('[1.0, 2.5, 3.14]'))");
@@ -235,6 +242,7 @@ void test_distance_l2() {
     std::cout << "Testing vec_distance_l2..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Distance between [0,0] and [3,4] should be 5.0 (Euclidean distance, not squared)
@@ -254,6 +262,7 @@ void test_distance_l1() {
     std::cout << "Testing vec_distance_l1..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Manhattan distance between [0,0] and [3,4] should be 7
@@ -273,6 +282,7 @@ void test_distance_cosine() {
     std::cout << "Testing vec_distance_cosine..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Cosine distance between identical vectors should be 0
@@ -297,6 +307,7 @@ void test_vec_add() {
     std::cout << "Testing vec_add..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     std::string result =
@@ -314,6 +325,7 @@ void test_vec_sub() {
     std::cout << "Testing vec_sub..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     std::string result =
@@ -331,6 +343,7 @@ void test_vec_normalize() {
     std::cout << "Testing vec_normalize..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Normalize [3, 4] -> [0.6, 0.8]
@@ -351,6 +364,7 @@ void test_vec_slice() {
     std::cout << "Testing vec_slice..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Slice [1,2,3,4,5] from index 1 to 4 -> [2,3,4]
@@ -376,6 +390,7 @@ void test_vec_dot() {
     std::cout << "Testing vec_dot..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Dot product of [1,2,3] and [4,5,6] = 1*4 + 2*5 + 3*6 = 32
@@ -395,6 +410,7 @@ void test_vec_magnitude() {
     std::cout << "Testing vec_magnitude..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Magnitude of [3,4] should be 5
@@ -414,6 +430,7 @@ void test_vec_scale() {
     std::cout << "Testing vec_scale..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Scale [1,2,3] by 2 -> [2,4,6]
@@ -430,6 +447,7 @@ void test_vec_mean() {
     std::cout << "Testing vec_mean..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Mean of [1,2,3,4,5] should be 3
@@ -449,6 +467,7 @@ void test_vec_std() {
     std::cout << "Testing vec_std..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Standard deviation should be > 0 for varying data
@@ -464,6 +483,7 @@ void test_vec_min_max() {
     std::cout << "Testing vec_min and vec_max..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     std::string min_val = db.exec_scalar("SELECT vec_min(vec_f32('[3,1,4,1,5,9,2,6]'))");
@@ -481,6 +501,7 @@ void test_vec_clamp() {
     std::cout << "Testing vec_clamp..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Clamp [1,5,10] to [2,8] -> [2,5,8]
@@ -511,6 +532,7 @@ void test_error_handling() {
     std::cout << "Testing error handling..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Dimension mismatch
@@ -551,6 +573,7 @@ void test_integration_similarity_search() {
     std::cout << "Testing integration: similarity search..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Create table with vectors
@@ -578,6 +601,7 @@ void test_integration_vector_operations() {
     std::cout << "Testing integration: vector operations pipeline..." << std::endl;
 
     SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
     register_all_functions(db);
 
     // Complex pipeline: create, normalize, scale, and compute distance
