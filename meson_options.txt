@@ -1,0 +1,6 @@
+option('enable_tests', type: 'boolean', value: true, description: 'Build unit tests')
+option('enable_examples', type: 'boolean', value: false, description: 'Build example programs')
+option('enable_benchmarks', type: 'boolean', value: false, description: 'Build benchmark suite (requires Google Benchmark)')
+option('enable_simd_avx', type: 'boolean', value: true, description: 'Enable AVX SIMD optimizations')
+option('enable_simd_neon', type: 'boolean', value: true, description: 'Enable NEON SIMD optimizations')
+option('use_system_expected', type: 'boolean', value: false, description: 'Use system-provided tl::expected if C++23 unavailable')
