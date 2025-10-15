@@ -1,5 +1,83 @@
 #include <sqlite3.h>
+#include <cassert>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sqlite-vec-cpp/sqlite/registration.hpp>
 #include <sqlite-vec-cpp/sqlite_vec.hpp>
+
+// Forward declarations of existing tests (defined later in this file)
+void test_vec_f32_json();
+void test_vec_f32_blob();
+void test_vec_int8();
+void test_vec_length();
+void test_vec_to_json();
+void test_distance_l2();
+
+// New tests to validate vec0 virtual table lifecycle
+static void test_vec0_basic_create_insert_select() {
+    std::cout << "Testing vec0 virtual table create/insert/select..." << std::endl;
+
+    sqlite3* db = nullptr;
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK && db);
+
+    // Initialize sqlite-vec (registers vec0 module + functions)
+    sqlite3_vec_init(db, nullptr, nullptr);
+
+    // Create vec0 table with dimension 4
+    const char* create_sql = "CREATE VIRTUAL TABLE doc_embeddings USING vec0(embedding float[4])";
+    char* err = nullptr;
+    int rc = sqlite3_exec(db, create_sql, nullptr, nullptr, &err);
+    assert(rc == SQLITE_OK);
+
+    // Insert a vector (as JSON via vec_f32)
+    const char* insert_sql =
+        "INSERT INTO doc_embeddings(rowid, embedding) VALUES(NULL, vec_f32('[1,2,3,4]'))";
+    rc = sqlite3_exec(db, insert_sql, nullptr, nullptr, &err);
+    assert(rc == SQLITE_OK);
+
+    // Read it back via SELECT; expect 1 row and non-null blob
+    sqlite3_stmt* stmt = nullptr;
+    rc = sqlite3_prepare_v2(db, "SELECT rowid, embedding FROM doc_embeddings", -1, &stmt, nullptr);
+    assert(rc == SQLITE_OK && stmt);
+    rc = sqlite3_step(stmt);
+    assert(rc == SQLITE_ROW);
+    assert(sqlite3_column_type(stmt, 0) == SQLITE_INTEGER);
+    assert(sqlite3_column_type(stmt, 1) == SQLITE_BLOB);
+    sqlite3_finalize(stmt);
+
+    // Drop table (should remove shadow tables without error)
+    rc = sqlite3_exec(db, "DROP TABLE doc_embeddings", nullptr, nullptr, &err);
+    assert(rc == SQLITE_OK);
+
+    sqlite3_close(db);
+    std::cout << "  \xE2\x9C\x93 vec0 create/insert/select/drop works" << std::endl;
+}
+
+static void test_vec0_update_delete_paths() {
+    std::cout << "Testing vec0 update/delete paths..." << std::endl;
+
+    sqlite3* db = nullptr;
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK && db);
+    sqlite3_vec_init(db, nullptr, nullptr);
+
+    assert(sqlite3_exec(db, "CREATE VIRTUAL TABLE t USING vec0(embedding float[2])", nullptr,
+                        nullptr, nullptr) == SQLITE_OK);
+    assert(sqlite3_exec(db, "INSERT INTO t(rowid, embedding) VALUES(NULL, vec_f32('[10,20]'))",
+                        nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    // Update rowid 1
+    assert(sqlite3_exec(db, "UPDATE t SET embedding=vec_f32('[11,22]') WHERE rowid=1", nullptr,
+                        nullptr, nullptr) == SQLITE_OK);
+
+    // Delete row
+    assert(sqlite3_exec(db, "DELETE FROM t WHERE rowid=1", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    sqlite3_close(db);
+    std::cout << "  \xE2\x9C\x93 vec0 update/delete works" << std::endl;
+}
+
+// Keep a single main() at end of file
 
 #include <cassert>
 #include <cmath>

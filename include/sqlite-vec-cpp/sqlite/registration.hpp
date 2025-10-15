@@ -6,13 +6,20 @@
 #include "enhanced_functions.hpp"
 #include "functions.hpp"
 #include "utility_functions.hpp"
+#include "vec0_module.hpp"
 
 namespace sqlite_vec_cpp::sqlite {
 
-/// Register all vector distance functions with SQLite
+/// Register all vector distance functions and vec0 virtual table module with SQLite
 inline Result<void> register_all_functions(sqlite3* db) {
     if (!db) {
         return err<void>(Error::invalid_argument("database handle is null"));
+    }
+
+    // Register vec0 virtual table module first (critical for CREATE VIRTUAL TABLE)
+    auto vec0_result = register_vec0_module(db);
+    if (!vec0_result) {
+        return vec0_result;
     }
 
     // Register core distance functions (compatible with original sqlite-vec)
