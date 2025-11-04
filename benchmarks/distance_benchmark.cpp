@@ -3,10 +3,12 @@
 
 #include <random>
 #include <vector>
-#include "vec_core.hpp"
+#include "../include/sqlite-vec-cpp/distances/cosine.hpp"
+#include "../include/sqlite-vec-cpp/distances/l1.hpp"
+#include "../include/sqlite-vec-cpp/distances/l2.hpp"
 #include <benchmark/benchmark.h>
 
-namespace sqlite_vec {
+using namespace sqlite_vec_cpp::distances;
 
 // Random vector generator
 template <typename T>
@@ -202,7 +204,5 @@ static void BM_L2_Float_Batch_1000x128(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * 1000 * 128);
 }
 BENCHMARK(BM_L2_Float_Batch_1000x128);
-
-} // namespace sqlite_vec
 
 BENCHMARK_MAIN();

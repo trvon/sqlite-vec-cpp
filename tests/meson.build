@@ -28,7 +28,23 @@ test_sqlite_functions = executable(
   dependencies: [sqlite3_dep, dependency('sqlite-vec-cpp')],
 )
 
+test_batch_distance = executable(
+  'test_batch_distance',
+  'test_batch_distance.cpp',
+  include_directories: inc_dirs,
+  dependencies: [sqlite3_dep],
+)
+
+test_hnsw = executable(
+  'test_hnsw',
+  'test_hnsw.cpp',
+  include_directories: inc_dirs,
+  dependencies: [sqlite3_dep],
+)
+
 test('Concepts and VectorView', test_concepts)
 test('Distance Metrics', test_distances)
 test('Utilities (Array)', test_utils)
 test('SQLite Functions (Comprehensive)', test_sqlite_functions, timeout: 60)
+test('Batch Distance Operations', test_batch_distance)
+test('HNSW Index', test_hnsw, timeout: 120)
