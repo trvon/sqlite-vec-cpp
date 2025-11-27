@@ -37,6 +37,9 @@ struct sqlite3;
 struct sqlite3_api_routines;
 
 // Main entry point (maintains compatibility with original sqlite-vec)
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
 int sqlite3_vec_init(sqlite3* db, char** pzErrMsg, const sqlite3_api_routines* pApi);
 
 // Additional C API functions
