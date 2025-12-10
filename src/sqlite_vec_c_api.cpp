@@ -12,11 +12,7 @@ extern "C" {
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
-int sqlite3_vec_init(
-    sqlite3 *db,
-    char **pzErrMsg,
-    const sqlite3_api_routines *pApi
-) {
+int sqlite3_vec_init(sqlite3* db, char** pzErrMsg, const sqlite3_api_routines* pApi) {
     (void)pApi; // not using extension API; direct sqlite3.h
 
     try {

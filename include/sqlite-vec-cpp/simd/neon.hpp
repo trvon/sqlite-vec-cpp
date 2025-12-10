@@ -117,25 +117,26 @@ inline std::int32_t l1_distance_int8_neon(std::span<const std::int8_t> a,
     std::size_t i = 0;
 
     // Process 64 elements at a time (4 × 16)
+    // Note: vabdq_s8 returns int8x16_t; reinterpret as uint8x16_t since abs diff is non-negative
     while (i + 63 < size) {
         int8x16_t v1 = vld1q_s8(&a[i]);
         int8x16_t v2 = vld1q_s8(&b[i]);
-        uint8x16_t diff1 = vabdq_s8(v1, v2);
+        uint8x16_t diff1 = vreinterpretq_u8_s8(vabdq_s8(v1, v2));
         acc1 = vaddq_s32(acc1, vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(diff1))));
 
         v1 = vld1q_s8(&a[i + 16]);
         v2 = vld1q_s8(&b[i + 16]);
-        uint8x16_t diff2 = vabdq_s8(v1, v2);
+        uint8x16_t diff2 = vreinterpretq_u8_s8(vabdq_s8(v1, v2));
         acc2 = vaddq_s32(acc2, vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(diff2))));
 
         v1 = vld1q_s8(&a[i + 32]);
         v2 = vld1q_s8(&b[i + 32]);
-        uint8x16_t diff3 = vabdq_s8(v1, v2);
+        uint8x16_t diff3 = vreinterpretq_u8_s8(vabdq_s8(v1, v2));
         acc3 = vaddq_s32(acc3, vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(diff3))));
 
         v1 = vld1q_s8(&a[i + 48]);
         v2 = vld1q_s8(&b[i + 48]);
-        uint8x16_t diff4 = vabdq_s8(v1, v2);
+        uint8x16_t diff4 = vreinterpretq_u8_s8(vabdq_s8(v1, v2));
         acc4 = vaddq_s32(acc4, vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(diff4))));
 
         i += 64;
@@ -145,7 +146,7 @@ inline std::int32_t l1_distance_int8_neon(std::span<const std::int8_t> a,
     while (i + 15 < size) {
         int8x16_t v1 = vld1q_s8(&a[i]);
         int8x16_t v2 = vld1q_s8(&b[i]);
-        uint8x16_t diff = vabdq_s8(v1, v2);
+        uint8x16_t diff = vreinterpretq_u8_s8(vabdq_s8(v1, v2));
         acc1 = vaddq_s32(acc1, vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(diff))));
         i += 16;
     }
