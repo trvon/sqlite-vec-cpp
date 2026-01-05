@@ -11,9 +11,11 @@
 #include <sqlite-vec-cpp/distances/l2.hpp>
 #include <sqlite-vec-cpp/index/hnsw.hpp>
 #include <sqlite-vec-cpp/index/hnsw_persistence.hpp>
+#include <sqlite-vec-cpp/utils/float16.hpp>
 
 using namespace sqlite_vec_cpp::index;
 using namespace sqlite_vec_cpp::distances;
+using namespace sqlite_vec_cpp::utils;
 
 // Helper to compare floats with tolerance
 bool approx_equal(float a, float b, float epsilon = 0.001f) {
@@ -398,8 +400,346 @@ void test_persistence_roundtrip() {
     std::cout << "    - Search results match exactly" << std::endl;
 }
 
+// Test 11: Soft deletion
+void test_soft_deletion() {
+    std::cout << "Test 11: Soft deletion..." << std::endl;
+
+    HNSWIndex<float, L2Metric<float>> index;
+
+    // Create vectors in a known pattern
+    std::vector<std::vector<float>> vectors = {
+        {0.0f, 0.0f},  // 0: origin
+        {1.0f, 0.0f},  // 1: right
+        {0.0f, 1.0f},  // 2: up
+        {-1.0f, 0.0f}, // 3: left
+        {0.0f, -1.0f}, // 4: down
+        {2.0f, 0.0f},  // 5: far right
+        {3.0f, 0.0f},  // 6: very far right
+    };
+
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        index.insert(i, std::span{vectors[i]});
+    }
+
+    assert(index.size() == 7);
+    assert(index.active_size() == 7);
+    assert(index.deleted_count() == 0);
+
+    // Search before deletion - query near far right should find 5, 6
+    std::vector<float> query = {2.5f, 0.0f};
+    auto results_before = index.search(std::span{query}, 3, 10);
+    assert(results_before.size() == 3);
+
+    // Should be 6, 5, 1 in order of distance
+    std::unordered_set<size_t> before_ids;
+    for (const auto& [id, dist] : results_before) {
+        before_ids.insert(id);
+    }
+    assert(before_ids.count(5) == 1);
+    assert(before_ids.count(6) == 1);
+
+    // Soft delete node 5 (far right)
+    index.remove(5);
+    assert(index.is_deleted(5));
+    assert(index.size() == 7);        // Total size unchanged
+    assert(index.active_size() == 6); // Active size decremented
+    assert(index.deleted_count() == 1);
+
+    // Search after deletion - should not include 5
+    auto results_after = index.search(std::span{query}, 3, 10);
+    for (const auto& [id, dist] : results_after) {
+        assert(id != 5); // Deleted node should not appear
+    }
+
+    // Verify 6 is still findable
+    bool found_6 = false;
+    for (const auto& [id, dist] : results_after) {
+        if (id == 6)
+            found_6 = true;
+    }
+    assert(found_6);
+
+    std::cout << "  ✓ Soft deletion passed" << std::endl;
+}
+
+// Test 12: Restore deleted nodes
+void test_restore_deletion() {
+    std::cout << "Test 12: Restore deleted nodes..." << std::endl;
+
+    HNSWIndex<float, L2Metric<float>> index;
+
+    std::vector<float> vec1 = {0.0f, 0.0f};
+    std::vector<float> vec2 = {1.0f, 0.0f};
+    index.insert(0, std::span{vec1});
+    index.insert(1, std::span{vec2});
+
+    // Delete node 1
+    index.remove(1);
+    assert(index.is_deleted(1));
+    assert(index.active_size() == 1);
+
+    // Search should not find node 1
+    std::vector<float> query = {0.5f, 0.0f};
+    auto results = index.search(std::span{query}, 2, 10);
+    for (const auto& [id, dist] : results) {
+        assert(id != 1);
+    }
+
+    // Restore node 1
+    bool restored = index.restore(1);
+    assert(restored);
+    assert(!index.is_deleted(1));
+    assert(index.active_size() == 2);
+
+    // Search should now find node 1
+    results = index.search(std::span{query}, 2, 10);
+    bool found_1 = false;
+    for (const auto& [id, dist] : results) {
+        if (id == 1)
+            found_1 = true;
+    }
+    assert(found_1);
+
+    // Restore non-existent node should return false
+    assert(!index.restore(99));
+
+    std::cout << "  ✓ Restore deletion passed" << std::endl;
+}
+
+// Test 13: Compaction
+void test_compaction() {
+    std::cout << "Test 13: Compaction..." << std::endl;
+
+    constexpr size_t num_vectors = 100;
+    constexpr size_t dim = 10;
+    std::mt19937 rng(42);
+
+    HNSWIndex<float, L2Metric<float>> index;
+    std::vector<std::vector<float>> vectors;
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        vectors.push_back(generate_vector(dim, rng));
+        index.insert(i, std::span{vectors[i]});
+    }
+
+    // Delete 30% of nodes
+    for (size_t i = 0; i < 30; ++i) {
+        index.remove(i);
+    }
+
+    assert(index.size() == 100);
+    assert(index.active_size() == 70);
+    assert(index.needs_compaction(0.2f)); // 30% deleted > 20% threshold
+
+    // Compact the index
+    auto compacted = index.compact();
+
+    assert(compacted.size() == 70);
+    assert(compacted.active_size() == 70);
+    assert(compacted.deleted_count() == 0);
+    assert(!compacted.needs_compaction());
+
+    // Verify search still works on compacted index
+    auto query = generate_vector(dim, rng);
+    auto results = compacted.search(std::span{query}, 10, 50);
+    assert(results.size() == 10);
+
+    // None of the results should be from deleted IDs
+    for (const auto& [id, dist] : results) {
+        assert(id >= 30); // IDs 0-29 were deleted
+    }
+
+    std::cout << "  ✓ Compaction passed" << std::endl;
+}
+
+// Test 14: Isolate deleted nodes
+void test_isolate_deleted() {
+    std::cout << "Test 14: Isolate deleted nodes..." << std::endl;
+
+    HNSWIndex<float, L2Metric<float>> index;
+
+    // Create a small graph
+    std::vector<std::vector<float>> vectors = {
+        {0.0f, 0.0f},
+        {1.0f, 0.0f},
+        {2.0f, 0.0f},
+        {3.0f, 0.0f},
+    };
+
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        index.insert(i, std::span{vectors[i]});
+    }
+
+    // Delete middle node
+    index.remove(1);
+    index.remove(2);
+
+    // Isolate - removes edges to deleted nodes
+    index.isolate_deleted();
+
+    // Search should still work
+    std::vector<float> query = {3.5f, 0.0f};
+    auto results = index.search(std::span{query}, 2, 10);
+
+    // Should find 3 and 0 (skipping deleted 1, 2)
+    assert(results.size() == 2);
+    for (const auto& [id, dist] : results) {
+        assert(id == 0 || id == 3);
+    }
+
+    std::cout << "  ✓ Isolate deleted passed" << std::endl;
+}
+
+// Test 15: Clear deletions
+void test_clear_deletions() {
+    std::cout << "Test 15: Clear deletions..." << std::endl;
+
+    HNSWIndex<float, L2Metric<float>> index;
+
+    std::vector<float> vec1 = {0.0f, 0.0f};
+    std::vector<float> vec2 = {1.0f, 0.0f};
+    index.insert(0, std::span{vec1});
+    index.insert(1, std::span{vec2});
+
+    index.remove(0);
+    index.remove(1);
+    assert(index.deleted_count() == 2);
+
+    index.clear_deletions();
+    assert(index.deleted_count() == 0);
+    assert(!index.is_deleted(0));
+    assert(!index.is_deleted(1));
+    assert(index.active_size() == 2);
+
+    std::cout << "  ✓ Clear deletions passed" << std::endl;
+}
+
+// Test 16: Parallel build
+void test_parallel_build() {
+    std::cout << "Test 16: Parallel build..." << std::endl;
+
+    constexpr size_t num_vectors = 1000;
+    constexpr size_t dim = 64;
+
+    std::mt19937 rng(42);
+    HNSWIndex<float, L2Metric<float>> index;
+
+    // Generate vectors
+    std::vector<std::vector<float>> vectors;
+    std::vector<std::span<const float>> spans;
+    std::vector<size_t> ids;
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        vectors.push_back(generate_vector(dim, rng));
+        spans.emplace_back(vectors.back());
+        ids.push_back(i);
+    }
+
+    // Parallel build
+    index.build_parallel(std::span{ids}, std::span{spans}, 4);
+
+    assert(index.size() == num_vectors);
+
+    // Test search still works
+    auto query = generate_vector(dim, rng);
+    auto results = index.search(std::span{query}, 10, 50);
+    assert(results.size() == 10);
+
+    std::cout << "  ✓ Parallel build passed (built " << num_vectors << " vectors)" << std::endl;
+}
+
+// Test 17: fp16 storage
+void test_fp16_storage() {
+    std::cout << "Test 17: fp16 storage..." << std::endl;
+
+    HNSWIndex<sqlite_vec_cpp::utils::float16_t, L2Metric<float>> index;
+
+    // Create vectors in a known pattern
+    std::vector<std::vector<float>> f32_vectors = {
+        {0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}, {-1.0f, 0.0f}, {0.0f, -1.0f},
+    };
+
+    // Insert as fp16
+    for (size_t i = 0; i < f32_vectors.size(); ++i) {
+        auto f16_vec = sqlite_vec_cpp::utils::to_float16(std::span{f32_vectors[i]});
+        index.insert(i, std::span{f16_vec});
+    }
+
+    assert(index.size() == 5);
+
+    // Search should still work (queries are float, storage is fp16)
+    std::vector<float> query = {0.5f, 0.0f};
+    auto results = index.search(std::span{query}, 3, 10);
+
+    assert(results.size() == 3);
+    // ID 1 (1.0, 0.0) or ID 0 (0.0, 0.0) should be closest to (0.5, 0.0) - both at L2 distance 0.5
+    assert(results[0].first == 1 || results[0].first == 0);
+    // Distance should be reasonable (L2 distance from (0.5,0) to (1,0) or (0,0) is 0.5)
+    assert(results[0].second < 0.6f);
+
+    std::cout << "  ✓ fp16 storage passed" << std::endl;
+}
+
+// Test 18: fp16 accuracy
+void test_fp16_accuracy() {
+    std::cout << "Test 18: fp16 accuracy..." << std::endl;
+
+    constexpr size_t num_vectors = 100;
+    constexpr size_t dim = 64;
+
+    std::mt19937 rng(42);
+
+    // Build float32 index
+    HNSWIndex<float, L2Metric<float>> f32_index;
+    std::vector<std::vector<float>> f32_vectors;
+    f32_vectors.reserve(num_vectors);
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        f32_vectors.push_back(generate_vector(dim, rng));
+        f32_index.insert(i, std::span{f32_vectors.back()});
+    }
+
+    // Build fp16 index with same vectors
+    HNSWIndex<sqlite_vec_cpp::utils::float16_t, L2Metric<float>> f16_index;
+    for (size_t i = 0; i < num_vectors; ++i) {
+        auto f16_vec = sqlite_vec_cpp::utils::to_float16(std::span{f32_vectors[i]});
+        f16_index.insert(i, std::span{f16_vec});
+    }
+
+    // Generate random query
+    auto query = generate_vector(dim, rng);
+
+    // Search both indices
+    auto f32_results = f32_index.search(std::span{query}, 10, 50);
+    auto f16_results = f16_index.search(std::span{query}, 10, 50);
+
+    assert(f32_results.size() == 10);
+    assert(f16_results.size() == 10);
+
+    // Check that most results match
+    std::unordered_set<size_t> f32_ids;
+    for (const auto& [id, _] : f32_results) {
+        f32_ids.insert(id);
+    }
+
+    size_t matches = 0;
+    for (const auto& [id, _] : f16_results) {
+        if (f32_ids.count(id)) {
+            matches++;
+        }
+    }
+
+    // At least 7 out of 10 should match (fp16 quantization is lossy but shouldn't change results
+    // much)
+    float match_rate = static_cast<float>(matches) / 10.0f;
+    std::cout << "  fp16 match rate: " << (match_rate * 100) << "%" << std::endl;
+    assert(match_rate >= 0.7f);
+
+    std::cout << "  ✓ fp16 accuracy passed" << std::endl;
+}
+
 int main() {
-    std::cout << "Running HNSW tests...\\n" << std::endl;
+    std::cout << "Running HNSW tests...\n" << std::endl;
 
     test_node_creation();
     test_layer_assignment();
@@ -411,7 +751,15 @@ int main() {
     test_single_vector();
     test_batch_build();
     test_persistence_roundtrip();
+    test_soft_deletion();
+    test_restore_deletion();
+    test_compaction();
+    test_isolate_deleted();
+    test_clear_deletions();
+    test_parallel_build();
+    test_fp16_storage();
+    test_fp16_accuracy();
 
-    std::cout << "\\nAll HNSW tests passed!" << std::endl;
+    std::cout << "\nAll HNSW tests passed!" << std::endl;
     return 0;
 }

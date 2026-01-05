@@ -5,10 +5,19 @@
 
 namespace sqlite_vec_cpp::concepts {
 
+namespace detail {
+template <typename T, typename = void> struct has_to_float : std::false_type {};
+
+template <typename T>
+struct has_to_float<T, std::void_t<decltype(std::declval<T>().to_float())>> : std::true_type {};
+} // namespace detail
+
 /// Concept for types that can be used as vector elements
 /// Matches: float, int8_t, int16_t, uint8_t, etc.
+/// Also matches custom float types like float16_t that have to_float() method
 template <typename T>
-concept VectorElement = std::is_arithmetic_v<T> && !std::is_same_v<T, bool>;
+concept VectorElement =
+    (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>) || detail::has_to_float<T>::value;
 
 /// Concept for floating-point vector elements
 template <typename T>
@@ -43,6 +52,10 @@ template <typename T> constexpr bool is_int16_v = std::is_same_v<T, std::int16_t
 
 /// Check if type is uint8_t
 template <typename T> constexpr bool is_uint8_v = std::is_same_v<T, std::uint8_t>;
+
+/// Check if type is a custom float type (float16_t, bfloat16_t, etc.)
+template <typename T>
+constexpr bool is_custom_float_v = detail::has_to_float<T>::value && !std::is_arithmetic_v<T>;
 
 /// Check if type requires SIMD alignment
 template <VectorElement T> constexpr bool requires_simd_alignment_v = is_float_v<T> || is_int8_v<T>;

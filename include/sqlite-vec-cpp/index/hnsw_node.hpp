@@ -4,11 +4,13 @@
 #include <span>
 #include <vector>
 #include "../concepts/vector_element.hpp"
+#include "../utils/float16.hpp"
 
 namespace sqlite_vec_cpp::index {
 
 /// Node in the HNSW graph
 /// Each node represents a vector with connections to neighbors at each layer
+/// @tparam T Storage type (float or float16_t)
 template <concepts::VectorElement T> struct HNSWNode {
     size_t id;                              ///< External ID (e.g., SQLite rowid)
     std::vector<T> vector;                  ///< Embedded vector (owned copy)
@@ -41,8 +43,15 @@ template <concepts::VectorElement T> struct HNSWNode {
                           layer_edges.end());
     }
 
-    /// Get vector as span
+    /// Get vector as span (same storage type)
     std::span<const T> as_span() const { return std::span{vector}; }
+
+    /// Get vector as float32 span (converts if needed)
+    template <typename U = T>
+    requires std::same_as<U, utils::float16_t>
+    std::vector<float> as_float32() const {
+        return utils::to_float32(std::span<const utils::float16_t>(vector));
+    }
 
     /// Number of layers (highest layer + 1)
     size_t num_layers() const { return edges.size(); }
@@ -52,5 +61,9 @@ template <concepts::VectorElement T> struct HNSWNode {
         return layer < edges.size() && !edges[layer].empty();
     }
 };
+
+/// Convenience type aliases
+using HNSWNodeF32 = HNSWNode<float>;
+using HNSWNodeF16 = HNSWNode<utils::float16_t>;
 
 } // namespace sqlite_vec_cpp::index

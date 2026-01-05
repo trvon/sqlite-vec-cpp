@@ -4,6 +4,7 @@
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include "hnsw.hpp"
 #include "hnsw_node.hpp"
 
@@ -13,7 +14,7 @@ namespace sqlite_vec_cpp::index {
 /// Provides serialization/deserialization to SQLite shadow tables
 ///
 /// Shadow Table Schema:
-/// - {table}_hnsw_meta: Stores index metadata (config, entry point, etc.)
+/// - {table}_hnsw_meta: Stores index metadata (config, entry point, deleted IDs, etc.)
 /// - {table}_hnsw_nodes: Stores HNSW graph structure (nodes + edges)
 
 /// Serialize HNSW index configuration to blob
@@ -96,6 +97,52 @@ typename HNSWIndex<T, Metric>::Config deserialize_hnsw_config(const void* blob, 
     config.ml_factor = read_f32();
 
     return config;
+}
+
+/// Serialize deleted IDs set to blob
+/// Format: count(8) + id1(8) + id2(8) + ...
+inline std::vector<uint8_t> serialize_deleted_ids(const std::unordered_set<size_t>& deleted_ids) {
+    std::vector<uint8_t> blob;
+    blob.reserve(8 + deleted_ids.size() * 8);
+
+    auto write_u64 = [&](uint64_t val) {
+        for (int i = 0; i < 8; ++i) {
+            blob.push_back((val >> (i * 8)) & 0xFF);
+        }
+    };
+
+    write_u64(deleted_ids.size());
+    for (size_t id : deleted_ids) {
+        write_u64(id);
+    }
+
+    return blob;
+}
+
+/// Deserialize deleted IDs set from blob
+inline std::unordered_set<size_t> deserialize_deleted_ids(const void* blob, size_t size) {
+    const uint8_t* data = static_cast<const uint8_t*>(blob);
+    size_t offset = 0;
+
+    auto read_u64 = [&]() -> uint64_t {
+        if (offset + 8 > size)
+            throw std::runtime_error("Deleted IDs blob truncated");
+        uint64_t val = 0;
+        for (int i = 0; i < 8; ++i) {
+            val |= (static_cast<uint64_t>(data[offset++]) << (i * 8));
+        }
+        return val;
+    };
+
+    uint64_t count = read_u64();
+    std::unordered_set<size_t> deleted_ids;
+    deleted_ids.reserve(count);
+
+    for (uint64_t i = 0; i < count; ++i) {
+        deleted_ids.insert(read_u64());
+    }
+
+    return deleted_ids;
 }
 
 /// Serialize HNSW node to blob
@@ -279,6 +326,29 @@ int save_hnsw_index(sqlite3* db, const char* schema, const char* table,
         return rc;
     }
 
+    // Save deleted IDs if any
+    if (index.deleted_count() > 0) {
+        std::ostringstream deleted_sql;
+        deleted_sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
+                    << "_hnsw_meta\" (key, value) VALUES ('deleted_ids', ?)";
+
+        rc = sqlite3_prepare_v2(db, deleted_sql.str().c_str(), -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            return rc;
+        }
+
+        auto deleted_blob = serialize_deleted_ids(index.deleted_ids());
+        sqlite3_bind_blob(stmt, 1, deleted_blob.data(), deleted_blob.size(), SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        if (rc != SQLITE_DONE) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            return rc;
+        }
+    }
+
     // Save all nodes
     std::ostringstream nodes_sql;
     nodes_sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
@@ -400,9 +470,284 @@ HNSWIndex<T, Metric> load_hnsw_index(sqlite3* db, const char* schema, const char
         throw std::runtime_error("Failed to iterate HNSW nodes");
     }
 
-    // Use factory method to reconstruct index
+    // Try to load deleted IDs (optional - may not exist in old saved indexes)
+    std::unordered_set<size_t> deleted_ids;
+    std::ostringstream deleted_sql;
+    deleted_sql << "SELECT value FROM \"" << schema << "\".\"" << table
+                << "_hnsw_meta\" WHERE key='deleted_ids'";
+
+    rc = sqlite3_prepare_v2(db, deleted_sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            const void* deleted_blob = sqlite3_column_blob(stmt, 0);
+            int deleted_size = sqlite3_column_bytes(stmt, 0);
+            if (deleted_blob && deleted_size > 0) {
+                deleted_ids = deserialize_deleted_ids(deleted_blob, deleted_size);
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    // Use factory method to reconstruct index with deleted IDs
     return HNSWIndex<T, Metric>::from_serialized(config, entry_point_id, entry_point_layer,
-                                                 std::move(nodes));
+                                                 std::move(nodes), std::move(deleted_ids));
+}
+
+/// Save a single node incrementally (for incremental persistence)
+/// @return SQLITE_OK on success, or error code
+template <typename T>
+int save_hnsw_node_incremental(sqlite3* db, const char* schema, const char* table,
+                               const HNSWNode<T>& node, char** pzErr) {
+    std::ostringstream sql;
+    sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
+        << "_hnsw_nodes\" (node_id, data) VALUES (?, ?)";
+
+    sqlite3_stmt* stmt;
+    int rc = sqlite3_prepare_v2(db, sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("Failed to prepare incremental node insert");
+        return rc;
+    }
+
+    auto node_blob = serialize_hnsw_node(node);
+    sqlite3_bind_int64(stmt, 1, node.id);
+    sqlite3_bind_blob(stmt, 2, node_blob.data(), node_blob.size(), SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE && pzErr) {
+        *pzErr = sqlite3_mprintf("Failed to save HNSW node %zu", node.id);
+    }
+
+    return rc;
+}
+
+/// Save multiple nodes incrementally (batch version for efficiency)
+/// @param nodes_to_save Vector of node IDs to save (only new/modified nodes)
+/// @return SQLITE_OK on success, or error code
+template <typename T, typename Metric>
+int save_hnsw_nodes_incremental(sqlite3* db, const char* schema, const char* table,
+                                const HNSWIndex<T, Metric>& index,
+                                std::span<const size_t> nodes_to_save, char** pzErr) {
+    if (nodes_to_save.empty()) {
+        return SQLITE_OK;
+    }
+
+    int rc = sqlite3_exec(db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("Failed to begin transaction for incremental save");
+        return rc;
+    }
+
+    std::ostringstream sql;
+    sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
+        << "_hnsw_nodes\" (node_id, data) VALUES (?, ?)";
+
+    sqlite3_stmt* stmt;
+    rc = sqlite3_prepare_v2(db, sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("Failed to prepare incremental nodes statement");
+        return rc;
+    }
+
+    for (size_t node_id : nodes_to_save) {
+        const typename HNSWIndex<T, Metric>::NodeType* node = index.get_node(node_id);
+        if (!node) {
+            continue;
+        }
+
+        auto node_blob = serialize_hnsw_node(*node);
+
+        sqlite3_reset(stmt);
+        sqlite3_bind_int64(stmt, 1, node_id);
+        sqlite3_bind_blob(stmt, 2, node_blob.data(), node_blob.size(), SQLITE_TRANSIENT);
+
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            if (pzErr)
+                *pzErr = sqlite3_mprintf("Failed to save HNSW node %zu", node_id);
+            return rc;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+
+    rc = sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+    return rc;
+}
+
+/// Load only new nodes since last persistence (for incremental loading)
+/// @param last_saved_id Load only nodes with ID > last_saved_id
+/// @return Map of node_id -> node for newly loaded nodes
+template <typename T>
+std::unordered_map<size_t, HNSWNode<T>>
+load_hnsw_nodes_incremental(sqlite3* db, const char* schema, const char* table,
+                            size_t last_saved_id, char** pzErr) {
+    std::ostringstream sql;
+    sql << "SELECT node_id, data FROM \"" << schema << "\".\"" << table
+        << "_hnsw_nodes\" WHERE node_id > " << last_saved_id << " ORDER BY node_id";
+
+    sqlite3_stmt* stmt;
+    int rc = sqlite3_prepare_v2(db, sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("Failed to prepare incremental load");
+        throw std::runtime_error("Failed to prepare incremental load");
+    }
+
+    std::unordered_map<size_t, HNSWNode<T>> new_nodes;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        size_t node_id = sqlite3_column_int64(stmt, 0);
+        const void* node_blob = sqlite3_column_blob(stmt, 1);
+        int node_size = sqlite3_column_bytes(stmt, 1);
+
+        HNSWNode<T> node = deserialize_hnsw_node<T>(node_blob, node_size);
+        new_nodes.emplace(node_id, std::move(node));
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("Failed to iterate HNSW nodes");
+        throw std::runtime_error("Failed to iterate HNSW nodes");
+    }
+
+    return new_nodes;
+}
+
+/// Get the maximum node ID currently persisted (for incremental persistence tracking)
+template <typename T>
+size_t get_max_persisted_node_id(sqlite3* db, const char* schema, const char* table, char** pzErr) {
+    std::ostringstream sql;
+    sql << "SELECT MAX(node_id) FROM \"" << schema << "\".\"" << table << "_hnsw_nodes\"";
+
+    sqlite3_stmt* stmt;
+    int rc = sqlite3_prepare_v2(db, sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("Failed to prepare max node ID query");
+        throw std::runtime_error("Failed to prepare max node ID query");
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return 0; // No nodes persisted yet
+    }
+
+    int64_t max_id = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    return static_cast<size_t>(max_id);
+}
+
+/// Checkpoint: Save metadata for incremental persistence coordination
+/// Saves current entry point and deleted IDs so incremental loads know where to resume
+template <typename T, typename Metric>
+int save_hnsw_checkpoint(sqlite3* db, const char* schema, const char* table,
+                         const HNSWIndex<T, Metric>& index, char** pzErr) {
+    int rc = sqlite3_exec(db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("Failed to begin checkpoint transaction");
+        return rc;
+    }
+
+    // Save entry point
+    std::ostringstream entry_sql;
+    entry_sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
+              << "_hnsw_meta\" (key, value) VALUES ('entry_point', ?)";
+
+    sqlite3_stmt* stmt;
+    rc = sqlite3_prepare_v2(db, entry_sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return rc;
+    }
+
+    uint64_t entry_data[2] = {index.entry_point(), index.max_layer()};
+    sqlite3_bind_blob(stmt, 1, entry_data, sizeof(entry_data), SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return rc;
+    }
+
+    // Save deleted IDs
+    std::ostringstream deleted_sql;
+    deleted_sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
+                << "_hnsw_meta\" (key, value) VALUES ('deleted_ids', ?)";
+
+    rc = sqlite3_prepare_v2(db, deleted_sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return rc;
+    }
+
+    auto deleted_blob = serialize_deleted_ids(index.deleted_ids());
+    sqlite3_bind_blob(stmt, 1, deleted_blob.data(), deleted_blob.size(), SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return rc;
+    }
+
+    rc = sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+    return rc;
+}
+
+/// Get checkpoint info: returns (entry_point_id, entry_point_layer, max_node_id)
+template <typename T, typename Metric>
+std::tuple<size_t, size_t, size_t> get_hnsw_checkpoint_info(sqlite3* db, const char* schema,
+                                                            const char* table) {
+    size_t entry_point_id = 0;
+    size_t entry_point_layer = 0;
+    size_t max_node_id = 0;
+
+    // Load entry point
+    std::ostringstream entry_sql;
+    entry_sql << "SELECT value FROM \"" << schema << "\".\"" << table
+              << "_hnsw_meta\" WHERE key='entry_point'";
+
+    sqlite3_stmt* stmt;
+    int rc = sqlite3_prepare_v2(db, entry_sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            const uint64_t* entry_data = static_cast<const uint64_t*>(sqlite3_column_blob(stmt, 0));
+            entry_point_id = entry_data[0];
+            entry_point_layer = entry_data[1];
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    // Get max node ID
+    std::ostringstream max_sql;
+    max_sql << "SELECT MAX(node_id) FROM \"" << schema << "\".\"" << table << "_hnsw_nodes\"";
+
+    rc = sqlite3_prepare_v2(db, max_sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+            max_node_id = static_cast<size_t>(sqlite3_column_int64(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    return {entry_point_id, entry_point_layer, max_node_id};
 }
 
 } // namespace sqlite_vec_cpp::index
