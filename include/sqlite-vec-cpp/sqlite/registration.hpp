@@ -63,6 +63,41 @@ inline Result<void> register_all_functions(sqlite3* db) {
         return err<void>(Error::sqlite_error("Failed to register vec_type", rc));
     }
 
+    // Register vec_f32 function (vector creation from JSON)
+    rc = sqlite3_create_function_v2(db, "vec_f32", 1,
+                                    SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_SUBTYPE |
+                                        SQLITE_RESULT_SUBTYPE,
+                                    nullptr, vec_f32, nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        return err<void>(Error::sqlite_error("Failed to register vec_f32", rc));
+    }
+
+    // Register vec_f32_simple function (for vec0 compatibility)
+    // This version doesn't set subtype so virtual table xUpdate can access blob
+    rc = sqlite3_create_function_v2(db, "vec_f32_simple", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                                    nullptr, vec_f32_simple, nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        return err<void>(Error::sqlite_error("Failed to register vec_f32_simple", rc));
+    }
+
+    // Register vec_int8 function (int8 vector creation from JSON)
+    rc = sqlite3_create_function_v2(db, "vec_int8", 1,
+                                    SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_SUBTYPE |
+                                        SQLITE_RESULT_SUBTYPE,
+                                    nullptr, vec_int8, nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        return err<void>(Error::sqlite_error("Failed to register vec_int8", rc));
+    }
+
+    // Register vec_bit function (bit vector creation from blob)
+    rc = sqlite3_create_function_v2(db, "vec_bit", 1,
+                                    SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_SUBTYPE |
+                                        SQLITE_RESULT_SUBTYPE,
+                                    nullptr, vec_bit, nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        return err<void>(Error::sqlite_error("Failed to register vec_bit", rc));
+    }
+
     // Register enhanced functions (C++20/23 specific features)
     rc = sqlite3_create_function_v2(db, "vec_dot", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nullptr,
                                     vec_dot, nullptr, nullptr, nullptr);

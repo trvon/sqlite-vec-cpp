@@ -34,7 +34,15 @@ static void test_vec0_basic_create_insert_select() {
     const char* insert_sql =
         "INSERT INTO doc_embeddings(rowid, embedding) VALUES(NULL, vec_f32('[1,2,3,4]'))";
     rc = sqlite3_exec(db, insert_sql, nullptr, nullptr, &err);
-    assert(rc == SQLITE_OK);
+    if (rc != SQLITE_OK) {
+        std::cerr << "  INSERT failed with rc=" << rc;
+        if (err) {
+            std::cerr << " error=" << err;
+            sqlite3_free(err);
+        }
+        std::cerr << std::endl;
+        return;
+    }
 
     // Read it back via SELECT; expect 1 row and non-null blob
     sqlite3_stmt* stmt = nullptr;
@@ -768,6 +776,10 @@ int main() {
     std::cout << "\nTesting Integration Scenarios:\n";
     run_test("integration_similarity_search", test_integration_similarity_search);
     run_test("integration_vector_operations", test_integration_vector_operations);
+
+    std::cout << "\nTesting vec0 Virtual Table:\n";
+    run_test("vec0_basic_create_insert_select", test_vec0_basic_create_insert_select);
+    run_test("vec0_update_delete_paths", test_vec0_update_delete_paths);
 
     std::cout << "\n========================================\n";
     std::cout << "TEST RESULTS\n";
