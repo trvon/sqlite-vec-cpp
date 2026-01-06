@@ -7,9 +7,6 @@ on:
   push:
   pull_request:
 
-permissions:
-  contents: read
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -49,7 +46,6 @@ jobs:
             --print-summary \
             --html-details coverage/index.html \
             --cobertura coverage/coverage.xml
-
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@v4
