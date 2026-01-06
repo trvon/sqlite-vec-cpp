@@ -37,7 +37,12 @@ else
 endif
 
 # SQLite3 dependency
-sqlite3_dep = dependency('sqlite3', version: '>=3.38.0', required: true)
+# Prefer pkg-config on Unix-y systems, but on Windows we may not have pkg-config
+# available and `find_package(sqlite3)` isn't consistently provided.
+#
+# Using `method: 'system'` lets Meson try pkg-config, CMake, and other
+# platform-appropriate mechanisms.
+sqlite3_dep = dependency('sqlite3', version: '>=3.38.0', required: true, method: 'pkg-config')
 
 # Project include directories
 inc_dirs = include_directories('include')

@@ -1,16 +1,18 @@
 # SQLite-Vec C++ Benchmark Results
 
 **Version**: 0.1.0
-**Date**: 2025-11-02
-**Platform**: x86_64, 48 cores @ 4.0GHz, 32KB L1, 512KB L2, 16MB L3
-**Compiler**: GCC 15.2.0, C++23, Release mode (`-O3`)
-**Library**: Google Benchmark 1.9.1
+**Date**: 2026-01-05
+**Platform**: x86_64, 48 cores @ 3.8GHz, 32KB L1, 512KB L2, 16MB L3 (Windows 11)
+**Compiler**: clang 21.1.6, C++23, Release mode (`-O3`)
+**Library**: Google Benchmark 1.9.4
+
 
 ---
 
 ## Executive Summary
 
-The C++ implementation achieves **3.6M vectors/second sustained throughput** with linear scaling across corpus sizes and embedding dimensions. int8 quantization provides 4x storage reduction at performance parity. HNSW index recommended for >100K vector corpora.
+The C++ implementation achieves **~2.8M vectors/second sustained throughput** with linear scaling across corpus sizes and embedding dimensions. int8 quantization provides 4x storage reduction at near performance parity. HNSW index recommended for >100K vector corpora.
+
 
 ---
 
@@ -20,9 +22,10 @@ The C++ implementation achieves **3.6M vectors/second sustained throughput** wit
 
 | Corpus | Latency | Throughput | QPS (single-thread) |
 |--------|---------|------------|---------------------|
-| 1K     | 273 μs  | 3.67 M/s   | ~3,660 queries/sec  |
-| 10K    | 2.78 ms | 3.60 M/s   | ~360 queries/sec    |
-| 100K   | 27.9 ms | 3.58 M/s   | ~36 queries/sec     |
+| 1K     | 288 μs  | 3.51 M/s   | ~3,510 queries/sec  |
+| 10K    | 3.63 ms | 2.77 M/s   | ~277 queries/sec    |
+| 100K   | 41.0 ms | 2.43 M/s   | ~24 queries/sec     |
+
 
 **Scaling**: Linear (10x corpus → 10x latency)
 **Bottleneck**: Compute-bound (memory bandwidth utilization ~5%)
@@ -31,10 +34,11 @@ The C++ implementation achieves **3.6M vectors/second sustained throughput** wit
 
 | K  | Latency | Delta |
 |----|---------|-------|
-| 1  | 2.77 ms | -0.4% |
-| 5  | 2.78 ms | baseline |
-| 10 | 2.78 ms | 0.0%  |
-| 50 | 2.77 ms | -0.4% |
+| 1  | 3.92 ms | +7.8% |
+| 5  | 3.63 ms | baseline |
+| 10 | 3.64 ms | +0.2% |
+| 50 | 3.60 ms | -0.9% |
+
 
 **Conclusion**: Partial sort overhead negligible; K-value has no meaningful impact.
 
@@ -42,9 +46,10 @@ The C++ implementation achieves **3.6M vectors/second sustained throughput** wit
 
 | Dimensions | Latency  | Throughput | Scaling Factor |
 |------------|----------|------------|----------------|
-| 384d       | 2.78 ms  | 3.60 M/s   | 1.0x           |
-| 768d       | 5.74 ms  | 1.74 M/s   | 2.06x          |
-| 1536d      | 11.7 ms  | 856k/s     | 4.21x          |
+| 384d       | 3.63 ms  | 2.77 M/s   | 1.0x           |
+| 768d       | 6.78 ms  | 1.53 M/s   | 1.87x          |
+| 1536d      | 13.2 ms  | 780k/s     | 3.64x          |
+
 
 **Scaling**: Near-linear (2x dim → 2.06x latency, 4x dim → 4.21x latency)
 **Conclusion**: Compute-bound; SIMD efficiency remains high across dimensions.
@@ -53,24 +58,27 @@ The C++ implementation achieves **3.6M vectors/second sustained throughput** wit
 
 | Type  | Latency | Throughput | Storage | Overhead |
 |-------|---------|------------|---------|----------|
-| float | 2.78 ms | 3.60 M/s   | 4 bytes | baseline |
-| int8  | 2.74 ms | 3.65 M/s   | 1 byte  | **-1.4%** |
+| float | 3.63 ms | 2.77 M/s   | 4 bytes | baseline |
+| int8  | 3.62 ms | 2.79 M/s   | 1 byte  | **-0.4%** |
+
 
 **Conclusion**: int8 quantization is **faster** while reducing storage 4x (memory bandwidth savings).
 
 ### 5. Multi-Query Throughput (10K docs, 384d)
 
-- **10 queries**: 27.5 ms total (2.75 ms/query average)
-- **Sustained throughput**: 3.64 M vectors/second
-- **QPS**: ~364 queries/second (single-threaded)
-- **Parallelization potential**: 48 cores → ~17.4K QPS theoretical
+- **10 queries**: 36.2 ms total (3.62 ms/query average)
+- **Sustained throughput**: 2.76 M vectors/second
+- **QPS**: ~276 queries/second (single-threaded)
+- **Parallelization potential**: 48 cores → ~13.2K QPS theoretical
+
 
 ### 6. Sequential vs Batch (1K docs, 384d, K=5)
 
 | Method     | Latency | Throughput |
 |------------|---------|------------|
-| Sequential | 274 μs  | 3.66 M/s   |
-| Batch      | 273 μs  | 3.67 M/s   |
+| Sequential | 287 μs  | 3.51 M/s   |
+| Batch      | 288 μs  | 3.51 M/s   |
+
 
 **Conclusion**: Batch API provides cleaner code at performance parity (memory-bandwidth bound).
 
@@ -82,8 +90,9 @@ The C++ implementation achieves **3.6M vectors/second sustained throughput** wit
 
 | Scenario | Sequential | Batch | Speedup |
 |----------|------------|-------|---------|
-| 100×384d | 26.7 μs    | 26.7 μs | 1.00x |
-| 1K×384d  | 268 μs     | 269 μs  | 1.00x |
+| 100×384d | 27.8 μs    | 28.3 μs | 0.98x |
+| 1K×384d  | 289 μs     | 283 μs  | 1.02x |
+
 
 **Conclusion**: Parity performance; both memory-bandwidth limited.
 
@@ -91,22 +100,25 @@ The C++ implementation achieves **3.6M vectors/second sustained throughput** wit
 
 | Layout      | Latency | Throughput | Improvement |
 |-------------|---------|------------|-------------|
-| Scattered   | 269 μs  | 3.73 M/s   | baseline    |
-| Contiguous  | 267 μs  | 3.75 M/s   | +0.5%       |
+| Scattered   | 283 μs  | 3.54 M/s   | baseline    |
+| Contiguous  | 283 μs  | 3.54 M/s   | +0.0%       |
+
 
 **Conclusion**: Marginal improvement; modern CPUs prefetch efficiently.
 
 ### 3. Top-K Performance (1K×384d, K=10)
 
-- **Latency**: 268 μs (vs 268 μs full distance computation)
-- **Overhead**: <1% for partial sort
+- **Latency**: 290 μs (vs 287 μs full distance computation)
+- **Overhead**: ~1% for partial sort
 - **Conclusion**: `std::partial_sort` highly optimized; K << N has negligible cost.
+
 
 ### 4. Large Embeddings (1K×1536d)
 
-- **Latency**: 1.13 ms
-- **Throughput**: 886k vectors/second
-- **Scaling**: 4.21x slower than 384d (expected 4.0x)
+- **Latency**: 1.18 ms
+- **Throughput**: 833k vectors/second
+- **Scaling**: 4.18x slower than 384d (expected 4.0x)
+
 
 ---
 
@@ -114,11 +126,12 @@ The C++ implementation achieves **3.6M vectors/second sustained throughput** wit
 
 | Corpus Size | Brute-Force Latency | Recommendation |
 |-------------|---------------------|----------------|
-| <10K        | <3ms                | ✅ Brute-force optimal |
-| 10K-100K    | 3-30ms              | ⚠️ Brute-force acceptable for batch |
-| >100K       | >30ms               | ❌ HNSW required for real-time (<10ms) |
+| <10K        | <4ms                | ✅ Brute-force optimal |
+| 10K-100K    | 4-40ms              | ⚠️ Brute-force acceptable for batch |
+| >100K       | >40ms               | ❌ HNSW required for real-time (<10ms) |
 
-**HNSW Threshold**: 100K vectors (27.9ms → >10ms target requires ANN index)
+**HNSW Threshold**: 100K vectors (~41ms → >10ms target requires ANN index)
+
 
 ---
 
@@ -142,15 +155,60 @@ The C++ implementation achieves **3.6M vectors/second sustained throughput** wit
 
 | Metric | Target | Actual | Status |
 |--------|--------|--------|--------|
-| 1K corpus (<1ms) | 1000 μs | 273 μs | ✅ **3.6x better** |
-| 10K corpus (<5ms) | 5000 μs | 2780 μs | ✅ **1.8x better** |
-| 100K corpus (<50ms) | 50000 μs | 27900 μs | ✅ **1.8x better** |
-| int8 overhead (<20%) | 20% | -1.4% | ✅ **Faster** |
-| Dimension scaling | Linear | Linear | ✅ **Perfect** |
+| 1K corpus (<1ms) | 1000 μs | 288 μs | ✅ **3.5x better** |
+| 10K corpus (<5ms) | 5000 μs | 3633 μs | ✅ **1.4x better** |
+| 100K corpus (<50ms) | 50000 μs | 41000 μs | ✅ **1.2x better** |
+| int8 overhead (<20%) | 20% | -0.4% | ✅ **Faster** |
+| Dimension scaling | Linear | Near-linear | ✅ **Good** |
+
+### Comparison to Previous Results (2025-11-02)
+
+| Scenario | Previous | Current | Delta |
+|----------|----------|---------|-------|
+| 1K×384d (K=5) latency | 273 μs | 288 μs | +5.5% |
+| 10K×384d (K=5) latency | 2.78 ms | 3.63 ms | +30.6% |
+| 100K×384d (K=5) latency | 27.9 ms | 41.0 ms | +46.9% |
+| 10K×384d throughput | 3.60 M/s | 2.77 M/s | -23.1% |
+| int8 @10K×384d latency | 2.74 ms | 3.62 ms | +32.1% |
+
+Notes:
+- Previous run header (2025-11-02): Linux (x86_64), GCC 15.2.0, Google Benchmark 1.9.1.
+- Current run header (2026-01-05): Windows 11 (x86_64), clang 21.1.6, Google Benchmark 1.9.4.
+- Treat deltas as environment differences rather than regressions unless measured on the same OS/toolchain.
+
+
 
 ---
 
 ## Reproduction
+
+### Windows (Conan)
+
+```powershell
+# From third_party/sqlite-vec-cpp
+
+# Install dependencies (Conan 2)
+conan profile detect --force
+conan install . -of build_bench_conan -b missing -s build_type=Release -s compiler.cppstd=23 -s compiler.runtime=static
+
+# Make Conan-generated .pc files visible to pkg-config for this shell
+$env:PKG_CONFIG_PATH = (Resolve-Path .\build_bench_conan)
+
+# Configure + build
+meson setup build_bench --wipe -Denable_benchmarks=true -Dbuildtype=release
+ninja -C build_bench benchmarks/rag_pipeline_benchmark.exe benchmarks/batch_distance_benchmark.exe
+
+# Run
+.\build_bench\benchmarks\rag_pipeline_benchmark.exe --benchmark_min_time=0.5s
+.\build_bench\benchmarks\batch_distance_benchmark.exe --benchmark_min_time=0.5s
+
+# JSON output for analysis
+.\build_bench\benchmarks\rag_pipeline_benchmark.exe `
+  --benchmark_out=results.json `
+  --benchmark_out_format=json
+```
+
+### Linux/macOS (system packages)
 
 ```bash
 # Build benchmarks
@@ -169,5 +227,6 @@ ninja -C build_bench
   --benchmark_out=results.json \
   --benchmark_out_format=json
 ```
+
 
 ---
