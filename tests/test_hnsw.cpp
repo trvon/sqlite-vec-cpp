@@ -5,9 +5,11 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <span>
 #include <vector>
+
 #include <sqlite-vec-cpp/distances/l2.hpp>
 #include <sqlite-vec-cpp/index/hnsw.hpp>
 #include <sqlite-vec-cpp/index/hnsw_persistence.hpp>

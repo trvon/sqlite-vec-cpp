@@ -1,0 +1,13 @@
+[requires]
+sqlite3/3.46.1
+benchmark/1.9.4
+
+[generators]
+MesonToolchain
+PkgConfigDeps
+
+[options]
+benchmark/*:with_libbacktrace=False
+benchmark/*:with_libbpf=False
+benchmark/*:with_perf_counters=False
+benchmark/*:with_pthread=False
