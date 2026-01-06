@@ -40,8 +40,6 @@ jobs:
             --exclude '.*build.*' \
             --exclude '.*third_party.*' \
             --exclude '.*benchmarks.*' \
-            --gcov-ignore-parse-errors=suspicious_hits.warn \
-            --merge-mode-functions=merge-use-line-0 \
             --print-summary \
             --html-details coverage/index.html \
             --cobertura coverage/coverage.xml
