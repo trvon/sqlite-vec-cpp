@@ -21,6 +21,9 @@ GIT_ONLY=false
 PARALLEL=true
 VERBOSE=false
 FIX_FORMAT=false
+RUN_COVERAGE=false
+RUN_TSAN=false
+COVERAGE_DIR=""
 BUILD_DIR=""
 COMPILE_COMMANDS=""
 EXCLUDE_DIRS=""
@@ -90,6 +93,9 @@ OPTIONS:
         --suppressions FILE      Use custom suppressions file
         --baseline FILE          Compare against baseline results
         --generate-baseline      Generate baseline file for future comparisons
+        --coverage               Build+run tests with coverage and generate reports
+        --coverage-dir DIR       Output directory for coverage reports
+        --tsan                   Build+run tests with ThreadSanitizer (no coverage)
         
     Performance:
         -j, --parallel           Enable parallel analysis (default: true)
@@ -133,6 +139,9 @@ EXAMPLES:
     
     # Fix formatting issues automatically
     $(basename "$0") --fix-format --git
+
+    # Run tests with coverage reports
+    $(basename "$0") --coverage --coverage-dir coverage/
 
 EOF
 }
@@ -200,6 +209,18 @@ while [[ $# -gt 0 ]]; do
             COMPILE_COMMANDS="$2"
             shift 2
             ;;
+        --coverage)
+            RUN_COVERAGE=true
+            shift
+            ;;
+        --coverage-dir)
+            COVERAGE_DIR="$2"
+            shift 2
+            ;;
+        --tsan)
+            RUN_TSAN=true
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -257,6 +278,12 @@ if ! check_tool "cppcheck" "brew install cppcheck" "Static analysis tool"; then
     MISSING_TOOLS=true
 fi
 
+if [[ "$RUN_COVERAGE" == true ]]; then
+    if ! check_tool "gcovr" "pip3 install gcovr" "Coverage report generator"; then
+        MISSING_TOOLS=true
+    fi
+fi
+
 # Check for optional tools
 if ! command -v "clang-format" &> /dev/null; then
     print_warning "clang-format not found (needed for --fix-format)"
@@ -312,6 +339,8 @@ print_progress "Output format: $OUTPUT_FORMAT"
 print_progress "Git only: $GIT_ONLY"
 print_progress "Parallel: $PARALLEL"
 print_progress "Fix format: $FIX_FORMAT"
+print_progress "Coverage: $RUN_COVERAGE"
+[[ -n "$COVERAGE_DIR" ]] && print_progress "Coverage directory: $COVERAGE_DIR"
 
 # Get list of files to analyze
 print_section "Collecting Source Files"
@@ -396,6 +425,97 @@ if [[ "$FIX_FORMAT" == true ]]; then
     fi
 fi
 
+# Sanity checks for mutually-exclusive instrumentations
+if [[ "$RUN_COVERAGE" == true && "$RUN_TSAN" == true ]]; then
+    print_error "--coverage and --tsan cannot be used together"
+    exit 1
+fi
+
+# Run coverage if requested
+if [[ "$RUN_COVERAGE" == true ]]; then
+    print_section "Running Coverage"
+
+    if [[ -z "$BUILD_DIR" ]]; then
+        BUILD_DIR="build_coverage"
+    fi
+    if [[ -z "$COVERAGE_DIR" ]]; then
+        COVERAGE_DIR="coverage"
+    fi
+
+    mkdir -p "$COVERAGE_DIR"
+
+    if [[ "$BUILD_DIR" != "build_coverage" ]]; then
+        print_warning "Coverage is best run in an isolated build directory."
+        print_warning "Overriding build dir '$BUILD_DIR' -> 'build_coverage'."
+        BUILD_DIR="build_coverage"
+    fi
+
+    if [[ ! -d "$BUILD_DIR" ]]; then
+        print_progress "Configuring coverage build directory: $BUILD_DIR"
+        meson setup "$BUILD_DIR" -Dbuildtype=debugoptimized -Db_coverage=true
+    else
+        print_progress "Reconfiguring existing build directory for coverage: $BUILD_DIR"
+        meson configure "$BUILD_DIR" -Db_coverage=true
+    fi
+
+    print_progress "Building coverage targets"
+    meson compile -C "$BUILD_DIR"
+
+    print_progress "Running tests"
+    # Meson injects sanitizer env vars during tests on some setups; clear them to avoid interference.
+    env -u ASAN_OPTIONS -u MSAN_OPTIONS -u UBSAN_OPTIONS -u MALLOC_PERTURB_ \
+        ASAN_OPTIONS= \
+        MSAN_OPTIONS= \
+        UBSAN_OPTIONS= \
+        MALLOC_PERTURB_= \
+        meson test -C "$BUILD_DIR"
+
+    print_progress "Generating coverage reports"
+    gcovr -r "$PROJECT_ROOT" \
+        --object-directory "$BUILD_DIR" \
+        --exclude '.*build.*' \
+        --exclude '.*third_party.*' \
+        --exclude '.*benchmarks.*' \
+        --gcov-ignore-parse-errors=suspicious_hits.warn \
+        --merge-mode-functions=merge-use-line-0 \
+        --print-summary \
+        --html-details "$COVERAGE_DIR/index.html" \
+        --cobertura "$COVERAGE_DIR/coverage.xml"
+
+    print_success "Coverage reports generated: $COVERAGE_DIR/index.html"
+fi
+
+# Run ThreadSanitizer if requested
+if [[ "$RUN_TSAN" == true ]]; then
+    print_section "Running ThreadSanitizer (TSAN)"
+
+    if [[ -z "$BUILD_DIR" ]]; then
+        BUILD_DIR="build_tsan"
+    fi
+
+    if [[ "$BUILD_DIR" != "build_tsan" ]]; then
+        print_warning "TSAN is best run in an isolated build directory."
+        print_warning "Overriding build dir '$BUILD_DIR' -> 'build_tsan'."
+        BUILD_DIR="build_tsan"
+    fi
+
+    if [[ ! -d "$BUILD_DIR" ]]; then
+        print_progress "Configuring TSAN build directory: $BUILD_DIR"
+        meson setup "$BUILD_DIR" -Dbuildtype=debugoptimized -Db_sanitize=thread
+    else
+        print_progress "Reconfiguring existing build directory for TSAN: $BUILD_DIR"
+        meson configure "$BUILD_DIR" -Db_sanitize=thread
+    fi
+
+    print_progress "Building TSAN targets"
+    meson compile -C "$BUILD_DIR"
+
+    print_progress "Running TSAN tests"
+    meson test -C "$BUILD_DIR"
+
+    print_success "TSAN test run completed"
+fi
+
 # Configure cppcheck based on profile
 print_section "Configuring Static Analysis"
 
@@ -450,7 +570,7 @@ case $PROFILE in
         ;;
     quick)
         CPPCHECK_ARGS+=(
-            "--enable=error,warning"
+            "--enable=warning"
         )
         ;;
     ci)

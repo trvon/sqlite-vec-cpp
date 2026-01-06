@@ -70,9 +70,11 @@ public:
 
     /// Set blob result with custom destructor
     template <typename Deleter>
-    void result_blob(std::span<const std::uint8_t> blob, Deleter&& deleter) const noexcept {
+    void result_blob(std::span<const std::uint8_t> blob,
+                     [[maybe_unused]] Deleter&& deleter) const noexcept {
         // Note: For custom deleters, would need to wrap in a C callback
         // For now, just use SQLITE_TRANSIENT
+        (void)deleter;
         result_blob(blob);
     }
 

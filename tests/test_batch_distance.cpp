@@ -38,7 +38,8 @@ void test_batch_basic() {
 
     // Test batch distance
     auto distances =
-        batch::batch_distance(std::span{query}, std::span{db_spans}, L2Metric<float>{});
+        batch::batch_distance(std::span<const float>(query),
+                              std::span<const std::span<const float>>(db_spans), L2Metric<float>{});
 
     assert(distances.size() == 4);
     assert(approx_equal(distances[0], 0.0f));
@@ -62,7 +63,8 @@ void test_batch_contiguous() {
         4.0f, 5.0f, 6.0f  // vec 3
     };
 
-    auto distances = batch::batch_distance_contiguous(std::span{query}, std::span{db_flat},
+    auto distances = batch::batch_distance_contiguous(std::span<const float>(query),
+                                                      std::span<const float>(db_flat),
                                                       4, // num_vectors
                                                       3, // dim
                                                       L2Metric<float>{});
@@ -91,7 +93,8 @@ void test_batch_top_k() {
         db_spans.emplace_back(vec);
     }
 
-    auto top_2 = batch::batch_top_k(std::span{query}, std::span{db_spans},
+    auto top_2 = batch::batch_top_k(std::span<const float>(query),
+                                    std::span<const std::span<const float>>(db_spans),
                                     2, // k=2
                                     L2Metric<float>{});
 
@@ -119,9 +122,10 @@ void test_batch_filtered() {
         db_spans.emplace_back(vec);
     }
 
-    auto filtered = batch::batch_distance_filtered(std::span{query}, std::span{db_spans},
-                                                   2.0f, // threshold
-                                                   L2Metric<float>{});
+    auto filtered = batch::batch_distance_filtered(
+        std::span<const float>(query), std::span<const std::span<const float>>(db_spans),
+        2.0f, // threshold
+        L2Metric<float>{});
 
     // Only vectors 0 and 1 should pass (dist < 2.0)
     assert(filtered.size() == 2);
@@ -149,8 +153,9 @@ void test_batch_int8() {
         db_spans.emplace_back(vec);
     }
 
-    auto distances =
-        batch::batch_distance(std::span{query}, std::span{db_spans}, L2Metric<int8_t>{});
+    auto distances = batch::batch_distance(std::span<const int8_t>(query),
+                                           std::span<const std::span<const int8_t>>(db_spans),
+                                           L2Metric<int8_t>{});
 
     assert(distances.size() == 3);
     assert(approx_equal(distances[0], 0.0f));
@@ -166,12 +171,13 @@ void test_batch_consistency() {
     std::vector<float> db_vec = {2.0f, 3.0f, 4.0f, 5.0f};
 
     // Single distance computation
-    float single_dist = l2_distance(std::span{query}, std::span{db_vec});
+    float single_dist = l2_distance(std::span<const float>(query), std::span<const float>(db_vec));
 
     // Batch distance computation
-    std::vector<std::span<const float>> db_spans = {std::span{db_vec}};
+    std::vector<std::span<const float>> db_spans = {std::span<const float>(db_vec)};
     auto batch_dists =
-        batch::batch_distance(std::span{query}, std::span{db_spans}, L2Metric<float>{});
+        batch::batch_distance(std::span<const float>(query),
+                              std::span<const std::span<const float>>(db_spans), L2Metric<float>{});
 
     assert(batch_dists.size() == 1);
     assert(approx_equal(batch_dists[0], single_dist));

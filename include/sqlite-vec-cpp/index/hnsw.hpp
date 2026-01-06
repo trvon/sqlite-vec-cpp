@@ -238,6 +238,10 @@ public:
             return;
 
         size_t actual_threads = num_threads ? num_threads : std::thread::hardware_concurrency();
+        if (actual_threads == 0) {
+            actual_threads = 1;
+        }
+
         ThreadPool pool(actual_threads);
 
         pool.parallel_for(ids.size(),
@@ -260,6 +264,10 @@ public:
             return;
 
         size_t actual_threads = num_threads ? num_threads : std::thread::hardware_concurrency();
+        if (actual_threads == 0) {
+            actual_threads = 1;
+        }
+
         ThreadPool pool(actual_threads);
 
         constexpr size_t DEFAULT_BATCH_SIZE = 256;

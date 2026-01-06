@@ -15,6 +15,18 @@ __declspec(dllexport)
 int sqlite3_vec_init(sqlite3* db, char** pzErrMsg, const sqlite3_api_routines* pApi) {
     (void)pApi; // not using extension API; direct sqlite3.h
 
+    // Test-only failpoint to exercise error path coverage.
+    // When SQLITE_VEC_CPP_TESTING is enabled, tests can force this failure by passing
+    // a non-null sqlite3_api_routines pointer. Normal usage passes NULL.
+#ifdef SQLITE_VEC_CPP_TESTING
+    if (pApi != nullptr) {
+        if (pzErrMsg) {
+            *pzErrMsg = sqlite3_mprintf("sqlite-vec test failpoint: init forced to fail");
+        }
+        return SQLITE_ERROR;
+    }
+#endif
+
     try {
         // Register all vector functions from C++ implementation
         auto result = sqlite_vec_cpp::sqlite::register_all_functions(db);

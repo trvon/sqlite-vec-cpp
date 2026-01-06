@@ -1,12 +1,15 @@
 #pragma once
 
 #include <sqlite3.h>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 #include "../utils/error.hpp"
+#include "parsers.hpp"
+#include "value.hpp"
 
 namespace sqlite_vec_cpp::sqlite {
 
@@ -84,7 +87,11 @@ inline bool parse_vec0_schema(int argc, const char* const* argv, std::string& em
 
 // Helper: Create shadow tables for vec0 storage
 inline int create_shadow_tables(sqlite3* db, const char* schema, const char* table,
-                                const char* embedding_col, size_t dims, char** pzErr) {
+                                const char* embedding_col, [[maybe_unused]] size_t dims,
+                                char** pzErr) {
+    // Note: dims parameter is reserved for future use (validation, typed vectors)
+    (void)dims;
+
     // Shadow table for metadata
     std::ostringstream meta_sql;
     meta_sql << "CREATE TABLE IF NOT EXISTS \"" << schema << "\".\"" << table << "_metadata\" ("
@@ -123,6 +130,9 @@ inline int create_shadow_tables(sqlite3* db, const char* schema, const char* tab
 inline int vec0Create(sqlite3* db, void* pAux, int argc, const char* const* argv,
                       sqlite3_vtab** ppVTab, char** pzErr) {
     (void)pAux;
+
+    // Enable shadow table writes through xUpdate
+    sqlite3_vtab_config(db, SQLITE_VTAB_DIRECTONLY);
 
     if (argc < 3) {
         *pzErr = sqlite3_mprintf("vec0: insufficient arguments");
@@ -342,12 +352,33 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
         bool is_insert = (sqlite3_value_type(argv[0]) == SQLITE_NULL);
         int64_t rowid = is_insert ? 0 : sqlite3_value_int64(argv[0]);
 
-        // argv[2] = embedding column value
-        const void* blob = sqlite3_value_blob(argv[2]);
-        int bytes = sqlite3_value_bytes(argv[2]);
+        // argv layout per SQLite vtab spec:
+        // - argv[0]: old rowid (or NULL)
+        // - argv[1]: new rowid (or NULL)
+        // - argv[2..]: column values in declared order
+        if (argc < 4) {
+            return SQLITE_MISUSE;
+        }
+
+        // Our declared schema is: CREATE TABLE x(rowid INTEGER PRIMARY KEY, "embedding")
+        // So the embedding column value is argv[3] (argv[2] corresponds to rowid column value).
+        sqlite3_value* embedding_val = argv[3];
+        const void* blob = sqlite3_value_blob(embedding_val);
+        int bytes = sqlite3_value_bytes(embedding_val);
+
+        // If xUpdate doesn't materialize function-returned blobs, parse JSON/text and bind as blob
+        std::vector<float> parsed_vec;
+        if (sqlite3_value_type(embedding_val) == SQLITE_TEXT) {
+            Value value(embedding_val);
+            auto parsed = parse_vector_from_value<float>(value);
+            if (parsed) {
+                parsed_vec = std::move(parsed.value());
+                blob = parsed_vec.data();
+                bytes = static_cast<int>(parsed_vec.size() * sizeof(float));
+            }
+        }
 
         if (is_insert) {
-            // INSERT
             std::ostringstream sql;
             sql << "INSERT INTO \"" << table->schema_name << "\".\"" << table->table_name
                 << "_vectors\" (\"" << table->embedding_column << "\") VALUES (?)";
@@ -357,9 +388,13 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
             if (rc != SQLITE_OK)
                 return rc;
 
-            sqlite3_bind_blob(stmt, 1, blob, bytes, SQLITE_TRANSIENT);
-            rc = sqlite3_step(stmt);
+            if (blob && bytes > 0) {
+                sqlite3_bind_blob(stmt, 1, blob, bytes, SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_null(stmt, 1);
+            }
 
+            rc = sqlite3_step(stmt);
             if (rc == SQLITE_DONE) {
                 *pRowid = sqlite3_last_insert_rowid(table->db);
                 rc = SQLITE_OK;
@@ -368,7 +403,6 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
             sqlite3_finalize(stmt);
             return rc;
         } else {
-            // UPDATE
             std::ostringstream sql;
             sql << "UPDATE \"" << table->schema_name << "\".\"" << table->table_name
                 << "_vectors\" SET \"" << table->embedding_column << "\"=? WHERE rowid=" << rowid;
@@ -378,9 +412,13 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
             if (rc != SQLITE_OK)
                 return rc;
 
-            sqlite3_bind_blob(stmt, 1, blob, bytes, SQLITE_TRANSIENT);
-            rc = sqlite3_step(stmt);
+            if (blob && bytes > 0) {
+                sqlite3_bind_blob(stmt, 1, blob, bytes, SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_null(stmt, 1);
+            }
 
+            rc = sqlite3_step(stmt);
             if (rc == SQLITE_DONE) {
                 *pRowid = rowid;
                 rc = SQLITE_OK;
@@ -419,7 +457,8 @@ static sqlite3_module vec0_module = {
     /* xSavepoint    */ nullptr,
     /* xRelease      */ nullptr,
     /* xRollbackTo   */ nullptr,
-    /* xShadowName   */ nullptr};
+    /* xShadowName   */ nullptr,
+    /* xIntegrity    */ nullptr};
 
 inline Result<void> register_vec0_module(sqlite3* db) {
     if (!db) {

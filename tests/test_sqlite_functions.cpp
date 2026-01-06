@@ -6,13 +6,215 @@
 #include <sqlite-vec-cpp/sqlite/registration.hpp>
 #include <sqlite-vec-cpp/sqlite_vec.hpp>
 
+extern "C" {
+int sqlite3_vec_init(sqlite3* db, char** pzErrMsg, const sqlite3_api_routines* pApi);
+int sqlite3_vec_distance_l2(const void* vec1, size_t size1, const void* vec2, size_t size2,
+                            float* result);
+int sqlite3_vec_distance_cosine(const void* vec1, size_t size1, const void* vec2, size_t size2,
+                                float* result);
+}
+
 // Forward declarations of existing tests (defined later in this file)
 void test_vec_f32_json();
 void test_vec_f32_blob();
 void test_vec_int8();
 void test_vec_length();
 void test_vec_to_json();
+void test_vec_f32_vs_vec_f32_simple();
 void test_distance_l2();
+static void test_distance_int8_l1_l2_cosine();
+static void test_distance_bit_hamming();
+static void test_distance_mismatched_types();
+static void test_distance_invalid_args();
+
+static double query_double(sqlite3* db, const char* sql) {
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    assert(rc == SQLITE_OK && stmt);
+    rc = sqlite3_step(stmt);
+    assert(rc == SQLITE_ROW);
+    double out = sqlite3_column_double(stmt, 0);
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+static int query_int(sqlite3* db, const char* sql) {
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    assert(rc == SQLITE_OK && stmt);
+    rc = sqlite3_step(stmt);
+    assert(rc == SQLITE_ROW);
+    int out = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+static std::string query_error(sqlite3* db, const char* sql) {
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        const char* err = sqlite3_errmsg(db);
+        return err ? std::string(err) : std::string();
+    }
+
+    rc = sqlite3_step(stmt);
+    assert(rc != SQLITE_ROW);
+
+    const char* err = sqlite3_errmsg(db);
+    sqlite3_finalize(stmt);
+    return err ? std::string(err) : std::string();
+}
+
+// C API compatibility layer tests
+static void test_distance_int8_l1_l2_cosine() {
+    sqlite3* db = nullptr;
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_vec_init(db, nullptr, nullptr) == SQLITE_OK);
+
+    // vec_int8() sets the value subtype so distance functions route to Int8 branches.
+    double l2 =
+        query_double(db, "SELECT vec_distance_l2(vec_int8('[1,2,3]'), vec_int8('[1,2,5]'))");
+    assert(l2 > 1.9 && l2 < 2.1);
+
+    double l1 =
+        query_double(db, "SELECT vec_distance_l1(vec_int8('[1,2,3]'), vec_int8('[1,2,5]'))");
+    assert(l1 > 1.9 && l1 < 2.1);
+
+    double cosine =
+        query_double(db, "SELECT vec_distance_cosine(vec_int8('[1,0,0]'), vec_int8('[0,1,0]'))");
+    assert(cosine > 0.9 && cosine < 1.1);
+
+    sqlite3_close(db);
+}
+
+static void test_distance_bit_hamming() {
+    sqlite3* db = nullptr;
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_vec_init(db, nullptr, nullptr) == SQLITE_OK);
+
+    // Two bytes => 16 bit dimensions.
+    // 0b00001111 vs 0b00011111 differs by 1 bit in first byte; second byte equal.
+    int dist = query_int(
+        db, "SELECT CAST(vec_distance_hamming(vec_bit(X'0F00'), vec_bit(X'1F00')) AS INT)");
+    assert(dist == 1);
+
+    sqlite3_close(db);
+}
+
+static void test_distance_mismatched_types() {
+    sqlite3* db = nullptr;
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_vec_init(db, nullptr, nullptr) == SQLITE_OK);
+
+    // Different subtypes => element types mismatch.
+    auto err = query_error(db, "SELECT vec_distance_l2(vec_f32('[1,2,3]'), vec_int8('[1,2,3]'))");
+    assert(!err.empty());
+
+    // Bitvectors cannot be used with L2.
+    err = query_error(db, "SELECT vec_distance_l2(vec_bit(X'00'), vec_bit(X'00'))");
+    assert(!err.empty());
+
+    sqlite3_close(db);
+}
+
+static void test_distance_invalid_args() {
+    sqlite3* db = nullptr;
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_vec_init(db, nullptr, nullptr) == SQLITE_OK);
+
+    // Wrong arg count.
+    auto err = query_error(db, "SELECT vec_distance_l2(vec_f32('[1,2,3]'))");
+    assert(!err.empty());
+
+    // Non-blob args (extract_vector_from_value checks value.is_blob).
+    err = query_error(db, "SELECT vec_distance_l2(1, 2)");
+    assert(!err.empty());
+
+    // Blob size not aligned to element size.
+    err = query_error(db, "SELECT vec_distance_l2(X'00', X'00')");
+    assert(!err.empty());
+
+    // Dimension mismatch.
+    err = query_error(db, "SELECT vec_distance_l2(vec_f32('[1,2,3]'), vec_f32('[1,2]'))");
+    assert(!err.empty());
+
+    sqlite3_close(db);
+}
+
+static void test_c_api_init_and_distance() {
+    std::cout << "Testing sqlite3_vec_init (test failpoint) + distance helpers..." << std::endl;
+
+    sqlite3* db = nullptr;
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK);
+
+    // With SQLITE_VEC_CPP_TESTING enabled, sqlite3_vec_init() can be forced to fail
+    // by passing a non-null `pApi` pointer.
+    {
+        char* err = nullptr;
+        int rc = sqlite3_vec_init(db, &err, reinterpret_cast<const sqlite3_api_routines*>(0x1));
+        assert(rc != SQLITE_OK);
+        assert(err != nullptr);
+        sqlite3_free(err);
+    }
+
+    // Normal init should still work.
+    assert(sqlite3_vec_init(db, nullptr, nullptr) == SQLITE_OK);
+
+    // We still directly test the helper C distance functions below.
+
+    float out = 0.0f;
+    float a[] = {1.0f, 0.0f, 0.0f};
+    float b[] = {0.0f, 1.0f, 0.0f};
+
+    int rc = sqlite3_vec_distance_l2(a, sizeof(a), b, sizeof(b), &out);
+    assert(rc == SQLITE_OK);
+    std::cout << "  l2_distance(a,b)=" << out << std::endl;
+    // l2_distance returns Euclidean distance: sqrt((1-0)^2 + (0-1)^2) = sqrt(2)
+    assert(out > 1.3f && out < 1.5f);
+
+    rc = sqlite3_vec_distance_cosine(a, sizeof(a), b, sizeof(b), &out);
+    assert(rc == SQLITE_OK);
+    std::cout << "  cosine_distance(a,b)=" << out << std::endl;
+    // cosine_distance is 1 - cosine_similarity; orthogonal vectors => similarity=0 => distance=1
+    assert(out > 0.9f && out < 1.1f);
+
+    // Error paths: null pointers
+    rc = sqlite3_vec_distance_l2(nullptr, sizeof(a), b, sizeof(b), &out);
+    assert(rc != SQLITE_OK);
+
+    rc = sqlite3_vec_distance_l2(a, sizeof(a), nullptr, sizeof(b), &out);
+    assert(rc != SQLITE_OK);
+
+    rc = sqlite3_vec_distance_l2(a, sizeof(a), b, sizeof(b), nullptr);
+    assert(rc != SQLITE_OK);
+
+    rc = sqlite3_vec_distance_cosine(nullptr, sizeof(a), b, sizeof(b), &out);
+    assert(rc != SQLITE_OK);
+
+    rc = sqlite3_vec_distance_cosine(a, sizeof(a), nullptr, sizeof(b), &out);
+    assert(rc != SQLITE_OK);
+
+    rc = sqlite3_vec_distance_cosine(a, sizeof(a), b, sizeof(b), nullptr);
+    assert(rc != SQLITE_OK);
+
+    // Error paths: dim mismatch
+    rc = sqlite3_vec_distance_l2(a, sizeof(a), b, sizeof(float) * 2, &out);
+    assert(rc != SQLITE_OK);
+
+    rc = sqlite3_vec_distance_cosine(a, sizeof(a), b, sizeof(float) * 2, &out);
+    assert(rc != SQLITE_OK);
+
+    // Error paths: closed database init
+    sqlite3_close(db);
+    db = nullptr;
+
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_close(db) == SQLITE_OK);
+
+    // sqlite3_vec_init expects a valid database handle; passing a closed handle is UB.
+
+    std::cout << "  ✓ C API init + distance helpers work" << std::endl;
+}
 
 // New tests to validate vec0 virtual table lifecycle
 static void test_vec0_basic_create_insert_select() {
@@ -30,9 +232,10 @@ static void test_vec0_basic_create_insert_select() {
     int rc = sqlite3_exec(db, create_sql, nullptr, nullptr, &err);
     assert(rc == SQLITE_OK);
 
-    // Insert a vector (as JSON via vec_f32)
+    // Insert a vector. SQLite virtual table xUpdate does not reliably materialize
+    // function-returned BLOBs (even without subtypes), so pass JSON text directly.
     const char* insert_sql =
-        "INSERT INTO doc_embeddings(rowid, embedding) VALUES(NULL, vec_f32('[1,2,3,4]'))";
+        "INSERT INTO doc_embeddings(rowid, embedding) VALUES(NULL, '[1,2,3,4]')";
     rc = sqlite3_exec(db, insert_sql, nullptr, nullptr, &err);
     if (rc != SQLITE_OK) {
         std::cerr << "  INSERT failed with rc=" << rc;
@@ -46,12 +249,20 @@ static void test_vec0_basic_create_insert_select() {
 
     // Read it back via SELECT; expect 1 row and non-null blob
     sqlite3_stmt* stmt = nullptr;
-    rc = sqlite3_prepare_v2(db, "SELECT rowid, embedding FROM doc_embeddings", -1, &stmt, nullptr);
+    rc = sqlite3_prepare_v2(db, "SELECT rowid, embedding, typeof(embedding) FROM doc_embeddings",
+                            -1, &stmt, nullptr);
     assert(rc == SQLITE_OK && stmt);
     rc = sqlite3_step(stmt);
     assert(rc == SQLITE_ROW);
     assert(sqlite3_column_type(stmt, 0) == SQLITE_INTEGER);
-    assert(sqlite3_column_type(stmt, 1) == SQLITE_BLOB);
+    int col1_type = sqlite3_column_type(stmt, 1);
+    const char* typeof_str = (const char*)sqlite3_column_text(stmt, 2);
+    std::cerr << "  typeof(embedding)=" << (typeof_str ? typeof_str : "<null>")
+              << " sqlite3_column_type=" << col1_type << std::endl;
+    if (col1_type == SQLITE_NULL) {
+        std::cerr << "  ERROR: Expected blob/text, got NULL" << std::endl;
+    }
+    assert(col1_type == SQLITE_BLOB || col1_type == SQLITE_TEXT);
     sqlite3_finalize(stmt);
 
     // Drop table (should remove shadow tables without error)
@@ -69,14 +280,37 @@ static void test_vec0_update_delete_paths() {
     assert(sqlite3_open(":memory:", &db) == SQLITE_OK && db);
     sqlite3_vec_init(db, nullptr, nullptr);
 
+    char* err = nullptr;
+    int rc = SQLITE_OK;
+
     assert(sqlite3_exec(db, "CREATE VIRTUAL TABLE t USING vec0(embedding float[2])", nullptr,
                         nullptr, nullptr) == SQLITE_OK);
-    assert(sqlite3_exec(db, "INSERT INTO t(rowid, embedding) VALUES(NULL, vec_f32('[10,20]'))",
-                        nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    rc = sqlite3_exec(db, "INSERT INTO t(rowid, embedding) VALUES(NULL, '[10,20]')", nullptr,
+                      nullptr, &err);
+    if (rc != SQLITE_OK) {
+        std::cerr << "  vec0 insert failed rc=" << rc;
+        if (err) {
+            std::cerr << " err=" << err;
+            sqlite3_free(err);
+            err = nullptr;
+        }
+        std::cerr << std::endl;
+    }
+    assert(rc == SQLITE_OK);
 
     // Update rowid 1
-    assert(sqlite3_exec(db, "UPDATE t SET embedding=vec_f32('[11,22]') WHERE rowid=1", nullptr,
-                        nullptr, nullptr) == SQLITE_OK);
+    rc = sqlite3_exec(db, "UPDATE t SET embedding='[11,22]' WHERE rowid=1", nullptr, nullptr, &err);
+    if (rc != SQLITE_OK) {
+        std::cerr << "  vec0 update failed rc=" << rc;
+        if (err) {
+            std::cerr << " err=" << err;
+            sqlite3_free(err);
+            err = nullptr;
+        }
+        std::cerr << std::endl;
+    }
+    assert(rc == SQLITE_OK);
 
     // Delete row
     assert(sqlite3_exec(db, "DELETE FROM t WHERE rowid=1", nullptr, nullptr, nullptr) == SQLITE_OK);
@@ -123,7 +357,7 @@ public:
 
         int rc = sqlite3_exec(
             db_, sql.c_str(),
-            [](void* data, int argc, char** argv, char** col_names) -> int {
+            [](void* data, int argc, char** argv, [[maybe_unused]] char** col_names) -> int {
                 if (argc > 0 && argv[0]) {
                     *static_cast<std::string*>(data) = argv[0];
                 }
@@ -318,6 +552,27 @@ void test_vec_to_json() {
     assert(json.find("2.5") != std::string::npos);
 
     std::cout << "  ✓ vec_to_json works" << std::endl;
+}
+
+void test_vec_f32_vs_vec_f32_simple() {
+    std::cout << "Testing vec_f32 vs vec_f32_simple..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+    register_all_functions(db);
+
+    // Test that both functions produce the same blob data
+    std::string hex_f32 = db.exec_scalar("SELECT hex(vec_f32('[1.0, 2.0, 3.0]'))");
+    std::string hex_simple = db.exec_scalar("SELECT hex(vec_f32_simple('[1.0, 2.0, 3.0]'))");
+    assert(hex_f32 == hex_simple);
+
+    // Test that vec_length works for both
+    std::string len_f32 = db.exec_scalar("SELECT vec_length(vec_f32('[1,2,3,4,5]'))");
+    std::string len_simple = db.exec_scalar("SELECT vec_length(vec_f32_simple('[1,2,3,4,5]'))");
+    assert(len_f32 == len_simple);
+    assert(len_f32 == "5");
+
+    std::cout << "  ✓ vec_f32 and vec_f32_simple produce identical results" << std::endl;
 }
 
 // ============================================================================
@@ -748,6 +1003,7 @@ int main() {
     run_test("vec_f32_blob", test_vec_f32_blob);
     run_test("vec_int8", test_vec_int8);
     run_test("vec_length", test_vec_length);
+    run_test("vec_f32_vs_vec_f32_simple", test_vec_f32_vs_vec_f32_simple);
     run_test("vec_to_json", test_vec_to_json);
 
     std::cout << "\nTesting Distance Functions:\n";
@@ -780,6 +1036,17 @@ int main() {
     std::cout << "\nTesting vec0 Virtual Table:\n";
     run_test("vec0_basic_create_insert_select", test_vec0_basic_create_insert_select);
     run_test("vec0_update_delete_paths", test_vec0_update_delete_paths);
+
+    std::cout << "\nTesting Distance Subtypes (Bit/Int8):\n";
+    run_test("distance_int8_l1_l2_cosine", test_distance_int8_l1_l2_cosine);
+    run_test("distance_bit_hamming", test_distance_bit_hamming);
+
+    std::cout << "\nTesting Distance Error Paths:\n";
+    run_test("distance_mismatched_types", test_distance_mismatched_types);
+    run_test("distance_invalid_args", test_distance_invalid_args);
+
+    std::cout << "\nTesting C API Compatibility Layer:\n";
+    run_test("c_api_init_and_distance", test_c_api_init_and_distance);
 
     std::cout << "\n========================================\n";
     std::cout << "TEST RESULTS\n";

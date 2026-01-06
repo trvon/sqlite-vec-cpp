@@ -1,0 +1,114 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson \
+            ninja-build \
+            pkg-config \
+            libsqlite3-dev \
+            libbenchmark-dev \
+            python3-pip \
+            gcovr
+
+      - name: Configure (coverage)
+        run: meson setup build_coverage -Dbuildtype=debugoptimized -Db_coverage=true
+
+      - name: Build
+        run: meson compile -C build_coverage
+
+      - name: Test
+        run: meson test -C build_coverage
+
+      - name: Coverage (summary + artifacts)
+        run: |
+          gcovr -r . \
+            --object-directory build_coverage \
+            --exclude '.*build.*' \
+            --exclude '.*third_party.*' \
+            --exclude '.*benchmarks.*' \
+            --gcov-ignore-parse-errors=suspicious_hits.warn \
+            --merge-mode-functions=merge-use-line-0 \
+            --print-summary \
+            --html-details coverage/index.html \
+            --cobertura coverage/coverage.xml
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+
+  tsan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            meson \
+            ninja-build \
+            pkg-config \
+            libsqlite3-dev
+
+      - name: Configure (TSAN)
+        run: |
+          CC=clang CXX=clang++ meson setup build_tsan \
+            -Dbuildtype=debugoptimized \
+            -Db_sanitize=thread
+
+      - name: Build
+        run: meson compile -C build_tsan
+
+      - name: Test
+        run: meson test -C build_tsan
+
+  benchmarks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson \
+            ninja-build \
+            pkg-config \
+            libsqlite3-dev \
+            libbenchmark-dev
+
+      - name: Configure (release + benchmarks)
+        run: meson setup build_bench -Dbuildtype=release -Denable_benchmarks=true
+
+      - name: Build
+        run: meson compile -C build_bench
+
+      - name: Run benchmarks
+        run: |
+          mkdir -p bench_results
+          ./build_bench/benchmarks/rag_pipeline_benchmark --benchmark_min_time=0.2s --benchmark_out=bench_results/rag.json --benchmark_out_format=json
+          ./build_bench/benchmarks/batch_distance_benchmark --benchmark_min_time=0.2s --benchmark_out=bench_results/batch.json --benchmark_out_format=json
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench_results
+          path: bench_results/*.json

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <execution>
+#include <numeric>
 #include <span>
 #include <vector>
 #include "../concepts/distance_metric.hpp"

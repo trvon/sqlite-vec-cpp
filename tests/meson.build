@@ -25,7 +25,12 @@ test_sqlite_functions = executable(
   'test_sqlite_functions',
   'test_sqlite_functions.cpp',
   include_directories: inc_dirs,
+  sources: [
+    'test_sqlite_functions.cpp',
+    '../src/sqlite_vec_c_api.cpp',
+  ],
   dependencies: [sqlite3_dep, dependency('sqlite-vec-cpp')],
+  cpp_args: ['-DSQLITE_VEC_CPP_TESTING'],
 )
 
 test_batch_distance = executable(

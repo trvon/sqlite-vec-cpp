@@ -63,14 +63,9 @@ inline void vec_f32_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     std::size_t size = vec.size() * sizeof(float);
     unsigned int subtype = static_cast<unsigned int>(VectorElementType::Float32);
 
-    fprintf(stderr, "[vec_f32_impl] DEBUG: vec.size()=%zu, data=%p, size=%zu, subtype=%u\n",
-            vec.size(), data, size, subtype);
-
     // Use the wrapper method that correctly sets blob + subtype
     context.result_blob_with_subtype(
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data), size), subtype);
-
-    fprintf(stderr, "[vec_f32_impl] DEBUG: result_blob_with_subtype called successfully\n");
 }
 
 /// SQLite function: vec_int8(json_or_blob) -> int8 vector blob
