@@ -71,5 +71,3 @@ Follow YAMS contribution guidelines. Key requirements:
 - Maintain performance parity (run benchmarks before/after)
 - Add tests for new functionality (minimum 80% coverage)
 - Update documentation for API changes
-
-Submit issues or pull requests to the YAMS repository.

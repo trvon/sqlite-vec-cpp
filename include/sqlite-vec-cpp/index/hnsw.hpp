@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <random>
 #include <shared_mutex>
