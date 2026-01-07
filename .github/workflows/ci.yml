@@ -150,18 +150,16 @@ jobs:
           brew install meson ninja pkg-config sqlite
 
       - name: Configure
-        env:
-          # macOS 11.0+ required for std::jthread (libc++ LLVM 11 sync primitives)
-          MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: |
+          # macOS 11.0+ required for std::jthread (libc++ LLVM 11 sync primitives)
           meson setup build \
             -Dbuildtype=debugoptimized \
             -Denable_simd_avx=false \
-            -Denable_simd_neon=true
+            -Denable_simd_neon=true \
+            -Dcpp_args="-mmacosx-version-min=11.0" \
+            -Dcpp_link_args="-mmacosx-version-min=11.0"
 
       - name: Build
-        env:
-          MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: meson compile -C build
 
       - name: Test
