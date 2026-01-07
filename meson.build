@@ -199,14 +199,20 @@ endif
 
 # SQLite3 dependency
 # Try multiple methods to find SQLite3:
-# 1. pkg-config (Unix-y systems)
-# 2. cmake (Windows with vcpkg, some Unix systems)
-# 3. system (fallback)
+# 1. pkg-config (Unix-y systems, MinGW)
+# 2. cmake with unofficial-sqlite3 (vcpkg on Windows)
+# 3. cmake with sqlite3 (some systems)
+# 4. system (fallback - lets meson try everything)
 sqlite3_dep = dependency('sqlite3', version: '>=3.38.0', required: false, method: 'pkg-config')
+if not sqlite3_dep.found()
+  # vcpkg uses 'unofficial-sqlite3' as the cmake package name
+  sqlite3_dep = dependency('unofficial-sqlite3', required: false, method: 'cmake', modules: ['unofficial::sqlite3::sqlite3'])
+endif
 if not sqlite3_dep.found()
   sqlite3_dep = dependency('sqlite3', version: '>=3.38.0', required: false, method: 'cmake')
 endif
 if not sqlite3_dep.found()
+  # Final fallback - let meson try all methods
   sqlite3_dep = dependency('sqlite3', version: '>=3.38.0', required: true)
 endif
 

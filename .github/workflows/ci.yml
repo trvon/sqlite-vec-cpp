@@ -150,6 +150,9 @@ jobs:
           brew install meson ninja pkg-config sqlite
 
       - name: Configure
+        env:
+          # macOS 11.0+ required for std::jthread (libc++ LLVM 11 sync primitives)
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: |
           meson setup build \
             -Dbuildtype=debugoptimized \
@@ -157,6 +160,8 @@ jobs:
             -Denable_simd_neon=true
 
       - name: Build
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: meson compile -C build
 
       - name: Test
@@ -185,17 +190,21 @@ jobs:
           C:\vcpkg\vcpkg install sqlite3:x64-windows
 
       - name: Configure
+        env:
+          CMAKE_PREFIX_PATH: C:\vcpkg\installed\x64-windows
         run: |
           meson setup build `
             -Dbuildtype=debugoptimized `
             -Denable_simd_avx=false `
             -Denable_simd_neon=false `
-            --pkg-config-path=C:\vcpkg\installed\x64-windows\lib\pkgconfig
+            --cmake-prefix-path=C:\vcpkg\installed\x64-windows
 
       - name: Build
         run: meson compile -C build
 
       - name: Test
+        env:
+          PATH: C:\vcpkg\installed\x64-windows\bin;${{ env.PATH }}
         run: meson test -C build
 
   # =============================================================================
