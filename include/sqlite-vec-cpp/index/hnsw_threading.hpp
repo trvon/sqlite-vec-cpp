@@ -26,7 +26,7 @@ public:
 /// Thread-local random number generator for parallel operations
 /// Avoids contention on shared RNG during parallel layer assignment
 class ThreadLocalRNG {
-    static thread_local std::mt19937 rng_;
+    static inline thread_local std::mt19937 rng_{std::random_device{}()};
     std::uniform_real_distribution<float> dist_{0.0f, 1.0f};
 
 public:
@@ -48,8 +48,6 @@ public:
         return dist(rng_);
     }
 };
-
-inline thread_local std::mt19937 ThreadLocalRNG::rng_{std::random_device{}()};
 
 /// Per-node lock array using pointer-based storage to avoid move issues
 class NodeLocks {
