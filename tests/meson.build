@@ -47,9 +47,14 @@ test_hnsw = executable(
   dependencies: [sqlite3_dep],
 )
 
+# Detect if sanitizers are enabled (TSAN/ASAN add significant overhead)
+# Meson doesn't expose b_sanitize directly, so we check compiler args
+is_sanitized = get_option('b_sanitize') != 'none'
+hnsw_timeout = is_sanitized ? 900 : 300
+
 test('Concepts and VectorView', test_concepts)
 test('Distance Metrics', test_distances)
 test('Utilities (Array)', test_utils)
 test('SQLite Functions (Comprehensive)', test_sqlite_functions, timeout: 60)
 test('Batch Distance Operations', test_batch_distance)
-test('HNSW Index', test_hnsw, timeout: 300)
+test('HNSW Index', test_hnsw, timeout: hnsw_timeout)
