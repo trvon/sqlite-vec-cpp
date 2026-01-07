@@ -8,7 +8,10 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # =============================================================================
+  # Linux Tests
+  # =============================================================================
+  test-linux:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,8 +29,13 @@ jobs:
             python3-pip \
             gcovr
 
-      - name: Configure (coverage)
-        run: meson setup build_coverage -Dbuildtype=debugoptimized -Db_coverage=true
+      - name: Configure (coverage, no SIMD)
+        run: |
+          meson setup build_coverage \
+            -Dbuildtype=debugoptimized \
+            -Db_coverage=true \
+            -Denable_simd_avx=false \
+            -Denable_simd_neon=false
 
       - name: Build
         run: meson compile -C build_coverage
@@ -50,10 +58,13 @@ jobs:
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: coverage
+          name: coverage-linux
           path: coverage/
 
-  tsan:
+  # =============================================================================
+  # Linux TSAN
+  # =============================================================================
+  tsan-linux:
     runs-on: ubuntu-latest
 
     steps:
@@ -69,11 +80,13 @@ jobs:
             pkg-config \
             libsqlite3-dev
 
-      - name: Configure (TSAN)
+      - name: Configure (TSAN, no SIMD)
         run: |
           CC=clang CXX=clang++ meson setup build_tsan \
             -Dbuildtype=debugoptimized \
-            -Db_sanitize=thread
+            -Db_sanitize=thread \
+            -Denable_simd_avx=false \
+            -Denable_simd_neon=false
 
       - name: Build
         run: meson compile -C build_tsan
@@ -81,7 +94,10 @@ jobs:
       - name: Test
         run: meson test -C build_tsan
 
-  benchmarks:
+  # =============================================================================
+  # Linux Benchmarks
+  # =============================================================================
+  benchmarks-linux:
     runs-on: ubuntu-latest
 
     steps:
@@ -97,8 +113,13 @@ jobs:
             libsqlite3-dev \
             libbenchmark-dev
 
-      - name: Configure (release + benchmarks)
-        run: meson setup build_bench -Dbuildtype=release -Denable_benchmarks=true
+      - name: Configure (release + benchmarks, no SIMD)
+        run: |
+          meson setup build_bench \
+            -Dbuildtype=release \
+            -Denable_benchmarks=true \
+            -Denable_simd_avx=false \
+            -Denable_simd_neon=false
 
       - name: Build
         run: meson compile -C build_bench
@@ -112,5 +133,104 @@ jobs:
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bench_results
+          name: bench_results-linux
           path: bench_results/*.json
+
+  # =============================================================================
+  # macOS Tests (ARM64 - NEON)
+  # =============================================================================
+  test-macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          brew install meson ninja pkg-config sqlite
+
+      - name: Configure
+        run: |
+          meson setup build \
+            -Dbuildtype=debugoptimized \
+            -Denable_simd_avx=false \
+            -Denable_simd_neon=true
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build
+
+  # =============================================================================
+  # Windows Tests (MSVC)
+  # =============================================================================
+  test-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          pip install meson ninja
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install SQLite via vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat
+          C:\vcpkg\vcpkg install sqlite3:x64-windows
+
+      - name: Configure
+        run: |
+          meson setup build `
+            -Dbuildtype=debugoptimized `
+            -Denable_simd_avx=false `
+            -Denable_simd_neon=false `
+            --pkg-config-path=C:\vcpkg\installed\x64-windows\lib\pkgconfig
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build
+
+  # =============================================================================
+  # Windows Tests (MinGW)
+  # =============================================================================
+  test-windows-mingw:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-sqlite3
+
+      - name: Configure
+        run: |
+          meson setup build \
+            -Dbuildtype=debugoptimized \
+            -Denable_simd_avx=false \
+            -Denable_simd_neon=false
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build
