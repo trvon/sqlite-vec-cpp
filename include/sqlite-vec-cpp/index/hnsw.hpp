@@ -47,14 +47,49 @@ namespace sqlite_vec_cpp::index {
 /// @tparam MetricT Distance metric type (must work with float spans)
 template <concepts::VectorElement StorageT, typename MetricT> class HNSWIndex {
 public:
-    /// Configuration parameters
+    /// Configuration parameters for HNSW index
+    /// Tuned for high recall on large corpora (10K+ vectors) with high-dimensional embeddings
     struct Config {
-        size_t M = 16;                           ///< Connections per node per layer
-        size_t M_max = 32;                       ///< Max connections (layer > 0)
-        size_t M_max_0 = 32;                     ///< Max connections (layer 0)
-        size_t ef_construction = 200;            ///< Exploration factor during construction
-        float ml_factor = 1.0f / std::log(2.0f); ///< Layer selection multiplier
+        size_t M = 16;                ///< Connections per node per layer (16-48 typical)
+        size_t M_max = 32;            ///< Max connections for layers > 0 (usually 2*M)
+        size_t M_max_0 = 64;          ///< Max connections at layer 0 (critical for recall, 2-4x M)
+        size_t ef_construction = 200; ///< Exploration factor during construction (100-500)
+        float ml_factor = 1.0f / std::log(2.0f); ///< Layer selection multiplier (1/ln(2))
         MetricT metric{};                        ///< Distance metric (operates on float spans)
+
+        /// Create config optimized for high recall on large corpora
+        /// @param corpus_size Expected number of vectors
+        /// @param dim Vector dimensionality (higher dims need more connectivity)
+        /// @return Config with parameters tuned for the corpus size
+        static Config for_corpus(size_t corpus_size, size_t dim = 128) {
+            Config cfg;
+
+            // Higher M for high-dimensional data (embeddings typically 384-1536)
+            if (dim >= 256) {
+                cfg.M = 24;
+                cfg.M_max = 48;
+                cfg.M_max_0 = 96;
+            } else if (dim >= 128) {
+                cfg.M = 16;
+                cfg.M_max = 32;
+                cfg.M_max_0 = 64;
+            } else {
+                cfg.M = 12;
+                cfg.M_max = 24;
+                cfg.M_max_0 = 48;
+            }
+
+            // Higher ef_construction for larger corpora
+            if (corpus_size >= 100000) {
+                cfg.ef_construction = 400;
+            } else if (corpus_size >= 10000) {
+                cfg.ef_construction = 200;
+            } else {
+                cfg.ef_construction = 100;
+            }
+
+            return cfg;
+        }
     };
 
     /// Alias for node type
@@ -278,6 +313,60 @@ public:
         return candidates;
     }
 
+    /// Batch search for multiple queries in parallel
+    /// Processes queries across multiple threads for higher throughput
+    /// @param queries Vector of query vectors (each is float32)
+    /// @param k Number of neighbors to return per query
+    /// @param ef_search Exploration factor (higher = better recall, slower)
+    /// @param num_threads Number of threads (0 = auto-detect based on hardware)
+    /// @return Vector of results, one per query (each is vector of (id, distance) pairs)
+    std::vector<std::vector<std::pair<size_t, float>>>
+    search_batch(std::span<const std::span<const float>> queries, size_t k, size_t ef_search = 50,
+                 size_t num_threads = 0) const {
+        return search_batch_with_filter(queries, k, ef_search, nullptr, num_threads);
+    }
+
+    /// Batch search with pre-filtering
+    /// @param queries Vector of query vectors (each is float32)
+    /// @param k Number of neighbors to return per query
+    /// @param ef_search Exploration factor (higher = better recall, slower)
+    /// @param filter Optional filter function: returns true if node should be included
+    /// @param num_threads Number of threads (0 = auto-detect based on hardware)
+    /// @return Vector of results, one per query (each is vector of (id, distance) pairs)
+    std::vector<std::vector<std::pair<size_t, float>>>
+    search_batch_with_filter(std::span<const std::span<const float>> queries, size_t k,
+                             size_t ef_search, FilterFn filter, size_t num_threads = 0) const {
+        if (queries.empty() || nodes_.empty()) {
+            return std::vector<std::vector<std::pair<size_t, float>>>(queries.size());
+        }
+
+        size_t actual_threads = num_threads ? num_threads : std::thread::hardware_concurrency();
+        if (actual_threads == 0) {
+            actual_threads = 1;
+        }
+
+        // For small batches, sequential is faster (avoids thread overhead)
+        if (queries.size() < 4 || actual_threads == 1) {
+            std::vector<std::vector<std::pair<size_t, float>>> results;
+            results.reserve(queries.size());
+            for (const auto& query : queries) {
+                results.push_back(search_with_filter(query, k, ef_search, filter));
+            }
+            return results;
+        }
+
+        // Pre-allocate results
+        std::vector<std::vector<std::pair<size_t, float>>> results(queries.size());
+
+        // Use thread pool for parallel search
+        ThreadPool pool(actual_threads);
+        pool.parallel_for(queries.size(), [&](size_t /*thread_id*/, size_t query_idx) {
+            results[query_idx] = search_with_filter(queries[query_idx], k, ef_search, filter);
+        });
+
+        return results;
+    }
+
     /// Batch build from vectors (sequential)
     void build(std::span<const size_t> ids, std::span<const std::span<const StorageT>> vectors) {
         if (ids.size() != vectors.size()) {
@@ -445,6 +534,143 @@ public:
 
     /// Get configuration
     const Config& config() const { return config_; }
+
+    // ========== Adaptive Search API ==========
+
+    /// Calculate recommended ef_search based on corpus size for target recall
+    /// Uses empirical scaling: ef_search ≈ k * sqrt(N) / 10 for 95%+ recall
+    /// @param k Number of neighbors to retrieve
+    /// @param target_recall Target recall (0.9 = 90%, 0.95 = 95%, 0.99 = 99%)
+    /// @return Recommended ef_search value
+    [[nodiscard]] size_t recommended_ef_search(size_t k, float target_recall = 0.95f) const {
+        size_t n = nodes_.size();
+        if (n == 0)
+            return k;
+
+        // Base ef_search scales with sqrt(N) for consistent recall
+        // Higher target_recall requires exponentially more exploration
+        double base = static_cast<double>(k) * std::sqrt(static_cast<double>(n)) / 10.0;
+
+        // Recall multiplier: 1.0 at 90%, 1.5 at 95%, 3.0 at 99%
+        double recall_factor = 1.0;
+        if (target_recall >= 0.99f) {
+            recall_factor = 3.0;
+        } else if (target_recall >= 0.95f) {
+            recall_factor = 1.5;
+        } else if (target_recall >= 0.90f) {
+            recall_factor = 1.0;
+        } else {
+            recall_factor = 0.7; // Lower recall = less exploration needed
+        }
+
+        size_t ef = static_cast<size_t>(base * recall_factor);
+
+        // Clamp to reasonable range [k, 2000]
+        return std::clamp(ef, k, size_t{2000});
+    }
+
+    /// Search with adaptive ef_search based on corpus size
+    /// Automatically selects ef_search for target recall
+    /// @param query Query vector (float32)
+    /// @param k Number of neighbors to return
+    /// @param target_recall Target recall (default 0.95 = 95%)
+    /// @return Vector of (id, distance) pairs, sorted by distance
+    std::vector<std::pair<size_t, float>> search_adaptive(std::span<const float> query, size_t k,
+                                                          float target_recall = 0.95f) const {
+        size_t ef = recommended_ef_search(k, target_recall);
+        return search(query, k, ef);
+    }
+
+    // ========== Graph Quality Metrics ==========
+
+    /// Statistics about the HNSW graph structure
+    struct GraphStats {
+        size_t num_nodes = 0;            ///< Total nodes in graph
+        size_t num_layers = 0;           ///< Number of layers (max_layer + 1)
+        size_t total_edges = 0;          ///< Total edges across all layers
+        double avg_degree_layer0 = 0.0;  ///< Average degree at layer 0
+        double avg_degree_upper = 0.0;   ///< Average degree at layers > 0
+        size_t min_degree_layer0 = 0;    ///< Minimum degree at layer 0
+        size_t max_degree_layer0 = 0;    ///< Maximum degree at layer 0
+        size_t orphan_count = 0;         ///< Nodes with 0 edges at layer 0 (bad for recall)
+        size_t underconnected = 0;       ///< Nodes with degree < M/2 at layer 0
+        double connectivity_score = 0.0; ///< 0-1 score (1 = fully connected)
+
+        /// Check if graph quality is acceptable for high recall
+        [[nodiscard]] bool is_healthy() const {
+            return orphan_count == 0 && connectivity_score >= 0.8 && min_degree_layer0 >= 2;
+        }
+    };
+
+    /// Compute graph quality metrics
+    /// @return GraphStats with connectivity analysis
+    [[nodiscard]] GraphStats compute_graph_stats() const {
+        GraphStats stats;
+        stats.num_nodes = nodes_.size();
+
+        if (nodes_.empty()) {
+            return stats;
+        }
+
+        stats.num_layers = entry_point_layer_.load(std::memory_order_relaxed) + 1;
+
+        size_t total_degree_layer0 = 0;
+        size_t total_degree_upper = 0;
+        size_t nodes_in_upper_layers = 0;
+        stats.min_degree_layer0 = std::numeric_limits<size_t>::max();
+        stats.max_degree_layer0 = 0;
+
+        for (const auto& [id, node] : nodes_) {
+            // Layer 0 stats (all nodes exist at layer 0)
+            size_t degree0 = node.neighbors(0).size();
+            total_degree_layer0 += degree0;
+            stats.total_edges += degree0;
+
+            if (degree0 < stats.min_degree_layer0) {
+                stats.min_degree_layer0 = degree0;
+            }
+            if (degree0 > stats.max_degree_layer0) {
+                stats.max_degree_layer0 = degree0;
+            }
+            if (degree0 == 0) {
+                stats.orphan_count++;
+            }
+            if (degree0 < config_.M / 2) {
+                stats.underconnected++;
+            }
+
+            // Upper layer stats
+            for (size_t layer = 1; layer <= node.max_layer(); ++layer) {
+                size_t degree = node.neighbors(layer).size();
+                total_degree_upper += degree;
+                stats.total_edges += degree;
+                nodes_in_upper_layers++;
+            }
+        }
+
+        // Edges are counted twice (bidirectional), so divide by 2
+        stats.total_edges /= 2;
+
+        stats.avg_degree_layer0 =
+            static_cast<double>(total_degree_layer0) / static_cast<double>(stats.num_nodes);
+
+        if (nodes_in_upper_layers > 0) {
+            stats.avg_degree_upper = static_cast<double>(total_degree_upper) /
+                                     static_cast<double>(nodes_in_upper_layers);
+        }
+
+        // Connectivity score: based on avg degree vs target M and orphan rate
+        double degree_ratio = stats.avg_degree_layer0 / static_cast<double>(config_.M_max_0);
+        double orphan_ratio =
+            1.0 - static_cast<double>(stats.orphan_count) / static_cast<double>(stats.num_nodes);
+        double underconnected_ratio =
+            1.0 - static_cast<double>(stats.underconnected) / static_cast<double>(stats.num_nodes);
+
+        stats.connectivity_score = std::min({degree_ratio, orphan_ratio, underconnected_ratio});
+        stats.connectivity_score = std::clamp(stats.connectivity_score, 0.0, 1.0);
+
+        return stats;
+    }
 
     /// Iterator support for serialization
     auto begin() const { return nodes_.begin(); }
@@ -800,6 +1026,7 @@ private:
     }
 
     /// Prune connections to maintain M_max limit
+    /// Uses heuristic pruning (HNSW paper algorithm 4) for better graph diversity
     void prune_connections(size_t node_id, size_t layer) {
         auto it = nodes_.find(node_id);
         if (it == nodes_.end())
@@ -812,10 +1039,10 @@ private:
         if (neighbors.size() <= M_max)
             return;
 
+        // Collect neighbor distances and sort by distance
         std::vector<std::pair<size_t, float>> neighbor_dists;
         neighbor_dists.reserve(neighbors.size());
         for (size_t neighbor : neighbors) {
-            // Verify neighbor still exists
             if (nodes_.find(neighbor) == nodes_.end())
                 continue;
             neighbor_dists.emplace_back(neighbor, distance(node_id, neighbor));
@@ -824,9 +1051,52 @@ private:
         std::sort(neighbor_dists.begin(), neighbor_dists.end(),
                   [](const auto& a, const auto& b) { return a.second < b.second; });
 
-        std::unordered_set<size_t> to_remove;
-        for (size_t i = M_max; i < neighbor_dists.size(); ++i) {
-            to_remove.insert(neighbor_dists[i].first);
+        // Heuristic pruning: select diverse neighbors
+        // Keep neighbor if it's closer to node than to any already-selected neighbor
+        // This promotes graph diversity and improves recall for clustered data
+        std::vector<size_t> selected;
+        selected.reserve(M_max);
+
+        for (const auto& [neighbor_id, dist_to_node] : neighbor_dists) {
+            if (selected.size() >= M_max)
+                break;
+
+            // Check if this neighbor is "diverse" - not too close to already selected
+            bool is_diverse = true;
+            for (size_t sel : selected) {
+                float dist_to_selected = distance(neighbor_id, sel);
+                // If neighbor is closer to an already-selected node than to our node,
+                // it's redundant (the selected node can reach it)
+                if (dist_to_selected < dist_to_node) {
+                    is_diverse = false;
+                    break;
+                }
+            }
+
+            if (is_diverse) {
+                selected.push_back(neighbor_id);
+            }
+        }
+
+        // If heuristic pruning left us short, add closest remaining
+        // (this ensures we always have M_max connections if possible)
+        if (selected.size() < M_max) {
+            for (const auto& [neighbor_id, dist] : neighbor_dists) {
+                if (selected.size() >= M_max)
+                    break;
+                if (std::find(selected.begin(), selected.end(), neighbor_id) == selected.end()) {
+                    selected.push_back(neighbor_id);
+                }
+            }
+        }
+
+        // Remove edges not in selected set
+        std::unordered_set<size_t> selected_set(selected.begin(), selected.end());
+        std::vector<size_t> to_remove;
+        for (const auto& [neighbor_id, dist] : neighbor_dists) {
+            if (!selected_set.contains(neighbor_id)) {
+                to_remove.push_back(neighbor_id);
+            }
         }
 
         for (size_t neighbor : to_remove) {

@@ -66,6 +66,9 @@ struct float16_t {
         return std::bit_cast<float>(result);
     }
 
+    /// Explicit conversion to float for use in static_cast<float>(float16_t)
+    explicit operator float() const noexcept { return to_float(); }
+
     auto operator<=>(const float16_t& other) const noexcept = default;
 
     bool operator==(const float16_t& other) const noexcept = default;

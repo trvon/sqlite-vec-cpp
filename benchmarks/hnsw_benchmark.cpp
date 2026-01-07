@@ -235,4 +235,63 @@ BENCHMARK(BM_HNSW_Recall_Quality)->Arg(100);
 BENCHMARK(BM_HNSW_Recall_Quality)->Arg(200);
 BENCHMARK(BM_HNSW_Recall_Quality)->Arg(500);
 
+// ============================================================================
+// Benchmark: Batch Search Throughput
+// ============================================================================
+
+static void BM_HNSW_Batch_Search(benchmark::State& state) {
+    size_t corpus_size = state.range(0);
+    size_t dim = state.range(1);
+    size_t num_queries = state.range(2);
+    size_t num_threads = state.range(3);
+    size_t k = 10;
+    size_t ef_search = 50;
+
+    std::mt19937 rng(42);
+
+    // Build index
+    HNSWIndex<float, L2Metric<float>> index;
+    std::vector<std::vector<float>> vectors;
+    vectors.reserve(corpus_size);
+    for (size_t i = 0; i < corpus_size; ++i) {
+        vectors.push_back(generate_vector(dim, rng));
+        index.insert(i, std::span<const float>{vectors[i]});
+    }
+
+    // Generate queries
+    std::vector<std::vector<float>> query_data;
+    std::vector<std::span<const float>> queries;
+    query_data.reserve(num_queries);
+    queries.reserve(num_queries);
+    for (size_t i = 0; i < num_queries; ++i) {
+        query_data.push_back(generate_vector(dim, rng));
+    }
+    for (auto& q : query_data) {
+        queries.push_back(std::span<const float>{q});
+    }
+
+    // Benchmark batch search
+    for (auto _ : state) {
+        auto results = index.search_batch(queries, k, ef_search, num_threads);
+        benchmark::DoNotOptimize(results);
+    }
+
+    state.counters["corpus"] = corpus_size;
+    state.counters["queries"] = num_queries;
+    state.counters["threads"] = num_threads;
+    state.counters["QPS"] =
+        benchmark::Counter(num_queries, benchmark::Counter::kIsIterationInvariantRate);
+}
+
+// Batch search thread scaling (10K corpus, 384d, 100 queries)
+BENCHMARK(BM_HNSW_Batch_Search)->Args({10000, 384, 100, 1});
+BENCHMARK(BM_HNSW_Batch_Search)->Args({10000, 384, 100, 2});
+BENCHMARK(BM_HNSW_Batch_Search)->Args({10000, 384, 100, 4});
+BENCHMARK(BM_HNSW_Batch_Search)->Args({10000, 384, 100, 8});
+
+// Batch size scaling (10K corpus, 384d, 4 threads)
+BENCHMARK(BM_HNSW_Batch_Search)->Args({10000, 384, 10, 4});
+BENCHMARK(BM_HNSW_Batch_Search)->Args({10000, 384, 100, 4});
+BENCHMARK(BM_HNSW_Batch_Search)->Args({10000, 384, 1000, 4});
+
 BENCHMARK_MAIN();

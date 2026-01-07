@@ -278,6 +278,123 @@ inline float cosine_distance_float_neon(std::span<const float> a, std::span<cons
     return 1.0f - (dot / denom);
 }
 
+/// NEON-optimized dot product for int8 vectors using DotProd instruction
+/// Available on ARMv8.2+ (Apple M1, Cortex-A75+, etc.)
+/// Processes 16 int8 values per iteration with fused multiply-accumulate
+/// @param a First int8 vector
+/// @param b Second int8 vector
+/// @return Dot product as int32
+#if defined(__ARM_FEATURE_DOTPROD)
+inline std::int32_t dot_product_int8_neon_dotprod(std::span<const std::int8_t> a,
+                                                  std::span<const std::int8_t> b) {
+    const std::size_t size = a.size();
+    const std::size_t qty64 = size >> 6;  // size / 64
+    const std::size_t end64 = qty64 << 6; // Aligned to 64 bytes
+
+    int32x4_t acc0 = vdupq_n_s32(0);
+    int32x4_t acc1 = vdupq_n_s32(0);
+    int32x4_t acc2 = vdupq_n_s32(0);
+    int32x4_t acc3 = vdupq_n_s32(0);
+
+    std::size_t i = 0;
+
+    // Process 64 int8s per iteration (4 × 16)
+    while (i < end64) {
+        // Load 16 int8s and compute dot product with vdotq_s32
+        int8x16_t v1_0 = vld1q_s8(&a[i]);
+        int8x16_t v2_0 = vld1q_s8(&b[i]);
+        acc0 = vdotq_s32(acc0, v1_0, v2_0);
+
+        int8x16_t v1_1 = vld1q_s8(&a[i + 16]);
+        int8x16_t v2_1 = vld1q_s8(&b[i + 16]);
+        acc1 = vdotq_s32(acc1, v1_1, v2_1);
+
+        int8x16_t v1_2 = vld1q_s8(&a[i + 32]);
+        int8x16_t v2_2 = vld1q_s8(&b[i + 32]);
+        acc2 = vdotq_s32(acc2, v1_2, v2_2);
+
+        int8x16_t v1_3 = vld1q_s8(&a[i + 48]);
+        int8x16_t v2_3 = vld1q_s8(&b[i + 48]);
+        acc3 = vdotq_s32(acc3, v1_3, v2_3);
+
+        i += 64;
+    }
+
+    // Process remaining 16-element chunks
+    while (i + 15 < size) {
+        int8x16_t v1 = vld1q_s8(&a[i]);
+        int8x16_t v2 = vld1q_s8(&b[i]);
+        acc0 = vdotq_s32(acc0, v1, v2);
+        i += 16;
+    }
+
+    // Reduce accumulators
+    int32x4_t acc_total = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+    std::int32_t sum = vaddvq_s32(acc_total);
+
+    // Handle remaining elements (scalar)
+    while (i < size) {
+        sum += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
+        ++i;
+    }
+
+    return sum;
+}
+
+/// NEON-optimized cosine distance for int8 vectors using DotProd instruction
+/// Uses the fast dot product path for computing dot(a,b), ||a||², ||b||²
+/// @param a First int8 vector
+/// @param b Second int8 vector
+/// @return Cosine distance (1 - cosine_similarity)
+inline float cosine_distance_int8_neon_dotprod(std::span<const std::int8_t> a,
+                                               std::span<const std::int8_t> b) {
+    const std::size_t size = a.size();
+    const std::size_t qty16 = size >> 4;  // size / 16
+    const std::size_t end16 = qty16 << 4; // Aligned to 16 bytes
+
+    int32x4_t dot_acc = vdupq_n_s32(0);
+    int32x4_t a_mag_acc = vdupq_n_s32(0);
+    int32x4_t b_mag_acc = vdupq_n_s32(0);
+
+    std::size_t i = 0;
+
+    // Process 16 int8s per iteration
+    while (i < end16) {
+        int8x16_t v1 = vld1q_s8(&a[i]);
+        int8x16_t v2 = vld1q_s8(&b[i]);
+
+        // Compute dot products: a·b, a·a, b·b
+        dot_acc = vdotq_s32(dot_acc, v1, v2);
+        a_mag_acc = vdotq_s32(a_mag_acc, v1, v1);
+        b_mag_acc = vdotq_s32(b_mag_acc, v2, v2);
+
+        i += 16;
+    }
+
+    // Reduce accumulators
+    std::int32_t dot = vaddvq_s32(dot_acc);
+    std::int32_t a_mag = vaddvq_s32(a_mag_acc);
+    std::int32_t b_mag = vaddvq_s32(b_mag_acc);
+
+    // Handle remaining elements (scalar)
+    while (i < size) {
+        std::int32_t ai = static_cast<std::int32_t>(a[i]);
+        std::int32_t bi = static_cast<std::int32_t>(b[i]);
+        dot += ai * bi;
+        a_mag += ai * ai;
+        b_mag += bi * bi;
+        ++i;
+    }
+
+    // Compute cosine distance
+    float denom = std::sqrt(static_cast<float>(a_mag)) * std::sqrt(static_cast<float>(b_mag));
+    if (denom < 1e-8f) {
+        return 1.0f; // Avoid division by zero
+    }
+    return 1.0f - (static_cast<float>(dot) / denom);
+}
+#endif // __ARM_FEATURE_DOTPROD
+
 } // namespace sqlite_vec_cpp::distances::simd
 
 #endif // SQLITE_VEC_ENABLE_NEON

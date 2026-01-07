@@ -205,4 +205,54 @@ static void BM_L2_Float_Batch_1000x128(benchmark::State& state) {
 }
 BENCHMARK(BM_L2_Float_Batch_1000x128);
 
+// ============================================================================
+// SIMD-Specific Benchmarks (NEON DotProd for int8)
+// ============================================================================
+
+#if defined(SQLITE_VEC_ENABLE_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#include "../include/sqlite-vec-cpp/simd/neon.hpp"
+
+static void BM_Int8_DotProd_NEON_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        int32_t result = simd::dot_product_int8_neon_dotprod(std::span<const int8_t>(a),
+                                                             std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_DotProd_NEON_384);
+
+static void BM_Int8_DotProd_Scalar_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        int32_t sum = 0;
+        for (size_t i = 0; i < 384; ++i) {
+            sum += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
+        }
+        benchmark::DoNotOptimize(sum);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_DotProd_Scalar_384);
+
+static void BM_Int8_Cosine_NEON_DotProd_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        float result = simd::cosine_distance_int8_neon_dotprod(std::span<const int8_t>(a),
+                                                               std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_Cosine_NEON_DotProd_384);
+
+#endif // SQLITE_VEC_ENABLE_NEON && __ARM_FEATURE_DOTPROD
+
 BENCHMARK_MAIN();

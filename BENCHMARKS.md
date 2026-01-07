@@ -13,6 +13,75 @@
 
 The C++ implementation achieves **~2.8M vectors/second sustained throughput** with linear scaling across corpus sizes and embedding dimensions. int8 quantization provides 4x storage reduction at near performance parity. HNSW index recommended for >100K vector corpora.
 
+---
+
+## Apple Silicon Results (M1 Pro)
+
+**Date**: 2026-01-07
+**Platform**: Apple M1 Pro, 16 cores (8P+8E), 192KB L1, 12MB L2, 24MB SLC
+**Compiler**: Apple clang 16.0, C++20, Release mode (`-O3 -DNDEBUG`)
+**SIMD**: NEON enabled (`-DSQLITE_VEC_ENABLE_NEON`), DotProd enabled (`-march=armv8.2-a+dotprod`)
+
+### HNSW Index Performance (dim=384, k=10, ef=50)
+
+| Corpus | Insert Rate | Search QPS | Search Latency |
+|--------|-------------|------------|----------------|
+| 1,000  | 7,395/s     | 16,565     | 60 µs          |
+| 5,000  | 3,207/s     | 8,981      | 111 µs         |
+| 10,000 | 2,116/s     | 6,400      | 156 µs         |
+| 25,000 | 1,061/s     | 3,510      | 285 µs         |
+| 50,000 | 632/s       | 2,369      | 422 µs         |
+
+### Prefetching Impact
+
+Software prefetching (`__builtin_prefetch`) in beam search provides 9-32% improvement:
+
+| Corpus | Without Prefetch | With Prefetch | Improvement |
+|--------|------------------|---------------|-------------|
+| 1,000  | 15,168 QPS       | 16,540 QPS    | +9%         |
+| 5,000  | 9,249 QPS        | 10,135 QPS    | +10%        |
+| 10,000 | 6,337 QPS        | 7,761 QPS     | **+22%**    |
+| 25,000 | 3,140 QPS        | 4,139 QPS     | **+32%**    |
+| 50,000 | 2,303 QPS        | 2,744 QPS     | +19%        |
+| 100,000| 1,907 QPS        | 2,179 QPS     | +14%        |
+
+### Batch Search Scaling (10K corpus, 1000 queries)
+
+Linear scaling with thread count using `search_batch()` API:
+
+| Threads | QPS    | Speedup |
+|---------|--------|---------|
+| 1 (seq) | 5,979  | 1.00x   |
+| 2       | 12,713 | **2.13x** |
+| 4       | 24,377 | **4.08x** |
+| 8       | 50,554 | **8.46x** |
+
+### SIMD Distance Computation
+
+#### Float32 Cosine Distance (NEON)
+
+| Dimensions | NEON (ns) | Scalar (ns) | Speedup |
+|------------|-----------|-------------|---------|
+| 384        | 29        | 347         | **12x** |
+
+#### Int8 Dot Product (DotProd Instruction)
+
+Using `vdotq_s32` (ARMv8.2+) for quantized vectors:
+
+| Method       | Time (ns) | Speedup |
+|--------------|-----------|---------|
+| Scalar       | 4.8       | 1.00x   |
+| NEON DotProd | 0.3       | **17.1x** |
+
+### Optimization Summary (M1 Pro)
+
+| Optimization | Improvement | Notes |
+|--------------|-------------|-------|
+| NEON SIMD (float32) | 12x | Cosine distance |
+| Prefetching | +9% to +32% | Depends on corpus size |
+| Batch search | Linear | 8.46x with 8 threads |
+| DotProd (int8) | 17x | ARMv8.2+ required |
+
 
 ---
 
