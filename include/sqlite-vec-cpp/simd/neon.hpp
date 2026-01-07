@@ -198,6 +198,86 @@ inline double l1_distance_float_neon(std::span<const float> a, std::span<const f
     return sum;
 }
 
+/// NEON-optimized cosine distance for float vectors
+/// cosine_distance = 1 - (dot(a,b) / (||a|| * ||b||))
+/// Requires: NEON support, size >= 4
+inline float cosine_distance_float_neon(std::span<const float> a, std::span<const float> b) {
+    const std::size_t size = a.size();
+    const std::size_t qty16 = size >> 4;    // size / 16
+    const std::size_t end_idx = qty16 << 4; // (size / 16) * 16
+
+    float32x4_t dot0 = vdupq_n_f32(0.0f);
+    float32x4_t dot1 = vdupq_n_f32(0.0f);
+    float32x4_t dot2 = vdupq_n_f32(0.0f);
+    float32x4_t dot3 = vdupq_n_f32(0.0f);
+
+    float32x4_t a_mag0 = vdupq_n_f32(0.0f);
+    float32x4_t a_mag1 = vdupq_n_f32(0.0f);
+    float32x4_t a_mag2 = vdupq_n_f32(0.0f);
+    float32x4_t a_mag3 = vdupq_n_f32(0.0f);
+
+    float32x4_t b_mag0 = vdupq_n_f32(0.0f);
+    float32x4_t b_mag1 = vdupq_n_f32(0.0f);
+    float32x4_t b_mag2 = vdupq_n_f32(0.0f);
+    float32x4_t b_mag3 = vdupq_n_f32(0.0f);
+
+    std::size_t i = 0;
+    while (i < end_idx) {
+        // Process 4 sets of 4 floats = 16 floats per iteration
+        float32x4_t v1 = vld1q_f32(&a[i]);
+        float32x4_t v2 = vld1q_f32(&b[i]);
+        dot0 = vfmaq_f32(dot0, v1, v2);
+        a_mag0 = vfmaq_f32(a_mag0, v1, v1);
+        b_mag0 = vfmaq_f32(b_mag0, v2, v2);
+        i += 4;
+
+        v1 = vld1q_f32(&a[i]);
+        v2 = vld1q_f32(&b[i]);
+        dot1 = vfmaq_f32(dot1, v1, v2);
+        a_mag1 = vfmaq_f32(a_mag1, v1, v1);
+        b_mag1 = vfmaq_f32(b_mag1, v2, v2);
+        i += 4;
+
+        v1 = vld1q_f32(&a[i]);
+        v2 = vld1q_f32(&b[i]);
+        dot2 = vfmaq_f32(dot2, v1, v2);
+        a_mag2 = vfmaq_f32(a_mag2, v1, v1);
+        b_mag2 = vfmaq_f32(b_mag2, v2, v2);
+        i += 4;
+
+        v1 = vld1q_f32(&a[i]);
+        v2 = vld1q_f32(&b[i]);
+        dot3 = vfmaq_f32(dot3, v1, v2);
+        a_mag3 = vfmaq_f32(a_mag3, v1, v1);
+        b_mag3 = vfmaq_f32(b_mag3, v2, v2);
+        i += 4;
+    }
+
+    // Reduce sums
+    float32x4_t dot_total = vaddq_f32(vaddq_f32(dot0, dot1), vaddq_f32(dot2, dot3));
+    float32x4_t a_mag_total = vaddq_f32(vaddq_f32(a_mag0, a_mag1), vaddq_f32(a_mag2, a_mag3));
+    float32x4_t b_mag_total = vaddq_f32(vaddq_f32(b_mag0, b_mag1), vaddq_f32(b_mag2, b_mag3));
+
+    float dot = vaddvq_f32(dot_total);
+    float a_mag = vaddvq_f32(a_mag_total);
+    float b_mag = vaddvq_f32(b_mag_total);
+
+    // Handle remaining elements (scalar)
+    while (i < size) {
+        dot += a[i] * b[i];
+        a_mag += a[i] * a[i];
+        b_mag += b[i] * b[i];
+        ++i;
+    }
+
+    // Compute cosine distance
+    float denom = std::sqrt(a_mag) * std::sqrt(b_mag);
+    if (denom < 1e-8f) {
+        return 1.0f; // Avoid division by zero
+    }
+    return 1.0f - (dot / denom);
+}
+
 } // namespace sqlite_vec_cpp::distances::simd
 
 #endif // SQLITE_VEC_ENABLE_NEON

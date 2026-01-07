@@ -17,6 +17,27 @@
 #include "hnsw_node.hpp"
 #include "hnsw_threading.hpp"
 
+// Prefetch hints for vector data during graph traversal
+// Define HNSW_DISABLE_PREFETCH to disable prefetching (for benchmarking)
+// Uses __builtin_prefetch on GCC/Clang, _mm_prefetch on MSVC
+#ifndef HNSW_DISABLE_PREFETCH
+#if defined(__GNUC__) || defined(__clang__)
+#define HNSW_PREFETCH_READ(addr) __builtin_prefetch(addr, 0, 3)  // read, high temporal locality
+#define HNSW_PREFETCH_WRITE(addr) __builtin_prefetch(addr, 1, 3) // write, high temporal locality
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#define HNSW_PREFETCH_READ(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#define HNSW_PREFETCH_WRITE(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#else
+#define HNSW_PREFETCH_READ(addr) ((void)0)
+#define HNSW_PREFETCH_WRITE(addr) ((void)0)
+#endif
+#else
+// Prefetching disabled for benchmarking
+#define HNSW_PREFETCH_READ(addr) ((void)0)
+#define HNSW_PREFETCH_WRITE(addr) ((void)0)
+#endif
+
 namespace sqlite_vec_cpp::index {
 
 /// Hierarchical Navigable Small World (HNSW) index for approximate nearest neighbor search
@@ -95,70 +116,117 @@ public:
 
     /// Insert vector into index (storage type StorageT, converts to float32 for graph operations)
     void insert(size_t id, std::span<const StorageT> vector) {
-        // Convert to float32 for graph search operations
-        std::vector<float> vector_f32 = to_float_vector(vector);
+        // For float storage, use input directly; for fp16, convert to float32
+        // Use stack buffer for typical embedding dimensions (up to 1536)
+        // to avoid heap allocation in the common case
+        alignas(32) float stack_buffer[1536];
+        std::span<const float> vector_f32;
+        std::vector<float> heap_buffer; // Only used if vector.size() > 1536
+
+        if constexpr (std::same_as<StorageT, float>) {
+            vector_f32 = vector;
+        } else {
+            if (vector.size() <= 1536) {
+                for (size_t i = 0; i < vector.size(); ++i) {
+                    stack_buffer[i] = static_cast<float>(vector[i]);
+                }
+                vector_f32 = std::span<const float>(stack_buffer, vector.size());
+            } else {
+                heap_buffer = to_float_vector(vector);
+                vector_f32 = heap_buffer;
+            }
+        }
 
         // Assign random layer using thread-local RNG
         size_t layer = random_layer();
 
-        // Create and insert node with write lock
+        // Create and insert node with write lock (brief)
+        bool is_first_node = false;
+        bool is_new_entry_point = false;
+        size_t old_entry = 0;
+        size_t old_layer = 0;
         {
             std::unique_lock lock(nodes_mutex_);
-            nodes_.emplace(id, NodeType(id, vector, layer));
+            // Pass M_max hint for edge pre-allocation
+            nodes_.emplace(id, NodeType(id, vector, layer, config_.M_max));
 
             // First node becomes entry point
             if (nodes_.size() == 1) {
                 entry_point_id_.store(id, std::memory_order_relaxed);
                 entry_point_layer_.store(layer, std::memory_order_relaxed);
-                return;
-            }
-
-            // Update entry point if new node has higher layer
-            if (layer > entry_point_layer_.load(std::memory_order_relaxed)) {
-                size_t old_entry = entry_point_id_.load(std::memory_order_relaxed);
-                size_t old_layer = entry_point_layer_.load(std::memory_order_relaxed);
+                is_first_node = true;
+            } else if (layer > entry_point_layer_.load(std::memory_order_relaxed)) {
+                // Update entry point if new node has higher layer
+                old_entry = entry_point_id_.load(std::memory_order_relaxed);
+                old_layer = entry_point_layer_.load(std::memory_order_relaxed);
                 entry_point_id_.store(id, std::memory_order_relaxed);
                 entry_point_layer_.store(layer, std::memory_order_relaxed);
-
-                size_t current = old_entry;
-                for (size_t lc = old_layer;; --lc) {
-                    auto candidates = beam_search_layer_locked(
-                        vector_f32, current, config_.ef_construction, lc, nullptr);
-
-                    size_t M = (lc == 0) ? config_.M_max_0 : config_.M;
-                    connect_neighbors(id, candidates, M, lc);
-
-                    if (lc == 0)
-                        break;
-                    if (!candidates.empty()) {
-                        current = candidates[0].first;
-                    }
-                }
-                return;
+                is_new_entry_point = true;
             }
-        } // Release write lock before search (search uses read lock)
+        } // Release write lock immediately
 
-        // Navigate from entry point to find insertion point at each layer
-        size_t current = entry_point_id_.load(std::memory_order_acquire);
-
-        for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > layer; --lc) {
-            current = greedy_search_layer(vector_f32, current, lc, nullptr);
+        if (is_first_node) {
+            return;
         }
 
-        {
-            std::unique_lock lock(nodes_mutex_);
-            for (size_t lc = layer;; --lc) {
-                auto candidates = beam_search_layer_locked(vector_f32, current,
-                                                           config_.ef_construction, lc, nullptr);
+        if (is_new_entry_point) {
+            // Handle new entry point case - connect from old entry point down
+            size_t current = old_entry;
+            for (size_t lc = old_layer;; --lc) {
+                // Search with read lock
+                std::vector<std::pair<size_t, float>> candidates;
+                {
+                    std::shared_lock lock(nodes_mutex_);
+                    candidates = beam_search_layer_locked(vector_f32, current,
+                                                          config_.ef_construction, lc, nullptr);
+                }
 
-                size_t M = (lc == 0) ? config_.M_max_0 : config_.M;
-                connect_neighbors(id, candidates, M, lc);
+                // Connect with write lock
+                {
+                    std::unique_lock lock(nodes_mutex_);
+                    size_t M = (lc == 0) ? config_.M_max_0 : config_.M;
+                    connect_neighbors(id, candidates, M, lc);
+                }
 
                 if (lc == 0)
                     break;
                 if (!candidates.empty()) {
                     current = candidates[0].first;
                 }
+            }
+            return;
+        }
+
+        // Normal case: navigate from entry point to find insertion point at each layer
+        size_t current = entry_point_id_.load(std::memory_order_acquire);
+
+        // Greedy search through upper layers (uses internal read lock)
+        for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > layer; --lc) {
+            std::shared_lock lock(nodes_mutex_);
+            current = greedy_search_layer_locked(vector_f32, current, lc, nullptr);
+        }
+
+        // Beam search and connect at each layer from node's layer down to 0
+        for (size_t lc = layer;; --lc) {
+            // Search with read lock (expensive operation)
+            std::vector<std::pair<size_t, float>> candidates;
+            {
+                std::shared_lock lock(nodes_mutex_);
+                candidates = beam_search_layer_locked(vector_f32, current, config_.ef_construction,
+                                                      lc, nullptr);
+            }
+
+            // Connect with write lock (cheap operation)
+            {
+                std::unique_lock lock(nodes_mutex_);
+                size_t M = (lc == 0) ? config_.M_max_0 : config_.M;
+                connect_neighbors(id, candidates, M, lc);
+            }
+
+            if (lc == 0)
+                break;
+            if (!candidates.empty()) {
+                current = candidates[0].first;
             }
         }
     }
@@ -291,7 +359,8 @@ public:
 
                 {
                     std::unique_lock lock(nodes_mutex_);
-                    nodes_.emplace(ids[i], NodeType(ids[i], vectors[i], layer));
+                    // Pass M_max hint for edge pre-allocation
+                    nodes_.emplace(ids[i], NodeType(ids[i], vectors[i], layer, config_.M_max));
 
                     size_t current_max = max_layer.load(std::memory_order_relaxed);
                     while (layer > current_max) {
@@ -534,7 +603,22 @@ private:
             const auto* current_node = try_get_node(current);
             if (!current_node)
                 break;
-            for (size_t neighbor : current_node->neighbors(layer)) {
+
+            auto neighbors = current_node->neighbors(layer);
+
+            // Prefetch first neighbor's vector data
+            if (!neighbors.empty()) {
+                prefetch_node(neighbors[0]);
+            }
+
+            for (size_t i = 0; i < neighbors.size(); ++i) {
+                size_t neighbor = neighbors[i];
+
+                // Prefetch next neighbor while computing distance for current
+                if (i + 1 < neighbors.size()) {
+                    prefetch_node(neighbors[i + 1]);
+                }
+
                 float neighbor_dist = distance(query, neighbor);
                 if (neighbor_dist < kDistanceEpsilon || neighbor_dist >= current_dist)
                     continue;
@@ -573,7 +657,9 @@ private:
                             decltype(cmp_min)>
             candidates(cmp_min);
 
-        std::unordered_set<size_t> visited;
+        // Use thread-local visited tracker instead of allocating unordered_set
+        // This avoids heap allocation per search call
+        auto& visited = ThreadLocalVisitedPool::get(nodes_.size() + 1);
 
         const auto* entry_node = try_get_node(entry_point);
         if (!entry_node)
@@ -581,7 +667,7 @@ private:
 
         float entry_dist = distance(query, entry_point);
         candidates.emplace(entry_dist, entry_point);
-        visited.insert(entry_point);
+        visited.visit(entry_point);
 
         auto passes_filter = [&](size_t id) {
             return !is_deleted(id) && (!filter || (*filter)(id));
@@ -608,10 +694,34 @@ private:
                 break;
             }
 
-            for (size_t neighbor : current_node->neighbors(layer)) {
-                if (visited.count(neighbor))
+            // Get neighbors and filter out already-visited ones
+            auto neighbors = current_node->neighbors(layer);
+
+            // Prefetch first unvisited neighbor's vector data before entering loop
+            // This hides memory latency for the first distance calculation
+            for (size_t neighbor : neighbors) {
+                if (!visited.is_visited(neighbor)) {
+                    prefetch_node(neighbor);
+                    break;
+                }
+            }
+
+            size_t prefetch_idx = 0;
+            for (size_t i = 0; i < neighbors.size(); ++i) {
+                size_t neighbor = neighbors[i];
+                if (visited.is_visited(neighbor))
                     continue;
-                visited.insert(neighbor);
+                visited.visit(neighbor);
+
+                // Prefetch next unvisited neighbor while we compute distance for current
+                // Look ahead to find the next neighbor that hasn't been visited
+                for (size_t j = i + 1; j < neighbors.size() && prefetch_idx <= i; ++j) {
+                    if (!visited.is_visited(neighbors[j])) {
+                        prefetch_node(neighbors[j]);
+                        prefetch_idx = j;
+                        break;
+                    }
+                }
 
                 float neighbor_dist = distance(query, neighbor);
                 if (neighbor_dist < kDistanceEpsilon)
@@ -662,20 +772,27 @@ private:
     void connect_neighbors(size_t node_id, const std::vector<std::pair<size_t, float>>& candidates,
                            size_t M, size_t layer) {
         size_t num_connections = std::min(M, candidates.size());
+        if (num_connections == 0)
+            return;
+
+        // Cache the node lookup - it won't change during this function
+        auto it_node = nodes_.find(node_id);
+        if (it_node == nodes_.end())
+            return;
+
+        size_t M_max = (layer == 0) ? config_.M_max_0 : config_.M_max;
 
         for (size_t i = 0; i < num_connections; ++i) {
             size_t neighbor_id = candidates[i].first;
 
-            // Verify both nodes exist (may not during concurrent insertion)
-            auto it_node = nodes_.find(node_id);
+            // Verify neighbor exists (may not during concurrent insertion)
             auto it_neighbor = nodes_.find(neighbor_id);
-            if (it_node == nodes_.end() || it_neighbor == nodes_.end())
+            if (it_neighbor == nodes_.end())
                 continue;
 
             it_node->second.add_edge(neighbor_id, layer);
             it_neighbor->second.add_edge(node_id, layer);
 
-            size_t M_max = (layer == 0) ? config_.M_max_0 : config_.M_max;
             if (it_neighbor->second.neighbors(layer).size() > M_max) {
                 prune_connections(it_neighbor->first, layer);
             }
@@ -742,6 +859,31 @@ private:
     const NodeType* try_get_node(size_t id) const {
         auto it = nodes_.find(id);
         return (it != nodes_.end()) ? &it->second : nullptr;
+    }
+
+    /// Prefetch node's vector data into CPU cache for upcoming distance calculation
+    /// Call this 1-2 iterations before you need the data to hide memory latency
+    /// @param id Node ID to prefetch
+    void prefetch_node(size_t id) const {
+        auto it = nodes_.find(id);
+        if (it != nodes_.end()) {
+            // Prefetch the vector data (this is what distance calculation reads)
+            // Prefetch first cache line (64 bytes = 16 floats) of the vector
+            if (!it->second.vector.empty()) {
+                HNSW_PREFETCH_READ(it->second.vector.data());
+                // For high-dimensional vectors, prefetch additional cache lines
+                // 384-dim float vector = 1536 bytes = 24 cache lines
+                // Prefetching 2-3 more lines helps hide memory latency
+                constexpr size_t kCacheLineSize = 64;
+                constexpr size_t kElementsPerCacheLine = kCacheLineSize / sizeof(StorageT);
+                if (it->second.vector.size() > kElementsPerCacheLine) {
+                    HNSW_PREFETCH_READ(it->second.vector.data() + kElementsPerCacheLine);
+                }
+                if (it->second.vector.size() > 2 * kElementsPerCacheLine) {
+                    HNSW_PREFETCH_READ(it->second.vector.data() + 2 * kElementsPerCacheLine);
+                }
+            }
+        }
     }
 
     /// Distance between two StorageT nodes

@@ -17,8 +17,18 @@ template <concepts::VectorElement T> struct HNSWNode {
     std::vector<std::vector<size_t>> edges; ///< edges[layer] = list of neighbor IDs
 
     /// Construct node with vector copy
-    HNSWNode(size_t node_id, std::span<const T> vec, size_t max_layer)
-        : id(node_id), vector(vec.begin(), vec.end()), edges(max_layer + 1) {}
+    /// @param node_id External ID
+    /// @param vec Vector data to copy
+    /// @param max_layer Highest layer for this node
+    /// @param M_max Expected max connections per layer (for pre-allocation, default 32)
+    HNSWNode(size_t node_id, std::span<const T> vec, size_t max_layer, size_t M_max = 32)
+        : id(node_id), vector(vec.begin(), vec.end()), edges(max_layer + 1) {
+        // Pre-reserve capacity to avoid reallocation during edge additions
+        // Layer 0 typically has 2x connections (M_max_0), upper layers have M_max
+        for (size_t layer = 0; layer <= max_layer; ++layer) {
+            edges[layer].reserve(layer == 0 ? M_max * 2 : M_max);
+        }
+    }
 
     /// Get connections at specific layer
     std::span<const size_t> neighbors(size_t layer) const {

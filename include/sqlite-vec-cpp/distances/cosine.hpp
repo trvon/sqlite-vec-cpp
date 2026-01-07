@@ -7,6 +7,15 @@
 #include "../concepts/distance_metric.hpp"
 #include "../concepts/vector_element.hpp"
 
+// Include SIMD implementations
+#ifdef SQLITE_VEC_ENABLE_AVX
+#include "../simd/avx.hpp"
+#endif
+
+#ifdef SQLITE_VEC_ENABLE_NEON
+#include "../simd/neon.hpp"
+#endif
+
 namespace sqlite_vec_cpp::distances {
 
 /// Cosine distance = 1 - cosine_similarity
@@ -74,13 +83,25 @@ float cosine_distance_int(std::span<const T> a, std::span<const T> b) {
 // Forward declarations for SIMD implementations (if needed)
 // Cosine is less commonly SIMD-optimized than L1/L2, but could be added
 
-/// Main cosine distance function
+/// Main cosine distance function with SIMD dispatch
 template <concepts::VectorElement T>
 float cosine_distance(std::span<const T> a, std::span<const T> b) {
     assert(a.size() == b.size() && "Vector dimensions must match");
 
-    // Type-based dispatch (SIMD could be added later)
-    if constexpr (concepts::FloatingPointElement<T>) {
+    // SIMD optimizations for float type
+    if constexpr (std::is_same_v<T, float>) {
+#ifdef SQLITE_VEC_ENABLE_AVX
+        // AVX: require minimum 8 elements for worthwhile SIMD
+        if (a.size() >= 8) {
+            return simd::cosine_distance_float_avx(a, b);
+        }
+#endif
+#ifdef SQLITE_VEC_ENABLE_NEON
+        // NEON: require minimum 16 elements for efficient unrolled loop
+        if (a.size() >= 16) {
+            return simd::cosine_distance_float_neon(a, b);
+        }
+#endif
         return cosine_distance_float(a, b);
     } else if constexpr (concepts::IntegerElement<T>) {
         return cosine_distance_int(a, b);

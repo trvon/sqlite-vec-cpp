@@ -322,4 +322,75 @@ public:
     void reset() { value_.store(0, std::memory_order_relaxed); }
 };
 
+/// Reusable visited set tracker using version-based reset pattern
+/// Avoids expensive unordered_set allocation on every search
+/// Uses a version counter to "reset" without clearing - O(1) reset vs O(n) clear
+class VisitedTracker {
+    std::vector<size_t> visited_version_; // Version when node was last visited
+    size_t current_version_ = 1;          // Current search version (never 0)
+    size_t capacity_ = 0;
+
+public:
+    explicit VisitedTracker(size_t initial_capacity = 1024) { resize(initial_capacity); }
+
+    /// Ensure capacity for node IDs up to max_id
+    void resize(size_t new_capacity) {
+        if (new_capacity > capacity_) {
+            // Grow by at least 2x to reduce reallocations
+            new_capacity = std::max(new_capacity, capacity_ * 2);
+            visited_version_.resize(new_capacity, 0);
+            capacity_ = new_capacity;
+        }
+    }
+
+    /// Reset for new search - O(1) by incrementing version
+    void reset() {
+        ++current_version_;
+        // Handle version overflow (unlikely but possible after 2^64 searches)
+        if (current_version_ == 0) {
+            // Reset all versions and start fresh
+            std::fill(visited_version_.begin(), visited_version_.end(), 0);
+            current_version_ = 1;
+        }
+    }
+
+    /// Check if node was visited in current search
+    [[nodiscard]] bool is_visited(size_t node_id) const {
+        if (node_id >= capacity_)
+            return false;
+        return visited_version_[node_id] == current_version_;
+    }
+
+    /// Mark node as visited, returns true if first visit
+    bool visit(size_t node_id) {
+        if (node_id >= capacity_) {
+            // Shouldn't happen if properly sized, but handle gracefully
+            resize(node_id + 1);
+        }
+        if (visited_version_[node_id] == current_version_) {
+            return false; // Already visited
+        }
+        visited_version_[node_id] = current_version_;
+        return true; // First visit
+    }
+
+    [[nodiscard]] size_t capacity() const { return capacity_; }
+};
+
+/// Thread-local visited tracker pool
+/// Each thread gets its own tracker to avoid contention
+class ThreadLocalVisitedPool {
+    static inline thread_local VisitedTracker tracker_{4096};
+
+public:
+    /// Get thread-local visited tracker, resized if needed
+    static VisitedTracker& get(size_t min_capacity = 0) {
+        if (min_capacity > 0 && tracker_.capacity() < min_capacity) {
+            tracker_.resize(min_capacity);
+        }
+        tracker_.reset();
+        return tracker_;
+    }
+};
+
 } // namespace sqlite_vec_cpp::index
