@@ -2,6 +2,17 @@
 
 #include <sqlite3.h>
 
+// Compatibility defines for older SQLite versions
+// SQLITE_SUBTYPE was added in SQLite 3.30.0
+#ifndef SQLITE_SUBTYPE
+#define SQLITE_SUBTYPE 0x000100000
+#endif
+
+// SQLITE_RESULT_SUBTYPE was added in SQLite 3.45.0
+#ifndef SQLITE_RESULT_SUBTYPE
+#define SQLITE_RESULT_SUBTYPE 0x001000000
+#endif
+
 #include "../utils/error.hpp"
 #include "enhanced_functions.hpp"
 #include "functions.hpp"

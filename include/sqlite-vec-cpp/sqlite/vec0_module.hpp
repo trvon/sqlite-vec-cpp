@@ -433,6 +433,10 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
 }
 
 // Module definition
+// Note: sqlite3_module struct size varies by SQLite version:
+// - xShadowName added in 3.26.0 (20 fields with iVersion=2)
+// - xIntegrity added in 3.44.0 (21 fields with iVersion=3)
+// We use designated initializers for forward compatibility
 static sqlite3_module vec0_module = {
     /* iVersion      */ 2,
     /* xCreate       */ vec0Create,
@@ -458,7 +462,10 @@ static sqlite3_module vec0_module = {
     /* xRelease      */ nullptr,
     /* xRollbackTo   */ nullptr,
     /* xShadowName   */ nullptr,
-    /* xIntegrity    */ nullptr};
+#if SQLITE_VERSION_NUMBER >= 3044000
+    /* xIntegrity    */ nullptr,
+#endif
+};
 
 inline Result<void> register_vec0_module(sqlite3* db) {
     if (!db) {

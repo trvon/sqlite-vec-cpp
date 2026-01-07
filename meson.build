@@ -198,12 +198,17 @@ else
 endif
 
 # SQLite3 dependency
-# Prefer pkg-config on Unix-y systems, but on Windows we may not have pkg-config
-# available and `find_package(sqlite3)` isn't consistently provided.
-#
-# Using `method: 'system'` lets Meson try pkg-config, CMake, and other
-# platform-appropriate mechanisms.
-sqlite3_dep = dependency('sqlite3', version: '>=3.38.0', required: true, method: 'pkg-config')
+# Try multiple methods to find SQLite3:
+# 1. pkg-config (Unix-y systems)
+# 2. cmake (Windows with vcpkg, some Unix systems)
+# 3. system (fallback)
+sqlite3_dep = dependency('sqlite3', version: '>=3.38.0', required: false, method: 'pkg-config')
+if not sqlite3_dep.found()
+  sqlite3_dep = dependency('sqlite3', version: '>=3.38.0', required: false, method: 'cmake')
+endif
+if not sqlite3_dep.found()
+  sqlite3_dep = dependency('sqlite3', version: '>=3.38.0', required: true)
+endif
 
 # Project include directories
 inc_dirs = include_directories('include')
