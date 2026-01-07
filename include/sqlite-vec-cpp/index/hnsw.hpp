@@ -640,7 +640,8 @@ public:
             }
 
             // Upper layer stats
-            for (size_t layer = 1; layer <= node.max_layer(); ++layer) {
+            size_t node_max_layer = node.num_layers() > 0 ? node.num_layers() - 1 : 0;
+            for (size_t layer = 1; layer <= node_max_layer; ++layer) {
                 size_t degree = node.neighbors(layer).size();
                 total_degree_upper += degree;
                 stats.total_edges += degree;

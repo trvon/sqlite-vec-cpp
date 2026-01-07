@@ -763,6 +763,114 @@ void test_fp16_accuracy() {
     std::cout << "  ✓ fp16 accuracy passed" << std::endl;
 }
 
+// Test 19: Graph quality metrics
+void test_graph_stats() {
+    std::cout << "Test 19: Graph quality metrics..." << std::endl;
+
+    constexpr size_t num_vectors = 1000;
+    constexpr size_t dim = 64;
+    std::mt19937 rng(42);
+
+    HNSWIndex<float, L2Metric<float>> index;
+    for (size_t i = 0; i < num_vectors; ++i) {
+        auto vec = generate_vector(dim, rng);
+        index.insert(i, std::span{vec});
+    }
+
+    auto stats = index.compute_graph_stats();
+
+    std::cout << "  Nodes: " << stats.num_nodes << std::endl;
+    std::cout << "  Layers: " << stats.num_layers << std::endl;
+    std::cout << "  Total edges: " << stats.total_edges << std::endl;
+    std::cout << "  Avg degree (layer 0): " << stats.avg_degree_layer0 << std::endl;
+    std::cout << "  Min/Max degree (layer 0): " << stats.min_degree_layer0 << "/"
+              << stats.max_degree_layer0 << std::endl;
+    std::cout << "  Orphan nodes: " << stats.orphan_count << std::endl;
+    std::cout << "  Connectivity score: " << (stats.connectivity_score * 100) << "%" << std::endl;
+
+    // Assertions
+    assert(stats.num_nodes == num_vectors);
+    assert(stats.num_layers >= 1);
+    assert(stats.orphan_count == 0);        // No orphans for healthy graph
+    assert(stats.avg_degree_layer0 >= 4.0); // Should have reasonable connectivity
+    assert(stats.is_healthy());             // Graph should be healthy
+
+    std::cout << "  ✓ Graph stats passed (healthy=" << (stats.is_healthy() ? "yes" : "no") << ")"
+              << std::endl;
+}
+
+// Test 20: Adaptive ef_search
+void test_adaptive_search() {
+    std::cout << "Test 20: Adaptive ef_search..." << std::endl;
+
+    constexpr size_t num_vectors = 5000;
+    constexpr size_t dim = 128;
+    constexpr size_t k = 10;
+    std::mt19937 rng(42);
+
+    HNSWIndex<float, L2Metric<float>> index;
+    std::vector<std::vector<float>> vectors;
+    vectors.reserve(num_vectors);
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        vectors.push_back(generate_vector(dim, rng));
+        index.insert(i, std::span{vectors[i]});
+    }
+
+    // Check recommended ef_search values
+    size_t ef_90 = index.recommended_ef_search(k, 0.90f);
+    size_t ef_95 = index.recommended_ef_search(k, 0.95f);
+    size_t ef_99 = index.recommended_ef_search(k, 0.99f);
+
+    std::cout << "  Corpus size: " << num_vectors << std::endl;
+    std::cout << "  ef_search for 90% recall: " << ef_90 << std::endl;
+    std::cout << "  ef_search for 95% recall: " << ef_95 << std::endl;
+    std::cout << "  ef_search for 99% recall: " << ef_99 << std::endl;
+
+    // Higher target recall should require higher ef_search
+    assert(ef_95 >= ef_90);
+    assert(ef_99 >= ef_95);
+    assert(ef_90 >= k); // ef_search should always be >= k
+
+    // Test adaptive search returns results
+    auto query = generate_vector(dim, rng);
+    auto results = index.search_adaptive(std::span{query}, k, 0.95f);
+    assert(results.size() == k);
+
+    std::cout << "  ✓ Adaptive search passed" << std::endl;
+}
+
+// Test 21: Config::for_corpus factory
+void test_config_for_corpus() {
+    std::cout << "Test 21: Config::for_corpus factory..." << std::endl;
+
+    using Config = HNSWIndex<float, L2Metric<float>>::Config;
+
+    // Small corpus, low dim
+    auto cfg_small = Config::for_corpus(1000, 64);
+    std::cout << "  1K vectors, dim=64: M=" << cfg_small.M << ", M_max_0=" << cfg_small.M_max_0
+              << ", ef_construction=" << cfg_small.ef_construction << std::endl;
+
+    // Medium corpus, medium dim
+    auto cfg_med = Config::for_corpus(50000, 128);
+    std::cout << "  50K vectors, dim=128: M=" << cfg_med.M << ", M_max_0=" << cfg_med.M_max_0
+              << ", ef_construction=" << cfg_med.ef_construction << std::endl;
+
+    // Large corpus, high dim
+    auto cfg_large = Config::for_corpus(500000, 384);
+    std::cout << "  500K vectors, dim=384: M=" << cfg_large.M << ", M_max_0=" << cfg_large.M_max_0
+              << ", ef_construction=" << cfg_large.ef_construction << std::endl;
+
+    // Larger corpus should have higher ef_construction
+    assert(cfg_large.ef_construction >= cfg_med.ef_construction);
+    assert(cfg_med.ef_construction >= cfg_small.ef_construction);
+
+    // Higher dim should have higher M
+    assert(cfg_large.M >= cfg_med.M);
+
+    std::cout << "  ✓ Config factory passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running HNSW tests...\n" << std::endl;
 
@@ -785,6 +893,9 @@ int main() {
     test_parallel_build();
     test_fp16_storage();
     test_fp16_accuracy();
+    test_graph_stats();
+    test_adaptive_search();
+    test_config_for_corpus();
 
     std::cout << "\nAll HNSW tests passed!" << std::endl;
     return 0;
