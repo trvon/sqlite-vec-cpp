@@ -515,6 +515,9 @@ private:
     /// Greedy search (read-only, called under shared lock)
     size_t greedy_search_layer_locked(std::span<const float> query, size_t entry_point,
                                       size_t layer, const FilterFn* filter) const {
+        // Small negative threshold to handle floating-point error in distance calculation
+        constexpr float kDistanceEpsilon = -1e-5f;
+
         size_t current = entry_point;
         float current_dist = distance(query, current);
 
@@ -533,7 +536,7 @@ private:
                 break;
             for (size_t neighbor : current_node->neighbors(layer)) {
                 float neighbor_dist = distance(query, neighbor);
-                if (neighbor_dist < 0 || neighbor_dist >= current_dist)
+                if (neighbor_dist < kDistanceEpsilon || neighbor_dist >= current_dist)
                     continue;
                 current = neighbor;
                 current_dist = neighbor_dist;
@@ -584,8 +587,12 @@ private:
             return !is_deleted(id) && (!filter || (*filter)(id));
         };
 
-        if (passes_filter(entry_point) && entry_dist >= 0) {
-            top_candidates.emplace(entry_dist, entry_point);
+        // Note: entry_dist can be slightly negative due to floating-point error
+        // (e.g., cosine distance of identical vectors = 1 - 1.0000001 = -1e-7)
+        // We allow small negative values to avoid missing exact matches.
+        constexpr float kDistanceEpsilon = -1e-5f;
+        if (passes_filter(entry_point) && entry_dist >= kDistanceEpsilon) {
+            top_candidates.emplace(std::max(0.0f, entry_dist), entry_point);
         }
 
         while (!candidates.empty()) {
@@ -607,19 +614,19 @@ private:
                 visited.insert(neighbor);
 
                 float neighbor_dist = distance(query, neighbor);
-                if (neighbor_dist < 0)
+                if (neighbor_dist < kDistanceEpsilon)
                     continue;
 
                 bool should_explore = top_candidates.empty() || top_candidates.size() < ef ||
                                       neighbor_dist < top_candidates.top().first;
 
                 if (should_explore) {
-                    candidates.emplace(neighbor_dist, neighbor);
+                    candidates.emplace(std::max(0.0f, neighbor_dist), neighbor);
                 }
 
                 if (passes_filter(neighbor)) {
                     if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
-                        top_candidates.emplace(neighbor_dist, neighbor);
+                        top_candidates.emplace(std::max(0.0f, neighbor_dist), neighbor);
                         if (top_candidates.size() > ef) {
                             top_candidates.pop();
                         }
@@ -633,9 +640,8 @@ private:
         while (!top_candidates.empty()) {
             auto [dist, id] = top_candidates.top();
             top_candidates.pop();
-            if (dist >= 0) {
-                result.emplace_back(id, dist);
-            }
+            // Distances are already clamped to >= 0 when added
+            result.emplace_back(id, dist);
         }
 
         std::sort(result.begin(), result.end(),

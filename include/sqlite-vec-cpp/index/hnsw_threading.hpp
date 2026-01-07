@@ -49,7 +49,7 @@ public:
     }
 };
 
-thread_local std::mt19937 ThreadLocalRNG::rng_{std::random_device{}()};
+inline thread_local std::mt19937 ThreadLocalRNG::rng_{std::random_device{}()};
 
 /// Per-node lock array using pointer-based storage to avoid move issues
 class NodeLocks {
