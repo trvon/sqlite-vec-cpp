@@ -61,7 +61,7 @@ inline void vec_f32_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     // Create blob from vector data
     const void* data = vec.data();
     std::size_t size = vec.size() * sizeof(float);
-    unsigned int subtype = static_cast<unsigned int>(VectorElementType::Float32);
+    auto subtype = static_cast<unsigned int>(VectorElementType::Float32);
 
     // Use the wrapper method that correctly sets blob + subtype
     context.result_blob_with_subtype(
@@ -88,7 +88,7 @@ inline void vec_int8_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
     const auto& vec = result.value();
     const void* data = vec.data();
     std::size_t size = vec.size() * sizeof(std::int8_t);
-    unsigned int subtype = static_cast<unsigned int>(VectorElementType::Int8);
+    auto subtype = static_cast<unsigned int>(VectorElementType::Int8);
 
     context.result_blob_with_subtype(
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data), size), subtype);
@@ -115,7 +115,7 @@ inline void vec_bit_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     const auto& vec = result.value();
     const void* data = vec.data();
     std::size_t size = vec.size();
-    unsigned int subtype = static_cast<unsigned int>(VectorElementType::Bit);
+    auto subtype = static_cast<unsigned int>(VectorElementType::Bit);
 
     context.result_blob_with_subtype(
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data), size), subtype);
@@ -424,10 +424,12 @@ inline void vec_slice_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv)
         std::int64_t size = static_cast<std::int64_t>(vec->size());
 
         // Handle negative indices (Python-style)
-        if (start < 0)
+        if (start < 0) {
             start += size;
-        if (end < 0)
+        }
+        if (end < 0) {
             end += size;
+        }
 
         // Clamp to valid range
         start = std::max(std::int64_t(0), std::min(start, size));

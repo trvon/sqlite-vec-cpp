@@ -59,16 +59,18 @@ public:
 
     [[nodiscard]] std::string_view as_text() const noexcept {
         const unsigned char* text = sqlite3_value_text(value_);
-        if (!text)
+        if (!text) {
             return {};
+        }
         int bytes = sqlite3_value_bytes(value_);
         return {reinterpret_cast<const char*>(text), static_cast<std::size_t>(bytes)};
     }
 
     [[nodiscard]] std::span<const std::uint8_t> as_blob() const noexcept {
         const void* blob = sqlite3_value_blob(value_);
-        if (!blob)
+        if (!blob) {
             return {};
+        }
         int bytes = sqlite3_value_bytes(value_);
         return {static_cast<const std::uint8_t*>(blob), static_cast<std::size_t>(bytes)};
     }

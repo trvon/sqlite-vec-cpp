@@ -130,14 +130,16 @@ public:
     }
 
     [[nodiscard]] void* get(std::size_t index) {
-        if (index >= length_)
+        if (index >= length_) {
             return nullptr;
+        }
         return &data_[index * element_size_];
     }
 
     [[nodiscard]] const void* get(std::size_t index) const {
-        if (index >= length_)
+        if (index >= length_) {
             return nullptr;
+        }
         return &data_[index * element_size_];
     }
 

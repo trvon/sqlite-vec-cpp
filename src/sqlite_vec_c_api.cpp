@@ -74,6 +74,7 @@ int sqlite3_vec_distance_l2(const void* vec1, size_t size1, const void* vec2, si
         *result = sqlite_vec_cpp::distances::l2_distance(v1, v2);
         return SQLITE_OK;
     } catch (...) {
+        // Propagate any exception as a generic error to the C API
         return SQLITE_ERROR;
     }
 }
@@ -98,6 +99,7 @@ int sqlite3_vec_distance_cosine(const void* vec1, size_t size1, const void* vec2
         *result = sqlite_vec_cpp::distances::cosine_distance(v1, v2);
         return SQLITE_OK;
     } catch (...) {
+        // Propagate any exception as a generic error to the C API
         return SQLITE_ERROR;
     }
 }

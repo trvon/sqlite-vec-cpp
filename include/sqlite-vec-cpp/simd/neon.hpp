@@ -284,7 +284,7 @@ inline float cosine_distance_float_neon(std::span<const float> a, std::span<cons
 /// @param a First int8 vector
 /// @param b Second int8 vector
 /// @return Dot product as int32
-#if defined(__ARM_FEATURE_DOTPROD)
+#ifdef __ARM_FEATURE_DOTPROD
 inline std::int32_t dot_product_int8_neon_dotprod(std::span<const std::int8_t> a,
                                                   std::span<const std::int8_t> b) {
     const std::size_t size = a.size();

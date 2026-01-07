@@ -106,8 +106,9 @@ struct PartitionColumnDefinition {
                 return "BLOB";
             case SQLITE_NULL:
                 return "NULL";
+            default:
+                return "UNKNOWN";
         }
-        return "UNKNOWN";
     }
 };
 
@@ -133,8 +134,9 @@ struct AuxiliaryColumnDefinition {
                 return "BLOB";
             case SQLITE_NULL:
                 return "NULL";
+            default:
+                return "UNKNOWN";
         }
-        return "UNKNOWN";
     }
 };
 

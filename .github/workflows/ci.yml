@@ -9,6 +9,35 @@ on:
 
 jobs:
   # =============================================================================
+  # Clang-Tidy Static Analysis
+  # =============================================================================
+  clang-tidy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang-tidy \
+            clang \
+            meson \
+            ninja-build \
+            pkg-config \
+            libsqlite3-dev
+
+      - name: Configure
+        run: |
+          CC=clang CXX=clang++ meson setup build \
+            -Dbuildtype=debug
+
+      - name: Run clang-tidy
+        run: |
+          clang-tidy -p build --header-filter='sqlite-vec-cpp/.*' src/sqlite_vec_c_api.cpp
+
+  # =============================================================================
   # Linux Tests
   # =============================================================================
   test-linux:

@@ -18,29 +18,25 @@ namespace sqlite_vec_cpp::sqlite {
 // Compatible with original sqlite-vec C implementation
 
 struct Vec0Table {
-    sqlite3_vtab base;
-    sqlite3* db;
+    sqlite3_vtab base{};
+    sqlite3* db = nullptr;
     std::string schema_name;
     std::string table_name;
     std::string embedding_column;
-    size_t dimensions;
-    bool use_shadow_tables;
+    size_t dimensions = 384;
+    bool use_shadow_tables = true;
 
-    Vec0Table() : db(nullptr), dimensions(384), use_shadow_tables(true) {
-        std::memset(&base, 0, sizeof(base));
-    }
+    Vec0Table() = default;
 };
 
 struct Vec0Cursor {
-    sqlite3_vtab_cursor base;
-    Vec0Table* table;
-    sqlite3_stmt* stmt; // For shadow table queries
-    int64_t current_rowid;
-    bool eof;
+    sqlite3_vtab_cursor base{};
+    Vec0Table* table = nullptr;
+    sqlite3_stmt* stmt = nullptr; // For shadow table queries
+    int64_t current_rowid = 0;
+    bool eof = true;
 
-    Vec0Cursor() : table(nullptr), stmt(nullptr), current_rowid(0), eof(true) {
-        std::memset(&base, 0, sizeof(base));
-    }
+    Vec0Cursor() = default;
 
     ~Vec0Cursor() {
         if (stmt) {
@@ -78,6 +74,8 @@ inline bool parse_vec0_schema(int argc, const char* const* argv, std::string& em
                     dims = std::stoul(dim_str);
                     return true;
                 } catch (...) {
+                    // Failed to parse dimensions - continue with defaults
+                    continue;
                 }
             }
         }
@@ -385,8 +383,9 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
 
             sqlite3_stmt* stmt;
             int rc = sqlite3_prepare_v2(table->db, sql.str().c_str(), -1, &stmt, nullptr);
-            if (rc != SQLITE_OK)
+            if (rc != SQLITE_OK) {
                 return rc;
+            }
 
             if (blob && bytes > 0) {
                 sqlite3_bind_blob(stmt, 1, blob, bytes, SQLITE_TRANSIENT);
@@ -409,8 +408,9 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
 
             sqlite3_stmt* stmt;
             int rc = sqlite3_prepare_v2(table->db, sql.str().c_str(), -1, &stmt, nullptr);
-            if (rc != SQLITE_OK)
+            if (rc != SQLITE_OK) {
                 return rc;
+            }
 
             if (blob && bytes > 0) {
                 sqlite3_bind_blob(stmt, 1, blob, bytes, SQLITE_TRANSIENT);
