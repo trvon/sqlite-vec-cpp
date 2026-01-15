@@ -7,6 +7,17 @@
 #include <thread>
 #include <vector>
 
+// C++20 jthread support check
+#if __has_include(<version>)
+#include <version>
+#endif
+
+#if defined(__cpp_lib_jthread) && (__cpp_lib_jthread >= 201911L)
+#define SQLITE_VEC_CPP_HAS_JTHREAD 1
+#else
+#define SQLITE_VEC_CPP_HAS_JTHREAD 0
+#endif
+
 namespace sqlite_vec_cpp::index {
 
 /// Simple spinlock using atomic flag
@@ -224,7 +235,11 @@ public:
 /// Thread pool executor for parallel operations
 class ThreadPool {
     size_t num_threads_;
+#if SQLITE_VEC_CPP_HAS_JTHREAD
     std::vector<std::jthread> threads_;
+#else
+    std::vector<std::thread> threads_;
+#endif
     std::atomic<size_t> next_idx_{0};
 
 public:
