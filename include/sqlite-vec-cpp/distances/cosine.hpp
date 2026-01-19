@@ -36,8 +36,12 @@ float cosine_distance_fallback(std::span<const T> a, std::span<const T> b) {
         b_mag += b_val * b_val;
     }
 
+    float denom = std::sqrt(a_mag) * std::sqrt(b_mag);
+    if (denom < 1e-8f) {
+        return 1.0f;
+    }
     // Return 1 - similarity to convert to distance
-    return 1.0f - (dot / (std::sqrt(a_mag) * std::sqrt(b_mag)));
+    return 1.0f - (dot / denom);
 }
 
 /// Specialized for floating-point (same as fallback, but explicit)
@@ -57,7 +61,11 @@ float cosine_distance_float(std::span<const T> a, std::span<const T> b) {
         b_mag += b_val * b_val;
     }
 
-    return 1.0f - (dot / (std::sqrt(a_mag) * std::sqrt(b_mag)));
+    float denom = std::sqrt(a_mag) * std::sqrt(b_mag);
+    if (denom < 1e-8f) {
+        return 1.0f;
+    }
+    return 1.0f - (dot / denom);
 }
 
 /// Specialized for integer types
@@ -77,7 +85,11 @@ float cosine_distance_int(std::span<const T> a, std::span<const T> b) {
         b_mag += b_val * b_val;
     }
 
-    return 1.0f - (dot / (std::sqrt(a_mag) * std::sqrt(b_mag)));
+    float denom = std::sqrt(a_mag) * std::sqrt(b_mag);
+    if (denom < 1e-8f) {
+        return 1.0f;
+    }
+    return 1.0f - (dot / denom);
 }
 
 // Forward declarations for SIMD implementations (if needed)

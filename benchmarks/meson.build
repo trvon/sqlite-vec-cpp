@@ -48,11 +48,31 @@ if benchmark_dep.found()
     install: false
   )
 
+  filtered_search_benchmark_exe = executable(
+    'filtered_search_benchmark',
+    'filtered_search_benchmark.cpp',
+    dependencies: [benchmark_dep],
+    include_directories: include_directories('../include'),
+    cpp_args: cpp_args_list,
+    install: false
+  )
+
+  precision_benchmark_exe = executable(
+    'precision_benchmark',
+    'precision_benchmark.cpp',
+    dependencies: [benchmark_dep],
+    include_directories: include_directories('../include'),
+    cpp_args: cpp_args_list,
+    install: false
+  )
+
   message('Benchmarks enabled:')
   # message('  ./distance_benchmark')  # TODO: Update for C++ API
   message('  ./batch_distance_benchmark')
   message('  ./rag_pipeline_benchmark')
   message('  ./hnsw_benchmark')
+  message('  ./filtered_search_benchmark')
+  message('  ./precision_benchmark')
 else
   message('Google Benchmark not found - benchmarks disabled')
   message('Install with: apt install libbenchmark-dev or brew install google-benchmark')

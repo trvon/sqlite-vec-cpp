@@ -1,155 +1,20 @@
 # SQLite-Vec C++ Benchmark Results
 
 **Version**: 0.1.0
-**Date**: 2026-01-05
-**Platform**: x86_64, 48 cores @ 3.8GHz, 32KB L1, 512KB L2, 16MB L3 (Windows 11)
-**Compiler**: clang 21.1.6, C++23, Release mode (`-O3`)
-**Library**: Google Benchmark 1.9.4
+**Date**: 2026-01-19
+**Platform**: Apple M3 Max, 16 cores, 48 GB RAM (macOS 26.2)
+**Compiler**: Apple clang 17.0.0, C++23, Release mode (`-O3` via Meson `buildtype=release`)
+**SIMD**: NEON enabled, ARM DotProd enabled
+**Library**: Google Benchmark 1.8.3
 
-
----
-
-## Executive Summary
-
-The C++ implementation achieves **~2.8M vectors/second sustained throughput** with linear scaling across corpus sizes and embedding dimensions. int8 quantization provides 4x storage reduction at near performance parity. HNSW index recommended for >100K vector corpora.
+> Note: Google Benchmark reports “Library was built as DEBUG” even in this Release build; the Meson
+> configuration is `buildtype=release` with NEON/DotProd enabled.
 
 ---
 
-## Apple Silicon Results (M1 Pro)
+## Archive
 
-**Date**: 2026-01-07
-**Platform**: Apple M1 Pro, 16 cores (8P+8E), 192KB L1, 12MB L2, 24MB SLC
-**Compiler**: Apple clang 16.0, C++20, Release mode (`-O3 -DNDEBUG`)
-**SIMD**: NEON enabled (`-DSQLITE_VEC_ENABLE_NEON`), DotProd enabled (`-march=armv8.2-a+dotprod`)
-
-### HNSW Index Performance (dim=384, k=10, ef=50)
-
-| Corpus | Insert Rate | Search QPS | Search Latency |
-|--------|-------------|------------|----------------|
-| 1,000  | 7,395/s     | 16,565     | 60 µs          |
-| 5,000  | 3,207/s     | 8,981      | 111 µs         |
-| 10,000 | 2,116/s     | 6,400      | 156 µs         |
-| 25,000 | 1,061/s     | 3,510      | 285 µs         |
-| 50,000 | 632/s       | 2,369      | 422 µs         |
-
-### Prefetching Impact
-
-Software prefetching (`__builtin_prefetch`) in beam search provides 9-32% improvement:
-
-| Corpus | Without Prefetch | With Prefetch | Improvement |
-|--------|------------------|---------------|-------------|
-| 1,000  | 15,168 QPS       | 16,540 QPS    | +9%         |
-| 5,000  | 9,249 QPS        | 10,135 QPS    | +10%        |
-| 10,000 | 6,337 QPS        | 7,761 QPS     | **+22%**    |
-| 25,000 | 3,140 QPS        | 4,139 QPS     | **+32%**    |
-| 50,000 | 2,303 QPS        | 2,744 QPS     | +19%        |
-| 100,000| 1,907 QPS        | 2,179 QPS     | +14%        |
-
-### Batch Search Scaling (10K corpus, 1000 queries)
-
-Linear scaling with thread count using `search_batch()` API:
-
-| Threads | QPS    | Speedup |
-|---------|--------|---------|
-| 1 (seq) | 5,979  | 1.00x   |
-| 2       | 12,713 | **2.13x** |
-| 4       | 24,377 | **4.08x** |
-| 8       | 50,554 | **8.46x** |
-
-### SIMD Distance Computation
-
-#### Float32 Cosine Distance (NEON)
-
-| Dimensions | NEON (ns) | Scalar (ns) | Speedup |
-|------------|-----------|-------------|---------|
-| 384        | 29        | 347         | **12x** |
-
-#### Int8 Dot Product (DotProd Instruction)
-
-Using `vdotq_s32` (ARMv8.2+) for quantized vectors:
-
-| Method       | Time (ns) | Speedup |
-|--------------|-----------|---------|
-| Scalar       | 4.8       | 1.00x   |
-| NEON DotProd | 0.3       | **17.1x** |
-
-### Optimization Summary (M1 Pro)
-
-| Optimization | Improvement | Notes |
-|--------------|-------------|-------|
-| NEON SIMD (float32) | 12x | Cosine distance |
-| Prefetching | +9% to +32% | Depends on corpus size |
-| Batch search | Linear | 8.46x with 8 threads |
-| DotProd (int8) | 17x | ARMv8.2+ required |
-
-
----
-
-## RAG Pipeline Benchmark
-
-### 1. Corpus Size Scaling (384d, K=5)
-
-| Corpus | Latency | Throughput | QPS (single-thread) |
-|--------|---------|------------|---------------------|
-| 1K     | 288 μs  | 3.51 M/s   | ~3,510 queries/sec  |
-| 10K    | 3.63 ms | 2.77 M/s   | ~277 queries/sec    |
-| 100K   | 41.0 ms | 2.43 M/s   | ~24 queries/sec     |
-
-
-**Scaling**: Linear (10x corpus → 10x latency)
-**Bottleneck**: Compute-bound (memory bandwidth utilization ~5%)
-
-### 2. K-Value Scaling (10K docs, 384d)
-
-| K  | Latency | Delta |
-|----|---------|-------|
-| 1  | 3.92 ms | +7.8% |
-| 5  | 3.63 ms | baseline |
-| 10 | 3.64 ms | +0.2% |
-| 50 | 3.60 ms | -0.9% |
-
-
-**Conclusion**: Partial sort overhead negligible; K-value has no meaningful impact.
-
-### 3. Embedding Dimension Scaling (10K docs, K=5)
-
-| Dimensions | Latency  | Throughput | Scaling Factor |
-|------------|----------|------------|----------------|
-| 384d       | 3.63 ms  | 2.77 M/s   | 1.0x           |
-| 768d       | 6.78 ms  | 1.53 M/s   | 1.87x          |
-| 1536d      | 13.2 ms  | 780k/s     | 3.64x          |
-
-
-**Scaling**: Near-linear (2x dim → 2.06x latency, 4x dim → 4.21x latency)
-**Conclusion**: Compute-bound; SIMD efficiency remains high across dimensions.
-
-### 4. Quantization (10K docs, 384d, K=5)
-
-| Type  | Latency | Throughput | Storage | Overhead |
-|-------|---------|------------|---------|----------|
-| float | 3.63 ms | 2.77 M/s   | 4 bytes | baseline |
-| int8  | 3.62 ms | 2.79 M/s   | 1 byte  | **-0.4%** |
-
-
-**Conclusion**: int8 quantization is **faster** while reducing storage 4x (memory bandwidth savings).
-
-### 5. Multi-Query Throughput (10K docs, 384d)
-
-- **10 queries**: 36.2 ms total (3.62 ms/query average)
-- **Sustained throughput**: 2.76 M vectors/second
-- **QPS**: ~276 queries/second (single-threaded)
-- **Parallelization potential**: 48 cores → ~13.2K QPS theoretical
-
-
-### 6. Sequential vs Batch (1K docs, 384d, K=5)
-
-| Method     | Latency | Throughput |
-|------------|---------|------------|
-| Sequential | 287 μs  | 3.51 M/s   |
-| Batch      | 288 μs  | 3.51 M/s   |
-
-
-**Conclusion**: Batch API provides cleaner code at performance parity (memory-bandwidth bound).
+Previous benchmark runs are archived in `benchmarks/archive/`.
 
 ---
 
@@ -157,145 +22,110 @@ Using `vdotq_s32` (ARMv8.2+) for quantized vectors:
 
 ### 1. Sequential vs Batch Comparison
 
-| Scenario | Sequential | Batch | Speedup |
-|----------|------------|-------|---------|
-| 100×384d | 27.8 μs    | 28.3 μs | 0.98x |
-| 1K×384d  | 289 μs     | 283 μs  | 1.02x |
-
-
-**Conclusion**: Parity performance; both memory-bandwidth limited.
+| Scenario | Time | Throughput |
+|----------|------|------------|
+| 100×384d (Sequential) | 2.383 µs | 41.96 M/s |
+| 100×384d (Batch)      | 2.523 µs | 39.64 M/s |
+| 1K×384d (Sequential)  | 25.50 µs | 39.21 M/s |
+| 1K×384d (Batch)       | 26.01 µs | 38.45 M/s |
 
 ### 2. Memory Layout Optimization
 
-| Layout      | Latency | Throughput | Improvement |
-|-------------|---------|------------|-------------|
-| Scattered   | 283 μs  | 3.54 M/s   | baseline    |
-| Contiguous  | 283 μs  | 3.54 M/s   | +0.0%       |
+| Layout | Time | Throughput |
+|--------|------|------------|
+| Contiguous (1K×384d) | 22.75 µs | 43.96 M/s |
 
+### 3. Top‑K Performance (1K×384d, K=10)
 
-**Conclusion**: Marginal improvement; modern CPUs prefetch efficiently.
+- **Latency**: 26.85 µs
+- **Throughput**: 37.25 M/s
 
-### 3. Top-K Performance (1K×384d, K=10)
+### 4. Quantization (1K×384d)
 
-- **Latency**: 290 μs (vs 287 μs full distance computation)
-- **Overhead**: ~1% for partial sort
-- **Conclusion**: `std::partial_sort` highly optimized; K << N has negligible cost.
+| Type | Time | Throughput |
+|------|------|------------|
+| int8 | 38.22 µs | 26.16 M/s |
 
+### 5. Large Embeddings (1K×1536d)
 
-### 4. Large Embeddings (1K×1536d)
-
-- **Latency**: 1.18 ms
-- **Throughput**: 833k vectors/second
-- **Scaling**: 4.18x slower than 384d (expected 4.0x)
-
+- **Latency**: 110.9 µs
+- **Throughput**: 9.02 M/s
 
 ---
 
-## HNSW Decision Matrix
+## RAG Pipeline Benchmark
 
-| Corpus Size | Brute-Force Latency | Recommendation |
-|-------------|---------------------|----------------|
-| <10K        | <4ms                | ✅ Brute-force optimal |
-| 10K-100K    | 4-40ms              | ⚠️ Brute-force acceptable for batch |
-| >100K       | >40ms               | ❌ HNSW required for real-time (<10ms) |
+### 1. Corpus Size Scaling (384d, K=5)
 
-**HNSW Threshold**: 100K vectors (~41ms → >10ms target requires ANN index)
+| Corpus | Latency | Throughput |
+|--------|---------|------------|
+| 1K     | 28.3 µs | 35.35 M/s  |
+| 10K    | 253 µs  | 39.51 M/s  |
+| 100K   | 5.67 ms | 17.64 M/s  |
 
+### 2. K‑Value Scaling (10K docs, 384d)
 
----
+| K  | Latency | Throughput |
+|----|---------|------------|
+| 1  | 305 µs  | 32.82 M/s  |
+| 5  | 253 µs  | 39.51 M/s  |
+| 10 | 254 µs  | 39.43 M/s  |
+| 50 | 342 µs  | 29.20 M/s  |
 
-## Platform-Specific Results
+### 3. Embedding Dimension Scaling (10K docs, K=5)
 
-### SIMD Utilization
+| Dimensions | Latency | Throughput | Scaling Factor |
+|------------|---------|------------|----------------|
+| 384d       | 253 µs  | 39.51 M/s  | 1.00x |
+| 768d       | 740 µs  | 13.51 M/s  | 2.92x |
+| 1536d      | 1122 µs | 8.91 M/s   | 4.43x |
 
-- **AVX**: Active (conditional compilation, `-mavx` detected)
-- **NEON**: Not tested (x86_64 platform)
-- **Scalar fallback**: Available for non-aligned/small vectors
+### 4. Quantization (10K docs, 384d, K=5)
 
-### Cache Efficiency
+| Type  | Latency | Throughput |
+|-------|---------|------------|
+| float | 253 µs  | 39.51 M/s  |
+| int8  | 414 µs  | 24.13 M/s  |
 
-- **L1 hit rate**: >95% (estimated from throughput consistency)
-- **Memory bandwidth**: ~11 GB/s per query (vs 200 GB/s L1 capacity)
-- **Conclusion**: Compute-bound, not memory-bound
+### 5. Multi‑Query Throughput (10K docs, 384d, 10 queries)
 
----
-
-## Comparison to Targets
-
-| Metric | Target | Actual | Status |
-|--------|--------|--------|--------|
-| 1K corpus (<1ms) | 1000 μs | 288 μs | ✅ **3.5x better** |
-| 10K corpus (<5ms) | 5000 μs | 3633 μs | ✅ **1.4x better** |
-| 100K corpus (<50ms) | 50000 μs | 41000 μs | ✅ **1.2x better** |
-| int8 overhead (<20%) | 20% | -0.4% | ✅ **Faster** |
-| Dimension scaling | Linear | Near-linear | ✅ **Good** |
-
-### Comparison to Previous Results (2025-11-02)
-
-| Scenario | Previous | Current | Delta |
-|----------|----------|---------|-------|
-| 1K×384d (K=5) latency | 273 μs | 288 μs | +5.5% |
-| 10K×384d (K=5) latency | 2.78 ms | 3.63 ms | +30.6% |
-| 100K×384d (K=5) latency | 27.9 ms | 41.0 ms | +46.9% |
-| 10K×384d throughput | 3.60 M/s | 2.77 M/s | -23.1% |
-| int8 @10K×384d latency | 2.74 ms | 3.62 ms | +32.1% |
-
-Notes:
-- Previous run header (2025-11-02): Linux (x86_64), GCC 15.2.0, Google Benchmark 1.9.1.
-- Current run header (2026-01-05): Windows 11 (x86_64), clang 21.1.6, Google Benchmark 1.9.4.
-- Treat deltas as environment differences rather than regressions unless measured on the same OS/toolchain.
-
-
+- **Total time**: 3.01 ms
+- **Throughput**: 33.23 M/s
 
 ---
 
-## Reproduction
+## Filtered Search Benchmark (HNSW, 10K corpus)
 
-### Windows (Conan)
+| Scenario | Time | Throughput |
+|----------|------|------------|
+| No filter | 9.83 ms | 10.17 k/s |
+| Bitset filter 10% | 50.93 ms | 1.96 k/s |
+| Bitset filter 50% | 19.42 ms | 5.15 k/s |
+| Bitset filter 90% | 11.07 ms | 9.03 k/s |
+| Set filter 10% | 65.46 ms | 1.53 k/s |
+| Set filter 50% | 23.39 ms | 4.28 k/s |
+| Set filter 90% | 11.78 ms | 8.49 k/s |
 
-```powershell
-# From third_party/sqlite-vec-cpp
+---
 
-# Install dependencies (Conan 2)
-conan profile detect --force
-conan install . -of build_bench_conan -b missing -s build_type=Release -s compiler.cppstd=23 -s compiler.runtime=static
+## HNSW Index Performance
 
-# Make Conan-generated .pc files visible to pkg-config for this shell
-$env:PKG_CONFIG_PATH = (Resolve-Path .\build_bench_conan)
+Full HNSW benchmark run was stopped due to long runtime. Partial results are logged in
+`benchmarks/logs/2026-01-19_release_neon/hnsw_benchmark.log`. We will update this section after
+optimizing the long‑running benchmark and re‑running.
 
-# Configure + build
-meson setup build_bench --wipe -Denable_benchmarks=true -Dbuildtype=release
-ninja -C build_bench benchmarks/rag_pipeline_benchmark.exe benchmarks/batch_distance_benchmark.exe
+---
 
-# Run
-.\build_bench\benchmarks\rag_pipeline_benchmark.exe --benchmark_min_time=0.5s
-.\build_bench\benchmarks\batch_distance_benchmark.exe --benchmark_min_time=0.5s
+## Reproducibility
 
-# JSON output for analysis
-.\build_bench\benchmarks\rag_pipeline_benchmark.exe `
-  --benchmark_out=results.json `
-  --benchmark_out_format=json
+Release build with NEON and DotProd:
+
+```
+meson setup builddir-release -Dbuildtype=release -Denable_benchmarks=true -Denable_simd_neon=true
+meson compile -C builddir-release
+./builddir-release/benchmarks/batch_distance_benchmark
+./builddir-release/benchmarks/rag_pipeline_benchmark
+./builddir-release/benchmarks/filtered_search_benchmark
 ```
 
-### Linux/macOS (system packages)
-
-```bash
-# Build benchmarks
-cd third_party/sqlite-vec-cpp
-meson setup build_bench -Denable_benchmarks=true -Dbuildtype=release
-ninja -C build_bench
-
-# Run RAG pipeline benchmark
-./build_bench/benchmarks/rag_pipeline_benchmark --benchmark_min_time=0.5s
-
-# Run batch distance benchmark
-./build_bench/benchmarks/batch_distance_benchmark --benchmark_min_time=0.5s
-
-# JSON output for analysis
-./build_bench/benchmarks/rag_pipeline_benchmark \
-  --benchmark_out=results.json \
-  --benchmark_out_format=json
-```
-
-
----
+Logs are stored under `benchmarks/logs/2026-01-19_release_neon/`.

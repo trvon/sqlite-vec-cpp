@@ -3,6 +3,11 @@
 #include <iostream>
 #include <vector>
 #include <sqlite-vec-cpp/sqlite_vec.hpp>
+#include <sqlite-vec-cpp/distances/l2.hpp>
+#include <sqlite-vec-cpp/distances/cosine.hpp>
+#include <sqlite-vec-cpp/distances/inner_product.hpp>
+#include <sqlite-vec-cpp/simd/avx.hpp>
+#include <sqlite-vec-cpp/simd/neon.hpp>
 
 using namespace sqlite_vec_cpp;
 using namespace sqlite_vec_cpp::distances;
@@ -124,6 +129,16 @@ void test_cosine_distance() {
     float dist_int8 = cosine_distance(view_a_int8.span(), view_b_int8.span());
     assert(approx_equal(dist_int8, 1.0f));
 
+    // Zero vector guard (should not be NaN/inf and should be max distance)
+    std::vector<float> zeros = {0.0f, 0.0f, 0.0f};
+    std::vector<float> ones = {1.0f, 0.0f, 0.0f};
+    VectorView<const float> view_zeros(zeros);
+    VectorView<const float> view_ones(ones);
+    float dist_zero = cosine_distance(view_zeros.span(), view_ones.span());
+    assert(!std::isnan(dist_zero));
+    assert(!std::isinf(dist_zero));
+    assert(approx_equal(dist_zero, 1.0f));
+
     std::cout << "  Cosine distance tests passed!" << std::endl;
 }
 
@@ -186,6 +201,49 @@ void test_metric_traits() {
     std::cout << "  Metric traits tests passed!" << std::endl;
 }
 
+void test_simd_consistency() {
+    std::cout << "Testing SIMD vs scalar consistency..." << std::endl;
+
+    std::vector<float> a(16);
+    std::vector<float> b(16);
+    for (size_t i = 0; i < a.size(); ++i) {
+        a[i] = static_cast<float>(i) * 0.1f;
+        b[i] = static_cast<float>(i) * 0.2f + 0.5f;
+    }
+
+    float l2_scalar = l2_distance_float(std::span<const float>(a), std::span<const float>(b));
+    float cosine_scalar =
+        cosine_distance_float(std::span<const float>(a), std::span<const float>(b));
+    float ip_scalar =
+        inner_product_distance_float(std::span<const float>(a), std::span<const float>(b));
+
+#ifdef SQLITE_VEC_ENABLE_AVX
+    float l2_avx = simd::l2_distance_float_avx(std::span<const float>(a),
+                                               std::span<const float>(b));
+    float cosine_avx =
+        simd::cosine_distance_float_avx(std::span<const float>(a), std::span<const float>(b));
+    float ip_avx =
+        simd::inner_product_float_avx(std::span<const float>(a), std::span<const float>(b));
+    assert(approx_equal(l2_scalar, l2_avx, 1e-4f));
+    assert(approx_equal(cosine_scalar, cosine_avx, 1e-4f));
+    assert(approx_equal(ip_scalar, ip_avx, 1e-4f));
+#endif
+
+#ifdef SQLITE_VEC_ENABLE_NEON
+    float l2_neon = simd::l2_distance_float_neon(std::span<const float>(a),
+                                                 std::span<const float>(b));
+    float cosine_neon =
+        simd::cosine_distance_float_neon(std::span<const float>(a), std::span<const float>(b));
+    float ip_neon =
+        simd::inner_product_float_neon(std::span<const float>(a), std::span<const float>(b));
+    assert(approx_equal(l2_scalar, l2_neon, 1e-4f));
+    assert(approx_equal(cosine_scalar, cosine_neon, 1e-4f));
+    assert(approx_equal(ip_scalar, ip_neon, 1e-4f));
+#endif
+
+    std::cout << "  SIMD consistency tests passed!" << std::endl;
+}
+
 int main() {
     try {
         test_l2_distance();
@@ -193,6 +251,7 @@ int main() {
         test_cosine_distance();
         test_hamming_distance();
         test_metric_traits();
+        test_simd_consistency();
 
         std::cout << "\nAll distance metric tests passed! ✓" << std::endl;
         return 0;

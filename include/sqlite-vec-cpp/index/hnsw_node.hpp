@@ -13,6 +13,7 @@ namespace sqlite_vec_cpp::index {
 /// @tparam T Storage type (float or float16_t)
 template <concepts::VectorElement T> struct HNSWNode {
     size_t id;                              ///< External ID (e.g., SQLite rowid)
+    size_t dense_id;                        ///< Dense, contiguous ID for visited tracking
     std::vector<T> vector;                  ///< Embedded vector (owned copy)
     std::vector<std::vector<size_t>> edges; ///< edges[layer] = list of neighbor IDs
 
@@ -22,7 +23,7 @@ template <concepts::VectorElement T> struct HNSWNode {
     /// @param max_layer Highest layer for this node
     /// @param M_max Expected max connections per layer (for pre-allocation, default 32)
     HNSWNode(size_t node_id, std::span<const T> vec, size_t max_layer, size_t M_max = 32)
-        : id(node_id), vector(vec.begin(), vec.end()), edges(max_layer + 1) {
+        : id(node_id), dense_id(0), vector(vec.begin(), vec.end()), edges(max_layer + 1) {
         // Pre-reserve capacity to avoid reallocation during edge additions
         // Layer 0 typically has 2x connections (M_max_0), upper layers have M_max
         for (size_t layer = 0; layer <= max_layer; ++layer) {
