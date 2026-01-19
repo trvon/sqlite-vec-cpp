@@ -56,6 +56,7 @@ public:
         size_t ef_construction = 200; ///< Exploration factor during construction (100-500)
         float ml_factor = 1.0f / std::log(2.0f); ///< Layer selection multiplier (1/ln(2))
         MetricT metric{};                        ///< Distance metric (operates on float spans)
+        bool clamp_negative_distances = true; ///< Clamp negative distances to 0 (safe for L2/cosine)
 
         /// Create config optimized for high recall on large corpora
         /// @param corpus_size Expected number of vectors
@@ -812,7 +813,8 @@ private:
     size_t greedy_search_layer_locked(std::span<const float> query, size_t entry_point,
                                       size_t layer, const FilterFn* filter) const {
         // Small negative threshold to handle floating-point error in distance calculation
-        constexpr float kDistanceEpsilon = -1e-5f;
+        const float kDistanceEpsilon =
+            config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
 
         size_t current = entry_point;
         float current_dist = distance(query, current);
@@ -903,9 +905,12 @@ private:
         // Note: entry_dist can be slightly negative due to floating-point error
         // (e.g., cosine distance of identical vectors = 1 - 1.0000001 = -1e-7)
         // We allow small negative values to avoid missing exact matches.
-        constexpr float kDistanceEpsilon = -1e-5f;
+        const float kDistanceEpsilon =
+            config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
         if (passes_filter(entry_point) && entry_dist >= kDistanceEpsilon) {
-            top_candidates.emplace(std::max(0.0f, entry_dist), entry_point);
+            float entry_score =
+                config_.clamp_negative_distances ? std::max(0.0f, entry_dist) : entry_dist;
+            top_candidates.emplace(entry_score, entry_point);
         }
 
         while (!candidates.empty()) {
@@ -958,12 +963,18 @@ private:
                                       neighbor_dist < top_candidates.top().first;
 
                 if (should_explore) {
-                    candidates.emplace(std::max(0.0f, neighbor_dist), neighbor);
+                    float candidate_score = config_.clamp_negative_distances
+                                                ? std::max(0.0f, neighbor_dist)
+                                                : neighbor_dist;
+                    candidates.emplace(candidate_score, neighbor);
                 }
 
                 if (passes_filter(neighbor)) {
                     if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
-                        top_candidates.emplace(std::max(0.0f, neighbor_dist), neighbor);
+                        float top_score = config_.clamp_negative_distances
+                                              ? std::max(0.0f, neighbor_dist)
+                                              : neighbor_dist;
+                        top_candidates.emplace(top_score, neighbor);
                         if (top_candidates.size() > ef) {
                             top_candidates.pop();
                         }

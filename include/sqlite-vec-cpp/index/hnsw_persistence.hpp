@@ -24,7 +24,7 @@ std::vector<uint8_t> serialize_hnsw_config(const typename HNSWIndex<T, Metric>::
     blob.reserve(64);
 
     // Version marker (for future compatibility)
-    constexpr uint32_t version = 1;
+    constexpr uint32_t version = 2;
     auto write_u32 = [&](uint32_t val) {
         for (int i = 0; i < 4; ++i) {
             blob.push_back((val >> (i * 8)) & 0xFF);
@@ -47,6 +47,7 @@ std::vector<uint8_t> serialize_hnsw_config(const typename HNSWIndex<T, Metric>::
     write_u64(config.M_max_0);
     write_u64(config.ef_construction);
     write_f32(config.ml_factor);
+    write_u32(config.clamp_negative_distances ? 1U : 0U);
 
     return blob;
 }
@@ -54,8 +55,9 @@ std::vector<uint8_t> serialize_hnsw_config(const typename HNSWIndex<T, Metric>::
 /// Deserialize HNSW index configuration from blob
 template <typename T, typename Metric>
 typename HNSWIndex<T, Metric>::Config deserialize_hnsw_config(const void* blob, size_t size) {
-    // Config blob: version(4) + M(8) + M_max(8) + M_max_0(8) + ef_construction(8) + ml_factor(4) =
-    // 40 bytes
+    // Config blob v1: version(4) + M(8) + M_max(8) + M_max_0(8) + ef_construction(8) + ml_factor(4)
+    // = 40 bytes
+    // Config blob v2: v1 + clamp_negative_distances(4) = 44 bytes
     if (size < 40) {
         throw std::runtime_error("Invalid HNSW config blob: too small");
     }
@@ -85,7 +87,7 @@ typename HNSWIndex<T, Metric>::Config deserialize_hnsw_config(const void* blob, 
     };
 
     uint32_t version = read_u32();
-    if (version != 1) {
+    if (version != 1 && version != 2) {
         throw std::runtime_error("Unsupported HNSW config version");
     }
 
@@ -95,6 +97,14 @@ typename HNSWIndex<T, Metric>::Config deserialize_hnsw_config(const void* blob, 
     config.M_max_0 = read_u64();
     config.ef_construction = read_u64();
     config.ml_factor = read_f32();
+    if (version >= 2) {
+        if (size < 44) {
+            throw std::runtime_error("Invalid HNSW config blob: missing clamp flag");
+        }
+        config.clamp_negative_distances = (read_u32() != 0);
+    } else {
+        config.clamp_negative_distances = true;
+    }
 
     return config;
 }
