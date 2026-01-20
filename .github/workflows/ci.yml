@@ -121,7 +121,13 @@ jobs:
         run: meson compile -C build_tsan
 
       - name: Test
-        run: meson test -C build_tsan
+        run: meson test -C build_tsan --print-errorlogs --verbose
+      - name: Upload tsan test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-test-logs
+          path: build_tsan/meson-logs/testlog.txt
 
   # =============================================================================
   # Linux Benchmarks

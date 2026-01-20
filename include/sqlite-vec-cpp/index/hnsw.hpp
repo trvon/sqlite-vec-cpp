@@ -812,11 +812,11 @@ public:
     /// This improves search quality by not traversing to dead-ends
     /// Call after batch deletions but before search
     void isolate_deleted() {
+        std::unique_lock nodes_lock(nodes_mutex_);
         std::shared_lock deleted_lock(deleted_mutex_);
         if (deleted_ids_.empty())
             return;
 
-        std::unique_lock nodes_lock(nodes_mutex_);
         for (auto& [id, node] : nodes_) {
             if (is_deleted_unlocked(id))
                 continue;
@@ -824,8 +824,8 @@ public:
             // Remove edges to deleted nodes at each layer
             for (size_t layer = 0; layer < node.edges.size(); ++layer) {
                 auto& layer_edges = node.edges[layer];
-                std::erase_if(layer_edges,
-                              [this](size_t neighbor) { return is_deleted(neighbor); });
+                std::erase_if(
+                    layer_edges, [this](size_t neighbor) { return is_deleted_unlocked(neighbor); });
             }
         }
     }
