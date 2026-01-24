@@ -49,7 +49,7 @@ template <concepts::VectorElement T> struct HNSWNode {
         std::lock_guard<std::mutex> lock(edge_mutex_);
         if (layer >= edges.size())
             return {};
-        return edges[layer];  // Return copy to avoid data race after lock release
+        return edges[layer]; // Return copy to avoid data race after lock release
     }
 
     /// Add bidirectional edge at layer (thread-safe)

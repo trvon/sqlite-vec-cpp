@@ -56,7 +56,8 @@ public:
         size_t ef_construction = 200; ///< Exploration factor during construction (100-500)
         float ml_factor = 1.0f / std::log(2.0f); ///< Layer selection multiplier (1/ln(2))
         MetricT metric{};                        ///< Distance metric (operates on float spans)
-        bool clamp_negative_distances = true; ///< Clamp negative distances to 0 (safe for L2/cosine)
+        bool clamp_negative_distances =
+            true; ///< Clamp negative distances to 0 (safe for L2/cosine)
 
         /// Create config optimized for high recall on large corpora
         /// @param corpus_size Expected number of vectors
@@ -478,9 +479,8 @@ public:
 
                 {
                     std::unique_lock lock(nodes_mutex_);
-                    auto [it, inserted] =
-                        nodes_.emplace(ids_span[i],
-                                       NodeType(ids_span[i], vectors_span[i], layer, config_.M_max));
+                    auto [it, inserted] = nodes_.emplace(
+                        ids_span[i], NodeType(ids_span[i], vectors_span[i], layer, config_.M_max));
                     if (!inserted) {
                         return;
                     }
@@ -526,8 +526,8 @@ public:
                 }
 
                 for (size_t lc = layer;; --lc) {
-                    auto candidates = beam_search_layer_batch(vector_f32, current,
-                                                              config_.ef_construction, lc);
+                    auto candidates =
+                        beam_search_layer_batch(vector_f32, current, config_.ef_construction, lc);
 
                     size_t M = (lc == 0) ? config_.M_max_0 : config_.M;
                     size_t num_connections = std::min(M, candidates.size());
@@ -824,8 +824,8 @@ public:
             // Remove edges to deleted nodes at each layer
             for (size_t layer = 0; layer < node.edges.size(); ++layer) {
                 auto& layer_edges = node.edges[layer];
-                std::erase_if(
-                    layer_edges, [this](size_t neighbor) { return is_deleted_unlocked(neighbor); });
+                std::erase_if(layer_edges,
+                              [this](size_t neighbor) { return is_deleted_unlocked(neighbor); });
             }
         }
     }
@@ -904,9 +904,7 @@ private:
             return current;
         float current_dist = distance_query_node(query, *current_node);
 
-        auto passes_filter = [&](size_t id) {
-            return !is_deleted_unlocked(id);
-        };
+        auto passes_filter = [&](size_t id) { return !is_deleted_unlocked(id); };
         size_t best_active = passes_filter(current) ? current : static_cast<size_t>(-1);
         float best_active_dist =
             passes_filter(current) ? current_dist : std::numeric_limits<float>::max();
@@ -951,9 +949,9 @@ private:
         return (best_active != static_cast<size_t>(-1)) ? best_active : current;
     }
 
-    std::vector<std::pair<size_t, float>>
-    beam_search_layer_batch(std::span<const float> query, size_t entry_point, size_t ef,
-                            size_t layer) const {
+    std::vector<std::pair<size_t, float>> beam_search_layer_batch(std::span<const float> query,
+                                                                  size_t entry_point, size_t ef,
+                                                                  size_t layer) const {
         auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
                             decltype(cmp)>
@@ -978,9 +976,7 @@ private:
         }
         visited.visit(entry_dense);
 
-        auto passes_filter = [&](size_t id) {
-            return !is_deleted_unlocked(id);
-        };
+        auto passes_filter = [&](size_t id) { return !is_deleted_unlocked(id); };
 
         const float kDistanceEpsilon =
             config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
@@ -1054,17 +1050,16 @@ private:
                                       neighbor_dist < top_candidates.top().first;
 
                 if (should_explore) {
-                    float scored =
-                        config_.clamp_negative_distances ? std::max(0.0f, neighbor_dist)
-                                                        : neighbor_dist;
+                    float scored = config_.clamp_negative_distances ? std::max(0.0f, neighbor_dist)
+                                                                    : neighbor_dist;
                     candidates.emplace(scored, neighbor);
                 }
 
                 if (passes_filter(neighbor)) {
                     if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
-                        float scored =
-                            config_.clamp_negative_distances ? std::max(0.0f, neighbor_dist)
-                                                            : neighbor_dist;
+                        float scored = config_.clamp_negative_distances
+                                           ? std::max(0.0f, neighbor_dist)
+                                           : neighbor_dist;
                         top_candidates.emplace(scored, neighbor);
                         if (top_candidates.size() > ef) {
                             top_candidates.pop();
@@ -1088,7 +1083,9 @@ private:
         return result;
     }
 
-    void prune_connections_batch(size_t node_id, size_t layer) { prune_connections(node_id, layer); }
+    void prune_connections_batch(size_t node_id, size_t layer) {
+        prune_connections(node_id, layer);
+    }
 
     /// Greedy search (read-only, called under shared lock)
     size_t greedy_search_layer_locked(std::span<const float> query, size_t entry_point,

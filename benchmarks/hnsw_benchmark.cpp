@@ -449,8 +449,7 @@ static void BM_HNSW_FP16_Drift(benchmark::State& state) {
                 if (it != f32_dist.end()) {
                     ++total_hits;
                     if (it->second > 0.0f) {
-                        ratio_sum += static_cast<double>(dist) /
-                                     static_cast<double>(it->second);
+                        ratio_sum += static_cast<double>(dist) / static_cast<double>(it->second);
                         ++ratio_count;
                     }
                 }

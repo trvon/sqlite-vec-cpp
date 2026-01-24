@@ -90,9 +90,8 @@ static void BM_HNSW_Search_Filter_Bitset(benchmark::State& state) {
 
     for (auto _ : state) {
         for (const auto& q : data.queries) {
-            auto results =
-                data.index.search_with_filter(std::span<const float>{q}, k, ef,
-                                              [&](size_t id) { return data.allowed[id] != 0; });
+            auto results = data.index.search_with_filter(
+                std::span<const float>{q}, k, ef, [&](size_t id) { return data.allowed[id] != 0; });
             benchmark::DoNotOptimize(results);
         }
     }
@@ -113,9 +112,10 @@ static void BM_HNSW_Search_Filter_Set(benchmark::State& state) {
 
     for (auto _ : state) {
         for (const auto& q : data.queries) {
-            auto results = data.index.search_with_filter(
-                std::span<const float>{q}, k, ef,
-                [&](size_t id) { return data.allowed_set.contains(id); });
+            auto results =
+                data.index.search_with_filter(std::span<const float>{q}, k, ef, [&](size_t id) {
+                    return data.allowed_set.contains(id);
+                });
             benchmark::DoNotOptimize(results);
         }
     }

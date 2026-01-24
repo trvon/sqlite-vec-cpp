@@ -14,9 +14,14 @@ std::vector<float> gen_vec(size_t dim, std::mt19937& rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<float> vec(dim);
     float norm = 0.0f;
-    for (auto& v : vec) { v = dist(rng); norm += v * v; }
+    for (auto& v : vec) {
+        v = dist(rng);
+        norm += v * v;
+    }
     norm = std::sqrt(norm);
-    for (auto& v : vec) { v /= norm; }
+    for (auto& v : vec) {
+        v /= norm;
+    }
     return vec;
 }
 
@@ -28,19 +33,24 @@ int main() {
 
     // Generate data once
     std::vector<std::vector<float>> vecs, qvecs;
-    for (size_t i = 0; i < corpus; ++i) vecs.push_back(gen_vec(dim, rng));
-    for (size_t i = 0; i < queries; ++i) qvecs.push_back(gen_vec(dim, rng));
+    for (size_t i = 0; i < corpus; ++i)
+        vecs.push_back(gen_vec(dim, rng));
+    for (size_t i = 0; i < queries; ++i)
+        qvecs.push_back(gen_vec(dim, rng));
 
-    for (auto [M, M_max, M_max_0] : {std::tuple{24,48,96}, std::tuple{32,64,128}}) {
+    for (auto [M, M_max, M_max_0] : {std::tuple{24, 48, 96}, std::tuple{32, 64, 128}}) {
         HNSWIndex<float, CosineMetric<float>>::Config cfg;
-        cfg.M = M; cfg.M_max = M_max; cfg.M_max_0 = M_max_0; cfg.ef_construction = 200;
+        cfg.M = M;
+        cfg.M_max = M_max;
+        cfg.M_max_0 = M_max_0;
+        cfg.ef_construction = 200;
         HNSWIndex<float, CosineMetric<float>> idx(cfg);
 
         auto t1 = std::chrono::high_resolution_clock::now();
         for (size_t i = 0; i < corpus; ++i)
             idx.insert(i, std::span<const float>{vecs[i]});
         auto t2 = std::chrono::high_resolution_clock::now();
-        double build_ms = std::chrono::duration<double, std::milli>(t2-t1).count();
+        double build_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
 
         printf("M=%d: build=%.0fms", M, build_ms);
 
@@ -49,7 +59,7 @@ int main() {
             for (size_t q = 0; q < queries; ++q)
                 idx.search(std::span<const float>{qvecs[q]}, k, ef);
             auto e = std::chrono::high_resolution_clock::now();
-            double lat_us = std::chrono::duration<double, std::micro>(e-s).count() / queries;
+            double lat_us = std::chrono::duration<double, std::micro>(e - s).count() / queries;
             printf(" | ef=%zu: %.0fus", ef, lat_us);
         }
         printf("\n");

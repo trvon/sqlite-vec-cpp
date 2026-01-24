@@ -2,12 +2,12 @@
 #include <cmath>
 #include <iostream>
 #include <vector>
-#include <sqlite-vec-cpp/sqlite_vec.hpp>
-#include <sqlite-vec-cpp/distances/l2.hpp>
 #include <sqlite-vec-cpp/distances/cosine.hpp>
 #include <sqlite-vec-cpp/distances/inner_product.hpp>
+#include <sqlite-vec-cpp/distances/l2.hpp>
 #include <sqlite-vec-cpp/simd/avx.hpp>
 #include <sqlite-vec-cpp/simd/neon.hpp>
+#include <sqlite-vec-cpp/sqlite_vec.hpp>
 
 using namespace sqlite_vec_cpp;
 using namespace sqlite_vec_cpp::distances;
@@ -218,8 +218,8 @@ void test_simd_consistency() {
         inner_product_distance_float(std::span<const float>(a), std::span<const float>(b));
 
 #ifdef SQLITE_VEC_ENABLE_AVX
-    float l2_avx = simd::l2_distance_float_avx(std::span<const float>(a),
-                                               std::span<const float>(b));
+    float l2_avx =
+        simd::l2_distance_float_avx(std::span<const float>(a), std::span<const float>(b));
     float cosine_avx =
         simd::cosine_distance_float_avx(std::span<const float>(a), std::span<const float>(b));
     float ip_avx =
@@ -230,8 +230,8 @@ void test_simd_consistency() {
 #endif
 
 #ifdef SQLITE_VEC_ENABLE_NEON
-    float l2_neon = simd::l2_distance_float_neon(std::span<const float>(a),
-                                                 std::span<const float>(b));
+    float l2_neon =
+        simd::l2_distance_float_neon(std::span<const float>(a), std::span<const float>(b));
     float cosine_neon =
         simd::cosine_distance_float_neon(std::span<const float>(a), std::span<const float>(b));
     float ip_neon =
