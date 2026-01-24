@@ -227,7 +227,7 @@ public:
                     std::shared_lock lock(nodes_mutex_);
                     std::shared_lock deleted_lock(deleted_mutex_);
                     candidates = beam_search_layer_locked(vector_f32, current,
-                                                          config_.ef_construction, config_.ef_construction, lc, nullptr);
+                                                          config_.ef_construction, lc, nullptr);
                 }
 
                 // Connect with write lock
@@ -264,7 +264,7 @@ public:
                 std::shared_lock lock(nodes_mutex_);
                 std::shared_lock deleted_lock(deleted_mutex_);
                 candidates = beam_search_layer_locked(vector_f32, current, config_.ef_construction,
-                                                      config_.ef_construction, lc, nullptr);
+                                                      lc, nullptr);
             }
 
             // Connect with write lock (cheap operation)
@@ -319,8 +319,13 @@ public:
             current = greedy_search_layer_locked(query, current, lc, filter_ptr);
         }
 
-        // Phase 2: Beam search at layer 0 with k results
-        auto candidates = beam_search_layer_locked(query, current, ef_search, k, 0, filter_ptr);
+        // Phase 2: Beam search at layer 0
+        auto candidates = beam_search_layer_locked(query, current, ef_search, 0, filter_ptr);
+
+        // Phase 3: Return top-k
+        if (candidates.size() > k) {
+            candidates.resize(k);
+        }
 
         return candidates;
     }
@@ -1148,15 +1153,9 @@ private:
     }
 
     /// Beam search (read-only, called under shared lock)
-    /// @param query Query vector
-    /// @param entry_point Starting node for search
-    /// @param ef Exploration factor (controls search breadth during traversal)
-    /// @param target_k Number of results to collect (may differ from ef)
-    /// @param layer Graph layer to search
-    /// @param filter Optional filter function
     std::vector<std::pair<size_t, float>> beam_search_layer_locked(std::span<const float> query,
                                                                    size_t entry_point, size_t ef,
-                                                                   size_t target_k, size_t layer,
+                                                                   size_t layer,
                                                                    const FilterFn* filter) const {
         auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
@@ -1208,7 +1207,7 @@ private:
                 continue;
 
             if (!top_candidates.empty() && current_dist > top_candidates.top().first &&
-                top_candidates.size() >= target_k) {
+                top_candidates.size() >= ef) {
                 break;
             }
 
@@ -1275,12 +1274,12 @@ private:
                 }
 
                 if (passes_filter(neighbor)) {
-                    if (top_candidates.size() < target_k || neighbor_dist < top_candidates.top().first) {
+                    if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
                         float top_score = config_.clamp_negative_distances
                                               ? std::max(0.0f, neighbor_dist)
                                               : neighbor_dist;
                         top_candidates.emplace(top_score, neighbor);
-                        if (top_candidates.size() > target_k) {
+                        if (top_candidates.size() > ef) {
                             top_candidates.pop();
                         }
                     }
@@ -1306,9 +1305,9 @@ private:
     /// Beam search (direct access, for insert phase)
     std::vector<std::pair<size_t, float>> beam_search_layer(std::span<const float> query,
                                                             size_t entry_point, size_t ef,
-                                                            size_t target_k, size_t layer,
+                                                            size_t layer,
                                                             const FilterFn* filter) const {
-        return beam_search_layer_locked(query, entry_point, ef, target_k, layer, filter);
+        return beam_search_layer_locked(query, entry_point, ef, layer, filter);
     }
 
     /// Connect node to M nearest neighbors at layer
