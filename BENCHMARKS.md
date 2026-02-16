@@ -18,6 +18,82 @@ Previous benchmark runs are archived in `benchmarks/archive/`.
 
 ---
 
+## HNSW Engine Comparison Benchmark (YAMS baseline + optional zvec)
+
+This benchmark is implemented by `benchmarks/hnsw_engine_comparison_benchmark.cpp` and built as
+`hnsw_engine_comparison_benchmark`.
+
+Current status for this report: **YAMS-only run** (zvec was not linked in this run).
+
+### What it measures
+
+- Index build time
+- Search latency and QPS at `ef_search` values 50, 100, 200
+- Recall@K against brute-force ground truth
+
+### Build and run
+
+From `third_party/sqlite-vec-cpp/`:
+
+```bash
+meson setup builddir
+meson compile -C builddir
+
+# YAMS baseline (default)
+./builddir/benchmarks/hnsw_engine_comparison_benchmark --corpus=10000 --dim=768
+```
+
+Optional zvec-enabled comparison:
+
+```bash
+# build zvec separately
+git clone https://github.com/alibaba/zvec.git /opt/zvec
+cd /opt/zvec && mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+
+# reconfigure sqlite-vec-cpp with zvec headers
+cd /path/to/yams/third_party/sqlite-vec-cpp
+meson setup builddir -Dzvec-root=/opt/zvec --reconfigure
+meson compile -C builddir
+./builddir/benchmarks/hnsw_engine_comparison_benchmark --corpus=10000 --dim=768
+```
+
+### Current run results (2026-02-16, Apple M3 Max)
+
+Run: `./hnsw_engine_comparison_benchmark --corpus=10000 --dim=768`
+
+| Engine | M | ef_search | Build (ms) | Latency (μs) | QPS | Recall@10 |
+|--------|---|-----------|------------|--------------|-----|-----------|
+| yams-hnsw | 16 | 50 | 50,709 | 693 | 1,443 | 54.1% |
+| yams-hnsw | 16 | 100 | 50,709 | 1,129 | 886 | 74.7% |
+| yams-hnsw | 16 | 200 | 50,709 | 1,819 | 550 | 92.9% |
+| yams-hnsw | 24 | 50 | 105,494 | 1,028 | 973 | 68.2% |
+| yams-hnsw | 24 | 100 | 105,494 | 1,529 | 654 | 86.9% |
+| yams-hnsw | 24 | 200 | 105,494 | 2,219 | 451 | 98.5% |
+| yams-hnsw | 32 | 50 | 177,331 | 1,119 | 894 | 76.8% |
+| yams-hnsw | 32 | 100 | 177,331 | 1,811 | 552 | 93.1% |
+| yams-hnsw | 32 | 200 | 177,331 | 2,405 | 416 | 99.5% |
+
+Hardware note: Apple M3 Max, NEON + DotProd, FP32, single-threaded query loop.
+
+### External zvec reference numbers (not measured in this run)
+
+From zvec published benchmarks (<https://zvec.org/en/docs/benchmarks/>):
+
+| Dataset | Config | QPS | Recall |
+|---------|--------|-----|--------|
+| Cohere 1M (768d) | INT8, M=15, ef_search=180 | ~16,000 | 95%+ |
+| Cohere 10M (768d) | INT8, M=50, ef_search=118, refiner | ~8,000 | 95%+ |
+
+Key differences vs this run:
+
+- zvec numbers use INT8 + refiner and multithreaded query load
+- this run uses FP32 and single-threaded query loop
+- hardware differs (cloud ECS vs local Apple Silicon)
+
+---
+
 ## Batch Distance Benchmark
 
 ### 1. Sequential vs Batch Comparison
@@ -129,3 +205,9 @@ meson compile -C builddir-release
 ```
 
 Logs are stored under `benchmarks/logs/2026-01-19_release_neon/`.
+
+For the HNSW engine comparison benchmark:
+
+```bash
+./builddir-release/benchmarks/hnsw_engine_comparison_benchmark --corpus=10000 --dim=768
+```

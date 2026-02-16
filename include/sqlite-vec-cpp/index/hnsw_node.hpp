@@ -52,6 +52,15 @@ template <concepts::VectorElement T> struct HNSWNode {
         return edges[layer]; // Return copy to avoid data race after lock release
     }
 
+    /// Get connections at specific layer (direct reference, NO lock — caller must ensure safety)
+    /// Use in single-threaded insert paths to avoid per-neighbor copy + mutex overhead
+    const std::vector<size_t>& neighbors_unlocked(size_t layer) const {
+        static const std::vector<size_t> empty;
+        if (layer >= edges.size())
+            return empty;
+        return edges[layer];
+    }
+
     /// Add bidirectional edge at layer (thread-safe)
     void add_edge(size_t neighbor_id, size_t layer) {
         std::lock_guard<std::mutex> lock(edge_mutex_);
@@ -60,9 +69,25 @@ template <concepts::VectorElement T> struct HNSWNode {
         edges[layer].push_back(neighbor_id);
     }
 
+    /// Add edge without locking (caller must ensure single-threaded access)
+    void add_edge_unlocked(size_t neighbor_id, size_t layer) {
+        if (layer >= edges.size())
+            return;
+        edges[layer].push_back(neighbor_id);
+    }
+
     /// Remove edge at layer (thread-safe)
     void remove_edge(size_t neighbor_id, size_t layer) {
         std::lock_guard<std::mutex> lock(edge_mutex_);
+        if (layer >= edges.size())
+            return;
+        auto& layer_edges = edges[layer];
+        layer_edges.erase(std::remove(layer_edges.begin(), layer_edges.end(), neighbor_id),
+                          layer_edges.end());
+    }
+
+    /// Remove edge without locking (caller must ensure single-threaded access)
+    void remove_edge_unlocked(size_t neighbor_id, size_t layer) {
         if (layer >= edges.size())
             return;
         auto& layer_edges = edges[layer];

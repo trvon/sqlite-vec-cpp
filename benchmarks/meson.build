@@ -77,3 +77,25 @@ else
   message('Google Benchmark not found - benchmarks disabled')
   message('Install with: apt install libbenchmark-dev or brew install google-benchmark')
 endif
+
+# HNSW engine comparison benchmark (standalone, no Google Benchmark dependency)
+# Links against zvec if available; otherwise runs YAMS HNSW baseline only.
+hnsw_engine_bench_cpp_args = cpp_args_list
+hnsw_engine_bench_incs = [include_directories('../include')]
+zvec_root = get_option('zvec-root')
+if zvec_root != ''
+  hnsw_engine_bench_incs += include_directories(zvec_root / 'src' / 'include')
+  hnsw_engine_bench_cpp_args += ['-DYAMS_HAS_ZVEC=1']
+  message('hnsw engine comparison benchmark: zvec ENABLED from ' + zvec_root)
+else
+  message('hnsw engine comparison benchmark: zvec NOT available (use -Dzvec-root=/path/to/zvec to enable)')
+endif
+
+hnsw_engine_comparison_benchmark_exe = executable(
+  'hnsw_engine_comparison_benchmark',
+  'hnsw_engine_comparison_benchmark.cpp',
+  include_directories: hnsw_engine_bench_incs,
+  cpp_args: hnsw_engine_bench_cpp_args,
+  install: false
+)
+message('  ./hnsw_engine_comparison_benchmark (YAMS HNSW baseline + optional zvec)')

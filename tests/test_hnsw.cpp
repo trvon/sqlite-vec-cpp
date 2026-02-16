@@ -11,6 +11,8 @@
 #include <vector>
 
 #include <sqlite-vec-cpp/distances/l2.hpp>
+#include <sqlite-vec-cpp/distances/cosine.hpp>
+#include <sqlite-vec-cpp/distances/inner_product.hpp>
 #include <sqlite-vec-cpp/index/hnsw.hpp>
 #include <sqlite-vec-cpp/index/hnsw_persistence.hpp>
 #include <sqlite-vec-cpp/utils/float16.hpp>
@@ -871,6 +873,309 @@ void test_config_for_corpus() {
     std::cout << "  ✓ Config factory passed" << std::endl;
 }
 
+// ============================================================================
+// Normalization regression tests
+// ============================================================================
+
+// Helper: compute L2 norm
+float vector_norm(std::span<const float> v) {
+    float sum = 0.0f;
+    for (float x : v)
+        sum += x * x;
+    return std::sqrt(sum);
+}
+
+// Test 22: Normalized cosine build produces correct search results
+void test_normalized_build_correctness() {
+    std::cout << "Test 22: Normalized cosine build correctness..." << std::endl;
+
+    using CosineIndex = HNSWIndex<float, CosineMetric<float>>;
+    CosineIndex::Config cfg;
+    cfg.normalize_vectors = true;
+    cfg.ef_construction = 200;
+
+    CosineIndex index(cfg);
+
+    // Simple 2D vectors with known cosine relationships
+    std::vector<std::vector<float>> vectors = {
+        {1.0f, 0.0f},   // 0: pointing right
+        {0.0f, 1.0f},   // 1: pointing up
+        {1.0f, 1.0f},   // 2: 45 degrees (not normalized)
+        {-1.0f, 0.0f},  // 3: pointing left (opposite of 0)
+        {3.0f, 0.1f},   // 4: nearly right (not unit norm)
+        {0.5f, 0.0f},   // 5: same direction as 0, different magnitude
+    };
+
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        index.insert(i, std::span{vectors[i]});
+    }
+
+    assert(index.size() == vectors.size());
+
+    // Query: (1, 0) should find id=0 and id=5 (same direction) and id=4 (nearly same)
+    std::vector<float> query = {2.0f, 0.0f}; // magnitude doesn't matter for cosine
+    auto results = index.search(std::span{query}, 3, 10);
+    assert(results.size() == 3);
+
+    // IDs 0, 5, 4 should be top-3 (all near the "right" direction)
+    std::unordered_set<size_t> top3;
+    for (const auto& [id, dist] : results) {
+        top3.insert(id);
+    }
+    assert(top3.count(0) || top3.count(5)); // At least one "right" vector in top-3
+    assert(top3.count(4));                  // Nearly-right vector
+
+    // Distances should be cosine distances in [0, 2] range
+    for (const auto& [id, dist] : results) {
+        assert(dist >= -0.01f && dist <= 2.01f); // Allow small float error
+    }
+
+    std::cout << "  ✓ Normalized cosine build correctness passed" << std::endl;
+}
+
+// Test 23: Recall parity — normalized vs non-normalized produce equivalent recall
+void test_normalized_recall_parity() {
+    std::cout << "Test 23: Normalized vs non-normalized recall parity..." << std::endl;
+
+    constexpr size_t num_vectors = 2000;
+    constexpr size_t dim = 128;
+    constexpr size_t k = 10;
+
+    std::mt19937 rng(42);
+
+    // Generate random vectors
+    std::vector<std::vector<float>> vectors;
+    vectors.reserve(num_vectors);
+    for (size_t i = 0; i < num_vectors; ++i) {
+        vectors.push_back(generate_vector(dim, rng));
+    }
+
+    // Build non-normalized index
+    using CosineIndex = HNSWIndex<float, CosineMetric<float>>;
+    CosineIndex::Config cfg_normal;
+    cfg_normal.normalize_vectors = false;
+    cfg_normal.ef_construction = 200;
+    CosineIndex normal_index(cfg_normal);
+
+    // Build normalized index
+    CosineIndex::Config cfg_norm;
+    cfg_norm.normalize_vectors = true;
+    cfg_norm.ef_construction = 200;
+    CosineIndex norm_index(cfg_norm);
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        normal_index.insert(i, std::span{vectors[i]});
+        norm_index.insert(i, std::span{vectors[i]});
+    }
+
+    // Brute-force ground truth
+    auto query = generate_vector(dim, rng);
+    CosineMetric<float> metric;
+    std::vector<std::pair<size_t, float>> ground_truth;
+    for (size_t i = 0; i < num_vectors; ++i) {
+        float dist = metric(std::span{query}, std::span{vectors[i]});
+        ground_truth.emplace_back(i, dist);
+    }
+    std::sort(ground_truth.begin(), ground_truth.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+    ground_truth.resize(k);
+
+    std::unordered_set<size_t> gt_ids;
+    for (const auto& [id, _] : ground_truth) {
+        gt_ids.insert(id);
+    }
+
+    // Search both
+    auto normal_results = normal_index.search(std::span{query}, k, 100);
+    auto norm_results = norm_index.search(std::span{query}, k, 100);
+
+    size_t normal_hits = 0, norm_hits = 0;
+    for (const auto& [id, _] : normal_results) {
+        if (gt_ids.count(id))
+            ++normal_hits;
+    }
+    for (const auto& [id, _] : norm_results) {
+        if (gt_ids.count(id))
+            ++norm_hits;
+    }
+
+    float normal_recall = static_cast<float>(normal_hits) / k;
+    float norm_recall = static_cast<float>(norm_hits) / k;
+
+    std::cout << "  Non-normalized recall@" << k << ": " << (normal_recall * 100) << "%"
+              << std::endl;
+    std::cout << "  Normalized recall@" << k << ": " << (norm_recall * 100) << "%" << std::endl;
+
+    // Both should achieve at least 70% recall (2000 vectors with ef=100)
+    assert(normal_recall >= 0.70f);
+    assert(norm_recall >= 0.70f);
+
+    // Normalized recall should not be significantly worse than non-normalized
+    // Allow up to 20% relative drop (normalization is an approximation for mixed metrics)
+    assert(norm_recall >= normal_recall * 0.80f);
+
+    std::cout << "  ✓ Recall parity passed" << std::endl;
+}
+
+// Test 24: Normalized batch build (sequential path)
+void test_normalized_batch_build() {
+    std::cout << "Test 24: Normalized batch build..." << std::endl;
+
+    constexpr size_t num_vectors = 500;
+    constexpr size_t dim = 32;
+    std::mt19937 rng(42);
+
+    using CosineIndex = HNSWIndex<float, CosineMetric<float>>;
+    CosineIndex::Config cfg;
+    cfg.normalize_vectors = true;
+
+    CosineIndex index(cfg);
+
+    std::vector<std::vector<float>> vectors;
+    std::vector<std::span<const float>> spans;
+    std::vector<size_t> ids;
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        vectors.push_back(generate_vector(dim, rng));
+        spans.emplace_back(vectors.back());
+        ids.push_back(i);
+    }
+
+    index.build(std::span{ids}, std::span{spans});
+    assert(index.size() == num_vectors);
+
+    auto query = generate_vector(dim, rng);
+    auto results = index.search(std::span{query}, 10, 50);
+    assert(results.size() == 10);
+
+    // Verify distances are valid cosine distances
+    for (const auto& [id, dist] : results) {
+        assert(dist >= -0.01f && dist <= 2.01f);
+    }
+
+    std::cout << "  ✓ Normalized batch build passed" << std::endl;
+}
+
+// Test 25: Normalized parallel build
+void test_normalized_parallel_build() {
+    std::cout << "Test 25: Normalized parallel build..." << std::endl;
+
+    constexpr size_t num_vectors = 500;
+    constexpr size_t dim = 32;
+    std::mt19937 rng(42);
+
+    using CosineIndex = HNSWIndex<float, CosineMetric<float>>;
+    CosineIndex::Config cfg;
+    cfg.normalize_vectors = true;
+
+    CosineIndex index(cfg);
+
+    std::vector<std::vector<float>> vectors;
+    std::vector<std::span<const float>> spans;
+    std::vector<size_t> ids;
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        vectors.push_back(generate_vector(dim, rng));
+        spans.emplace_back(vectors.back());
+        ids.push_back(i);
+    }
+
+    // Use single-threaded parallel to avoid flakiness under CI
+    index.build_parallel(std::span{ids}, std::span{spans}, 1);
+    assert(index.size() == num_vectors);
+
+    auto query = generate_vector(dim, rng);
+    auto results = index.search(std::span{query}, 10, 50);
+    assert(results.size() == 10);
+
+    for (const auto& [id, dist] : results) {
+        assert(dist >= -0.01f && dist <= 2.01f);
+    }
+
+    std::cout << "  ✓ Normalized parallel build passed" << std::endl;
+}
+
+// Test 26: Vectors are actually stored normalized (internal invariant)
+void test_normalized_storage_invariant() {
+    std::cout << "Test 26: Normalized storage invariant..." << std::endl;
+
+    using CosineIndex = HNSWIndex<float, CosineMetric<float>>;
+    CosineIndex::Config cfg;
+    cfg.normalize_vectors = true;
+
+    CosineIndex index(cfg);
+
+    // Insert vectors with varying magnitudes (all same dimension)
+    std::vector<std::vector<float>> vectors = {
+        {3.0f, 4.0f},       // norm = 5
+        {0.1f, 0.2f},       // small magnitude
+        {100.0f, 0.0f},     // large magnitude
+    };
+
+    // Use insert_single_threaded to keep it simple
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        index.insert_single_threaded(i, std::span{vectors[i]});
+    }
+
+    // Access stored vectors via get_node and verify they're unit-norm
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        const auto* node = index.get_node(i);
+        assert(node != nullptr);
+        auto stored_vec = std::span<const float>(node->vector);
+        float norm = vector_norm(stored_vec);
+        // Should be approximately 1.0
+        assert(std::abs(norm - 1.0f) < 0.001f);
+    }
+
+    std::cout << "  ✓ Normalized storage invariant passed" << std::endl;
+}
+
+// Test 27: SIMD inner product distance correctness for known values
+void test_inner_product_distance_correctness() {
+    std::cout << "Test 27: Inner product distance correctness..." << std::endl;
+
+    // For unit vectors, cosine_distance = 1 - dot(a, b)
+    // inner_product_distance also computes 1 - dot(a, b)
+
+    // Parallel vectors (same direction): dot = 1, distance = 0
+    std::vector<float> a(128, 0.0f);
+    a[0] = 1.0f;
+    std::vector<float> b(128, 0.0f);
+    b[0] = 1.0f;
+
+    sqlite_vec_cpp::distances::InnerProductMetric<float> ip_metric;
+    float dist = ip_metric(std::span{a}, std::span{b});
+    assert(std::abs(dist) < 0.001f); // Should be ~0
+
+    // Orthogonal vectors: dot = 0, distance = 1
+    std::vector<float> c(128, 0.0f);
+    c[1] = 1.0f;
+    float dist2 = ip_metric(std::span{a}, std::span{c});
+    assert(std::abs(dist2 - 1.0f) < 0.001f); // Should be ~1
+
+    // Anti-parallel vectors: dot = -1, distance = 2
+    std::vector<float> d(128, 0.0f);
+    d[0] = -1.0f;
+    float dist3 = ip_metric(std::span{a}, std::span{d});
+    assert(std::abs(dist3 - 2.0f) < 0.001f); // Should be ~2
+
+    // Test with dimension >= 16 (triggers NEON 4x4 unroll path)
+    std::mt19937 rng(42);
+    std::vector<float> p(768), q(768);
+    float manual_dot = 0.0f;
+    for (size_t i = 0; i < 768; ++i) {
+        p[i] = static_cast<float>(rng() % 1000) / 1000.0f;
+        q[i] = static_cast<float>(rng() % 1000) / 1000.0f;
+        manual_dot += p[i] * q[i];
+    }
+    float ip_dist = ip_metric(std::span{p}, std::span{q});
+    float expected = 1.0f - manual_dot;
+    // Allow larger tolerance for 768d accumulation
+    assert(std::abs(ip_dist - expected) < 0.1f);
+
+    std::cout << "  ✓ Inner product distance correctness passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running HNSW tests...\n" << std::endl;
 
@@ -896,6 +1201,14 @@ int main() {
     test_graph_stats();
     test_adaptive_search();
     test_config_for_corpus();
+
+    // Normalization regression tests
+    test_normalized_build_correctness();
+    test_normalized_recall_parity();
+    test_normalized_batch_build();
+    test_normalized_parallel_build();
+    test_normalized_storage_invariant();
+    test_inner_product_distance_correctness();
 
     std::cout << "\nAll HNSW tests passed!" << std::endl;
     return 0;

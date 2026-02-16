@@ -200,6 +200,7 @@ inline double l1_distance_float_neon(std::span<const float> a, std::span<const f
 
 /// NEON-optimized cosine distance for float vectors
 /// cosine_distance = 1 - (dot(a,b) / (||a|| * ||b||))
+/// Uses 4×4 unrolled loop processing 16 floats per iteration with 3 accumulator chains.
 /// Requires: NEON support, size >= 4
 inline float cosine_distance_float_neon(std::span<const float> a, std::span<const float> b) {
     const std::size_t size = a.size();

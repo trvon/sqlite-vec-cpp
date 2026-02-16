@@ -62,25 +62,52 @@ float inner_product_distance_int(std::span<const T> a, std::span<const T> b) {
 #ifdef SQLITE_VEC_ENABLE_NEON
 namespace simd {
 /// NEON-optimized inner product for float vectors
+/// 4×4 unrolled: 4 accumulators × 4 floats = 16 floats per iteration.
+/// For 768-dim vectors this does 192 FMA (vs 576 for full cosine).
+/// Perfect for pre-normalized vectors where cosine = 1 - dot(a,b).
 inline float inner_product_float_neon(std::span<const float> a, std::span<const float> b) {
     assert(a.size() == b.size());
+    const std::size_t size = a.size();
+    const std::size_t qty16 = size >> 4;    // size / 16
+    const std::size_t end_idx = qty16 << 4; // (size / 16) * 16
 
-    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+    float32x4_t dot0 = vdupq_n_f32(0.0f);
+    float32x4_t dot1 = vdupq_n_f32(0.0f);
+    float32x4_t dot2 = vdupq_n_f32(0.0f);
+    float32x4_t dot3 = vdupq_n_f32(0.0f);
+
     std::size_t i = 0;
+    while (i < end_idx) {
+        // Process 4 sets of 4 floats = 16 floats per iteration
+        float32x4_t v1 = vld1q_f32(&a[i]);
+        float32x4_t v2 = vld1q_f32(&b[i]);
+        dot0 = vfmaq_f32(dot0, v1, v2);
+        i += 4;
 
-    // Process 4 floats at a time
-    for (; i + 4 <= a.size(); i += 4) {
-        float32x4_t a_vec = vld1q_f32(&a[i]);
-        float32x4_t b_vec = vld1q_f32(&b[i]);
-        sum_vec = vmlaq_f32(sum_vec, a_vec, b_vec);
+        v1 = vld1q_f32(&a[i]);
+        v2 = vld1q_f32(&b[i]);
+        dot1 = vfmaq_f32(dot1, v1, v2);
+        i += 4;
+
+        v1 = vld1q_f32(&a[i]);
+        v2 = vld1q_f32(&b[i]);
+        dot2 = vfmaq_f32(dot2, v1, v2);
+        i += 4;
+
+        v1 = vld1q_f32(&a[i]);
+        v2 = vld1q_f32(&b[i]);
+        dot3 = vfmaq_f32(dot3, v1, v2);
+        i += 4;
     }
 
-    // Horizontal sum
-    float dot = vaddvq_f32(sum_vec);
+    // Reduce 4 accumulators
+    float32x4_t dot_total = vaddq_f32(vaddq_f32(dot0, dot1), vaddq_f32(dot2, dot3));
+    float dot = vaddvq_f32(dot_total);
 
-    // Handle remaining elements
-    for (; i < a.size(); ++i) {
+    // Handle remaining elements (scalar)
+    while (i < size) {
         dot += a[i] * b[i];
+        ++i;
     }
 
     return 1.0f - dot;
@@ -130,8 +157,8 @@ float inner_product_distance(std::span<const T> a, std::span<const T> b) {
         }
 #endif
 #ifdef SQLITE_VEC_ENABLE_NEON
-        // NEON: require minimum size
-        if (a.size() > 4) {
+        // NEON: 4×4 unrolled, require minimum 16 elements for efficient loop
+        if (a.size() >= 16) {
             return simd::inner_product_float_neon(a, b);
         }
 #endif
