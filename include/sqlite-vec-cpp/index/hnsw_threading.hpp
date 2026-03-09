@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -37,13 +39,34 @@ public:
 /// Thread-local random number generator for parallel operations
 /// Avoids contention on shared RNG during parallel layer assignment
 class ThreadLocalRNG {
-    static inline thread_local std::mt19937 rng_{std::random_device{}()};
+    static inline thread_local std::mt19937 rng_{};
+    static inline thread_local bool seeded_{false};
     std::uniform_real_distribution<float> dist_{0.0f, 1.0f};
+    uint32_t seed_{42};
+
+    static uint32_t resolveSeed(uint32_t fallback) {
+        if (const char* env = std::getenv("YAMS_HNSW_RANDOM_SEED")) {
+            try {
+                const auto parsed = static_cast<unsigned long>(std::stoul(std::string(env)));
+                return static_cast<uint32_t>(parsed);
+            } catch (...) {
+            }
+        }
+        return fallback;
+    }
+
+    void ensureSeeded() {
+        if (!seeded_) {
+            rng_.seed(resolveSeed(seed_));
+            seeded_ = true;
+        }
+    }
 
 public:
-    explicit ThreadLocalRNG(uint32_t seed = 42) { rng_.seed(seed); }
+    explicit ThreadLocalRNG(uint32_t seed = 42) : seed_(seed) {}
 
     [[nodiscard]] float random() {
+        ensureSeeded();
         float r = dist_(rng_);
         if (r == 0.0f)
             r = 1e-9f;
@@ -55,6 +78,7 @@ public:
     }
 
     [[nodiscard]] uint32_t random_uint(uint32_t max) {
+        ensureSeeded();
         std::uniform_int_distribution<uint32_t> dist(0, max - 1);
         return dist(rng_);
     }
