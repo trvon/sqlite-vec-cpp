@@ -672,12 +672,33 @@ int save_hnsw_checkpoint(sqlite3* db, const char* schema, const char* table,
         return rc;
     }
 
+    // Save config so checkpointed indices remain loadable without requiring a full save.
+    std::ostringstream config_sql;
+    config_sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
+               << "_hnsw_meta\" (key, value) VALUES ('config', ?)";
+
+    sqlite3_stmt* stmt;
+    rc = sqlite3_prepare_v2(db, config_sql.str().c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return rc;
+    }
+
+    auto config_blob = serialize_hnsw_config<T, Metric>(index.config());
+    sqlite3_bind_blob(stmt, 1, config_blob.data(), config_blob.size(), SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return rc;
+    }
+
     // Save entry point
     std::ostringstream entry_sql;
     entry_sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
               << "_hnsw_meta\" (key, value) VALUES ('entry_point', ?)";
 
-    sqlite3_stmt* stmt;
     rc = sqlite3_prepare_v2(db, entry_sql.str().c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
