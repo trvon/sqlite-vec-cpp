@@ -73,16 +73,13 @@ public:
         static Config for_corpus(size_t corpus_size, size_t dim = 128) {
             Config cfg;
 
-            // Higher M for high-dimensional data (embeddings typically 384-1536)
-            // Benchmark: 768d with M=32 shows 6-8% better recall vs M=24 at ef=100
-            if (dim >= 512) {
-                cfg.M = 32;
-                cfg.M_max = 64;
-                cfg.M_max_0 = 128;
-            } else if (dim >= 256) {
-                cfg.M = 24;
-                cfg.M_max = 48;
-                cfg.M_max_0 = 96;
+            // Higher M for high-dimensional data (embeddings typically 384-1536), but keep
+            // 512+d on the same profile as 256+d to avoid pathological build times for
+            // medium-sized corpora where reranking/refinement already recovers quality.
+            if (dim >= 256) {
+                cfg.M = 16;
+                cfg.M_max = 32;
+                cfg.M_max_0 = 64;
             } else if (dim >= 128) {
                 cfg.M = 16;
                 cfg.M_max = 32;
@@ -96,8 +93,6 @@ public:
             // Higher ef_construction for larger corpora
             if (corpus_size >= 100000) {
                 cfg.ef_construction = 400;
-            } else if (corpus_size >= 10000) {
-                cfg.ef_construction = 200;
             } else {
                 cfg.ef_construction = 100;
             }
@@ -216,8 +211,7 @@ public:
         {
             std::unique_lock lock(nodes_mutex_);
             // Pass M_max hint for edge pre-allocation
-            auto [it, inserted] =
-                nodes_.emplace(id, NodeType(id, store_vec, layer, config_.M_max));
+            auto [it, inserted] = nodes_.emplace(id, NodeType(id, store_vec, layer, config_.M_max));
             if (!inserted) {
                 return;
             }
@@ -372,8 +366,8 @@ public:
         if (layer > ep_layer) {
             size_t current = entry_point_id_.load(std::memory_order_relaxed);
             for (size_t lc = ep_layer;; --lc) {
-                auto candidates = beam_search_layer_unlocked(vector_f32, current,
-                                                             config_.ef_construction, lc);
+                auto candidates =
+                    beam_search_layer_unlocked(vector_f32, current, config_.ef_construction, lc);
                 size_t M = (lc == 0) ? config_.M_max_0 : config_.M;
                 connect_neighbors_unlocked(id, candidates, M, lc);
                 if (lc == 0)
@@ -394,8 +388,8 @@ public:
         }
 
         for (size_t lc = layer;; --lc) {
-            auto candidates = beam_search_layer_unlocked(vector_f32, current,
-                                                         config_.ef_construction, lc);
+            auto candidates =
+                beam_search_layer_unlocked(vector_f32, current, config_.ef_construction, lc);
             size_t M = (lc == 0) ? config_.M_max_0 : config_.M;
             connect_neighbors_unlocked(id, candidates, M, lc);
             if (lc == 0)
@@ -1053,8 +1047,6 @@ private:
 
     bool is_deleted_unlocked(size_t id) const { return deleted_ids_.contains(id); }
 
-
-
     /// Register node in flat lookup table (call from insert_single_threaded)
     void register_flat_lookup(size_t id, NodeType* ptr) {
         if (id >= flat_lookup_.size()) {
@@ -1112,9 +1104,9 @@ private:
     }
 
     /// Beam search without any locking (single-threaded insert path)
-    std::vector<std::pair<size_t, float>>
-    beam_search_layer_unlocked(std::span<const float> query, size_t entry_point, size_t ef,
-                               size_t layer) const {
+    std::vector<std::pair<size_t, float>> beam_search_layer_unlocked(std::span<const float> query,
+                                                                     size_t entry_point, size_t ef,
+                                                                     size_t layer) const {
         auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
                             decltype(cmp)>
