@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <queue>
@@ -418,6 +419,8 @@ public:
     /// @param k Number of neighbors to return
     /// @param ef_search Exploration factor (higher = better recall, slower)
     /// @return Vector of (id, distance) pairs, sorted by distance
+    using FilterFn = std::function<bool(size_t node_id)>;
+
     std::vector<std::pair<size_t, float>> search(std::span<const float> query, size_t k,
                                                  size_t ef_search = 50) const {
         return search_with_filter(query, k, ef_search, nullptr);
@@ -429,45 +432,26 @@ public:
     /// @param ef_search Exploration factor (higher = better recall, slower)
     /// @param filter Optional filter function: returns true if node should be included
     /// @return Vector of (id, distance) pairs, sorted by distance
-    using FilterFn = std::function<bool(size_t node_id)>;
     std::vector<std::pair<size_t, float>> search_with_filter(std::span<const float> query, size_t k,
                                                              size_t ef_search,
                                                              const FilterFn& filter) const {
-        if (nodes_.empty())
-            return {};
+        return search_with_filter_impl<false>(query, k, ef_search, filter);
+    }
 
-        // Normalize query to match pre-normalized vectors
-        std::vector<float> norm_query;
-        std::span<const float> effective_query = query;
-        if (config_.normalize_vectors) {
-            norm_query = normalize_vector(query);
-            effective_query = std::span<const float>(norm_query);
-        }
+    /// Search optimized for read-mostly workloads.
+    /// Uses direct neighbor references under the index read lock to avoid per-hop
+    /// neighbor vector copies. Do not use concurrently with unlocked bulk-build or
+    /// single-threaded insert APIs that mutate graph edges without taking nodes_mutex_.
+    std::vector<std::pair<size_t, float>> search_read_mostly(std::span<const float> query, size_t k,
+                                                             size_t ef_search = 50) const {
+        return search_read_mostly_with_filter(query, k, ef_search, nullptr);
+    }
 
-        ef_search = std::max(ef_search, k);
-
-        // Acquire shared lock for read-only operations
-        std::shared_lock lock(nodes_mutex_);
-        std::shared_lock deleted_lock(deleted_mutex_);
-
-        const FilterFn* filter_ptr = filter ? &filter : nullptr;
-
-        // Phase 1: Navigate from top layer to layer 1
-        size_t current = entry_point_id_.load(std::memory_order_acquire);
-        for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > 0; --lc) {
-            current = greedy_search_layer_locked(effective_query, current, lc, filter_ptr);
-        }
-
-        // Phase 2: Beam search at layer 0
-        auto candidates =
-            beam_search_layer_locked(effective_query, current, ef_search, 0, filter_ptr);
-
-        // Phase 3: Return top-k
-        if (candidates.size() > k) {
-            candidates.resize(k);
-        }
-
-        return candidates;
+    /// Read-mostly search with pre-filtering.
+    std::vector<std::pair<size_t, float>>
+    search_read_mostly_with_filter(std::span<const float> query, size_t k, size_t ef_search,
+                                   const FilterFn& filter) const {
+        return search_with_filter_impl<true>(query, k, ef_search, filter);
     }
 
     /// Batch search for multiple queries in parallel
@@ -1080,6 +1064,52 @@ private:
     // These access node edges directly (no mutex, no copy) for maximum throughput.
     // Caller MUST ensure no concurrent access.
 
+    template <bool ReadMostly>
+    decltype(auto) search_neighbors(const NodeType& node, size_t layer) const {
+        if constexpr (ReadMostly) {
+            return node.neighbors_unlocked(layer);
+        } else {
+            return node.neighbors(layer);
+        }
+    }
+
+    template <bool ReadMostly>
+    std::vector<std::pair<size_t, float>> search_with_filter_impl(std::span<const float> query,
+                                                                  size_t k, size_t ef_search,
+                                                                  const FilterFn& filter) const {
+        if (nodes_.empty())
+            return {};
+
+        std::vector<float> norm_query;
+        std::span<const float> effective_query = query;
+        if (config_.normalize_vectors) {
+            norm_query = normalize_vector(query);
+            effective_query = std::span<const float>(norm_query);
+        }
+
+        ef_search = std::max(ef_search, k);
+
+        std::shared_lock lock(nodes_mutex_);
+        std::shared_lock deleted_lock(deleted_mutex_);
+
+        const FilterFn* filter_ptr = filter ? &filter : nullptr;
+
+        size_t current = entry_point_id_.load(std::memory_order_acquire);
+        for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > 0; --lc) {
+            current =
+                greedy_search_layer_shared<ReadMostly>(effective_query, current, lc, filter_ptr);
+        }
+
+        auto candidates = beam_search_layer_shared<ReadMostly>(effective_query, current, ef_search,
+                                                               0, filter_ptr);
+
+        if (candidates.size() > k) {
+            candidates.resize(k);
+        }
+
+        return candidates;
+    }
+
     /// Greedy search without any locking (single-threaded insert path)
     size_t greedy_search_layer_unlocked(std::span<const float> query, size_t entry_point,
                                         size_t layer) const {
@@ -1562,8 +1592,8 @@ private:
         prune_connections(node_id, layer);
     }
 
-    /// Greedy search (read-only, called under shared lock)
-    size_t greedy_search_layer_locked(std::span<const float> query, size_t entry_point,
+    template <bool ReadMostly>
+    size_t greedy_search_layer_shared(std::span<const float> query, size_t entry_point,
                                       size_t layer, const FilterFn* filter) const {
         // Small negative threshold to handle floating-point error in distance calculation
         const float kDistanceEpsilon =
@@ -1586,7 +1616,7 @@ private:
             if (!current_node)
                 break;
 
-            auto neighbors = current_node->neighbors(layer);
+            const auto& neighbors = search_neighbors<ReadMostly>(*current_node, layer);
 
             // Prefetch first neighbor's vector data
             if (!neighbors.empty()) {
@@ -1618,17 +1648,28 @@ private:
         return (best_active != static_cast<size_t>(-1)) ? best_active : current;
     }
 
+    /// Greedy search (read-only, called under shared lock)
+    size_t greedy_search_layer_locked(std::span<const float> query, size_t entry_point,
+                                      size_t layer, const FilterFn* filter) const {
+        return greedy_search_layer_shared<false>(query, entry_point, layer, filter);
+    }
+
+    /// Greedy search optimized for read-mostly workloads under shared lock.
+    size_t greedy_search_layer_read_mostly(std::span<const float> query, size_t entry_point,
+                                           size_t layer, const FilterFn* filter) const {
+        return greedy_search_layer_shared<true>(query, entry_point, layer, filter);
+    }
+
     /// Greedy search (direct access, for insert phase with write lock held)
     size_t greedy_search_layer(std::span<const float> query, size_t entry_point, size_t layer,
                                const FilterFn* filter) const {
         return greedy_search_layer_locked(query, entry_point, layer, filter);
     }
 
-    /// Beam search (read-only, called under shared lock)
-    std::vector<std::pair<size_t, float>> beam_search_layer_locked(std::span<const float> query,
-                                                                   size_t entry_point, size_t ef,
-                                                                   size_t layer,
-                                                                   const FilterFn* filter) const {
+    template <bool ReadMostly>
+    std::vector<std::pair<size_t, float>>
+    beam_search_layer_shared(std::span<const float> query, size_t entry_point, size_t ef,
+                             size_t layer, const FilterFn* filter) const {
         auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
                             decltype(cmp)>
@@ -1684,7 +1725,7 @@ private:
             }
 
             // Get neighbors and filter out already-visited ones
-            auto neighbors = current_node->neighbors(layer);
+            const auto& neighbors = search_neighbors<ReadMostly>(*current_node, layer);
 
             // Prefetch first unvisited neighbor's vector data before entering loop
             // This hides memory latency for the first distance calculation
@@ -1772,6 +1813,21 @@ private:
                   [](const auto& a, const auto& b) { return a.second < b.second; });
 
         return result;
+    }
+
+    /// Beam search (read-only, called under shared lock)
+    std::vector<std::pair<size_t, float>> beam_search_layer_locked(std::span<const float> query,
+                                                                   size_t entry_point, size_t ef,
+                                                                   size_t layer,
+                                                                   const FilterFn* filter) const {
+        return beam_search_layer_shared<false>(query, entry_point, ef, layer, filter);
+    }
+
+    /// Beam search optimized for read-mostly workloads under shared lock.
+    std::vector<std::pair<size_t, float>>
+    beam_search_layer_read_mostly(std::span<const float> query, size_t entry_point, size_t ef,
+                                  size_t layer, const FilterFn* filter) const {
+        return beam_search_layer_shared<true>(query, entry_point, ef, layer, filter);
     }
 
     /// Beam search (direct access, for insert phase)

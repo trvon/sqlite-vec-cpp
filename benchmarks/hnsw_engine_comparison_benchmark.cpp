@@ -220,25 +220,34 @@ benchmarkYamsHNSW(const BenchConfig& cfg, const std::vector<std::vector<float>>&
 
         // Search at various ef values
         for (size_t ef : {50UL, 100UL, 200UL}) {
-            size_t totalHits = 0;
-            auto searchStart = std::chrono::high_resolution_clock::now();
-            for (size_t q = 0; q < queries.size(); ++q) {
-                auto res = idx.search(std::span<const float>{queries[q]}, cfg.k, ef);
-                for (const auto& [id, _] : res) {
-                    if (gtSets[q].count(id)) {
-                        ++totalHits;
+            auto runSearchVariant = [&](const char* engine_name, bool read_mostly) {
+                size_t totalHits = 0;
+                auto searchStart = std::chrono::high_resolution_clock::now();
+                for (size_t q = 0; q < queries.size(); ++q) {
+                    auto res =
+                        read_mostly
+                            ? idx.search_read_mostly(std::span<const float>{queries[q]}, cfg.k, ef)
+                            : idx.search(std::span<const float>{queries[q]}, cfg.k, ef);
+                    for (const auto& [id, _] : res) {
+                        if (gtSets[q].count(id)) {
+                            ++totalHits;
+                        }
                     }
                 }
-            }
-            auto searchEnd = std::chrono::high_resolution_clock::now();
-            double totalUs =
-                std::chrono::duration<double, std::micro>(searchEnd - searchStart).count();
-            double latencyUs = totalUs / static_cast<double>(queries.size());
-            double qps = 1e6 / latencyUs;
-            double recall = 100.0 * static_cast<double>(totalHits) /
-                            static_cast<double>(queries.size() * cfg.k);
+                auto searchEnd = std::chrono::high_resolution_clock::now();
+                double totalUs =
+                    std::chrono::duration<double, std::micro>(searchEnd - searchStart).count();
+                double latencyUs = totalUs / static_cast<double>(queries.size());
+                double qps = 1e6 / latencyUs;
+                double recall = 100.0 * static_cast<double>(totalHits) /
+                                static_cast<double>(queries.size() * cfg.k);
 
-            results.push_back(EngineResult{"yams-hnsw", M, ef, buildMs, latencyUs, qps, recall, 0});
+                results.push_back(
+                    EngineResult{engine_name, M, ef, buildMs, latencyUs, qps, recall, 0});
+            };
+
+            runSearchVariant("yams-hnsw", false);
+            runSearchVariant("yams-hnsw-ro", true);
         }
     }
 
@@ -551,8 +560,8 @@ int main(int argc, char* argv[]) {
     printf("=== YAMS HNSW Summary ===\n");
     for (const auto& r : yamsResults) {
         if (r.efSearch == 100) {
-            printf("  M=%-2d: %.0f QPS, %.1f%% recall@%zu, build=%.0fms\n", r.M, r.qps, r.recall,
-                   cfg.k, r.buildTimeMs);
+            printf("  %-12s M=%-2d: %.0f QPS, %.1f%% recall@%zu, build=%.0fms\n", r.engine, r.M,
+                   r.qps, r.recall, cfg.k, r.buildTimeMs);
         }
     }
     printf("\n");

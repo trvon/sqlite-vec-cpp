@@ -1,7 +1,12 @@
 #include <sqlite3.h>
 #include <cassert>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
 #include <iostream>
+#include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <sqlite-vec-cpp/sqlite/registration.hpp>
 #include <sqlite-vec-cpp/sqlite_vec.hpp>
@@ -335,8 +340,8 @@ using namespace sqlite_vec_cpp::sqlite;
 // RAII wrapper for SQLite database
 class SQLiteDB {
 public:
-    SQLiteDB() {
-        int rc = sqlite3_open(":memory:", &db_);
+    explicit SQLiteDB(const std::string& path = ":memory:") {
+        int rc = sqlite3_open(path.c_str(), &db_);
         if (rc != SQLITE_OK) {
             throw std::runtime_error("Failed to open database");
         }
@@ -400,6 +405,62 @@ public:
 private:
     sqlite3* db_ = nullptr;
 };
+
+struct RowDistance {
+    std::int64_t rowid;
+    double distance;
+};
+
+std::vector<RowDistance> query_row_distances(sqlite3* db, const std::string& sql) {
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        throw std::runtime_error("Failed to prepare query: " + std::string(sqlite3_errmsg(db)));
+    }
+
+    std::vector<RowDistance> rows;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        rows.push_back(RowDistance{sqlite3_column_int64(stmt, 0), sqlite3_column_double(stmt, 1)});
+    }
+
+    if (rc != SQLITE_DONE) {
+        std::string error = sqlite3_errmsg(db);
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("Query failed: " + error);
+    }
+
+    sqlite3_finalize(stmt);
+    return rows;
+}
+
+std::string query_explain_plan(sqlite3* db, const std::string& sql) {
+    sqlite3_stmt* stmt = nullptr;
+    std::string explain_sql = "EXPLAIN QUERY PLAN " + sql;
+    int rc = sqlite3_prepare_v2(db, explain_sql.c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        throw std::runtime_error("Failed to prepare EQP: " + std::string(sqlite3_errmsg(db)));
+    }
+
+    std::string detail;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char* text = sqlite3_column_text(stmt, 3);
+        if (text) {
+            if (!detail.empty()) {
+                detail += "\n";
+            }
+            detail += reinterpret_cast<const char*>(text);
+        }
+    }
+
+    if (rc != SQLITE_DONE) {
+        std::string error = sqlite3_errmsg(db);
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("EQP failed: " + error);
+    }
+
+    sqlite3_finalize(stmt);
+    return detail;
+}
 
 // Default flags for functions that work with vector subtypes
 constexpr int VEC_FUNC_FLAGS =
@@ -1013,6 +1074,342 @@ void test_vec0_dimension_validation() {
     std::cout << "  ✓ vec0 enforces declared dimensions" << std::endl;
 }
 
+void test_vec0_ann_match_query() {
+    std::cout << "Testing vec0 ANN MATCH query..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (1, '[0,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (2, '[1,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (3, '[2,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (4, '[0,2]')");
+
+    const std::string sql = "SELECT rowid, distance FROM t "
+                            "WHERE embedding MATCH vec_f32('[1.2,0]') AND k = 2 "
+                            "ORDER BY distance";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    assert(plan.find("ann") != std::string::npos);
+
+    auto rows = query_row_distances(db.get(), sql);
+    assert(rows.size() == 2);
+    assert(rows[0].rowid == 2);
+    assert(rows[1].rowid == 3);
+    assert(approx_equal(static_cast<float>(rows[0].distance), 0.2f, 0.05f));
+    assert(approx_equal(static_cast<float>(rows[1].distance), 0.8f, 0.05f));
+
+    std::cout << "  ✓ vec0 MATCH ANN query works" << std::endl;
+}
+
+void test_vec0_ann_hidden_query() {
+    std::cout << "Testing vec0 explicit hidden query..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (10, '[0,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (11, '[1,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (12, '[2,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (13, '[0,2]')");
+
+    const std::string sql = "SELECT rowid, distance FROM t "
+                            "WHERE query = vec_f32('[1.2,0]') AND k = 3 AND ef_search = 32 "
+                            "ORDER BY distance";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    assert(plan.find("ann") != std::string::npos);
+
+    auto rows = query_row_distances(db.get(), sql);
+    assert(rows.size() == 3);
+    assert(rows[0].rowid == 11);
+    assert(rows[1].rowid == 12);
+    assert(rows[2].rowid == 10 || rows[2].rowid == 13);
+
+    std::cout << "  ✓ vec0 explicit hidden query works" << std::endl;
+}
+
+void test_vec0_ann_insert_visibility() {
+    std::cout << "Testing vec0 ANN insert visibility..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (1, '[0,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (2, '[2,0]')");
+
+    const std::string sql = "SELECT rowid, distance FROM t "
+                            "WHERE embedding MATCH vec_f32('[1,0]') AND k = 1 "
+                            "ORDER BY distance";
+
+    auto before = query_row_distances(db.get(), sql);
+    assert(before.size() == 1);
+
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (3, '[1,0]')");
+
+    auto after = query_row_distances(db.get(), sql);
+    assert(after.size() == 1);
+    assert(after[0].rowid == 3);
+    assert(approx_equal(static_cast<float>(after[0].distance), 0.0f));
+
+    std::cout << "  ✓ vec0 ANN sees inserted vectors" << std::endl;
+}
+
+void test_vec0_ann_match_respects_rowid_filter() {
+    std::cout << "Testing vec0 ANN MATCH with rowid filter semantics..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (1, '[0.0,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (2, '[0.2,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (3, '[0.4,0]')");
+
+    const std::string sql = "SELECT rowid, distance FROM t "
+                            "WHERE embedding MATCH vec_f32('[0,0]') AND rowid IN (2,3) AND k = 1 "
+                            "ORDER BY distance";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    if (plan.find("ann") == std::string::npos) {
+        throw std::runtime_error("Expected ANN query plan for MATCH rowid-filter test");
+    }
+
+    auto rows = query_row_distances(db.get(), sql);
+    if (rows.size() != 1) {
+        throw std::runtime_error("Expected one filtered MATCH result, got " +
+                                 std::to_string(rows.size()));
+    }
+    if (rows[0].rowid != 2) {
+        throw std::runtime_error("Expected filtered MATCH result rowid=2");
+    }
+    if (!approx_equal(static_cast<float>(rows[0].distance), 0.2f, 0.05f)) {
+        throw std::runtime_error("Expected filtered MATCH distance near 0.2");
+    }
+
+    std::cout << "  ✓ vec0 MATCH ANN respects rowid filter" << std::endl;
+}
+
+void test_vec0_ann_hidden_query_respects_rowid_filter() {
+    std::cout << "Testing vec0 hidden query with rowid filter semantics..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (10, '[0.0,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (11, '[0.2,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (12, '[0.4,0]')");
+
+    const std::string sql = "SELECT rowid, distance FROM t "
+                            "WHERE query = vec_f32('[0,0]') AND rowid IN (11,12) AND k = 1 "
+                            "ORDER BY distance";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    if (plan.find("ann") == std::string::npos) {
+        throw std::runtime_error("Expected ANN query plan for hidden-query rowid-filter test");
+    }
+
+    auto rows = query_row_distances(db.get(), sql);
+    if (rows.size() != 1) {
+        throw std::runtime_error("Expected one filtered hidden-query result, got " +
+                                 std::to_string(rows.size()));
+    }
+    if (rows[0].rowid != 11) {
+        throw std::runtime_error("Expected filtered hidden-query result rowid=11");
+    }
+    if (!approx_equal(static_cast<float>(rows[0].distance), 0.2f, 0.05f)) {
+        throw std::runtime_error("Expected filtered hidden-query distance near 0.2");
+    }
+
+    std::cout << "  ✓ vec0 hidden query respects rowid filter" << std::endl;
+}
+
+void test_vec0_benchmark_combined_loop_overstates_ann_latency() {
+    std::cout << "Testing vec0 benchmark timing sanity..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+    db.exec("CREATE VIRTUAL TABLE vecs USING vec0(embedding float[64])");
+
+    auto make_vector = [](size_t dim, std::mt19937& rng) {
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> vec(dim);
+        for (auto& value : vec) {
+            value = dist(rng);
+        }
+        return vec;
+    };
+
+    std::mt19937 rng(42);
+    std::vector<std::vector<float>> corpus;
+    std::vector<std::vector<float>> queries;
+    corpus.reserve(1500);
+    queries.reserve(24);
+
+    for (size_t i = 0; i < 1500; ++i) {
+        corpus.push_back(make_vector(64, rng));
+    }
+    for (size_t i = 0; i < 24; ++i) {
+        queries.push_back(make_vector(64, rng));
+    }
+
+    sqlite3_stmt* insert_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db.get(), "INSERT INTO vecs(rowid, embedding) VALUES (?, ?)", -1,
+                                &insert_stmt, nullptr);
+    assert(rc == SQLITE_OK && insert_stmt);
+    for (size_t i = 0; i < corpus.size(); ++i) {
+        sqlite3_bind_int64(insert_stmt, 1, static_cast<sqlite3_int64>(i + 1));
+        sqlite3_bind_blob(insert_stmt, 2, corpus[i].data(),
+                          static_cast<int>(corpus[i].size() * sizeof(float)), SQLITE_TRANSIENT);
+        rc = sqlite3_step(insert_stmt);
+        assert(rc == SQLITE_DONE);
+        sqlite3_reset(insert_stmt);
+        sqlite3_clear_bindings(insert_stmt);
+    }
+    sqlite3_finalize(insert_stmt);
+
+    sqlite3_stmt* ann_stmt = nullptr;
+    sqlite3_stmt* exact_stmt = nullptr;
+    rc = sqlite3_prepare_v2(db.get(),
+                            "SELECT rowid FROM vecs WHERE embedding MATCH ?1 AND k = ?2 "
+                            "ORDER BY distance",
+                            -1, &ann_stmt, nullptr);
+    assert(rc == SQLITE_OK && ann_stmt);
+    rc = sqlite3_prepare_v2(
+        db.get(), "SELECT rowid FROM vecs ORDER BY vec_distance_l2(embedding, ?1) LIMIT ?2", -1,
+        &exact_stmt, nullptr);
+    assert(rc == SQLITE_OK && exact_stmt);
+
+    auto collect_ids = [](sqlite3_stmt* stmt) {
+        std::vector<std::int64_t> ids;
+        int step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            ids.push_back(sqlite3_column_int64(stmt, 0));
+        }
+        assert(step_rc == SQLITE_DONE);
+        return ids;
+    };
+
+    sqlite3_bind_blob(ann_stmt, 1, queries[0].data(),
+                      static_cast<int>(queries[0].size() * sizeof(float)), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ann_stmt, 2, 10);
+    (void)collect_ids(ann_stmt);
+    sqlite3_reset(ann_stmt);
+    sqlite3_clear_bindings(ann_stmt);
+
+    auto measure_us = [](auto&& fn) {
+        auto start = std::chrono::steady_clock::now();
+        fn();
+        auto end = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::micro>(end - start).count();
+    };
+
+    double ann_only_us = measure_us([&]() {
+        for (const auto& query : queries) {
+            sqlite3_bind_blob(ann_stmt, 1, query.data(),
+                              static_cast<int>(query.size() * sizeof(float)), SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ann_stmt, 2, 10);
+            (void)collect_ids(ann_stmt);
+            sqlite3_reset(ann_stmt);
+            sqlite3_clear_bindings(ann_stmt);
+        }
+    });
+
+    double exact_only_us = measure_us([&]() {
+        for (const auto& query : queries) {
+            sqlite3_bind_blob(exact_stmt, 1, query.data(),
+                              static_cast<int>(query.size() * sizeof(float)), SQLITE_TRANSIENT);
+            sqlite3_bind_int64(exact_stmt, 2, 10);
+            (void)collect_ids(exact_stmt);
+            sqlite3_reset(exact_stmt);
+            sqlite3_clear_bindings(exact_stmt);
+        }
+    });
+
+    double combined_us = measure_us([&]() {
+        size_t hits = 0;
+        for (const auto& query : queries) {
+            sqlite3_bind_blob(ann_stmt, 1, query.data(),
+                              static_cast<int>(query.size() * sizeof(float)), SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ann_stmt, 2, 10);
+            auto ann_ids = collect_ids(ann_stmt);
+            sqlite3_reset(ann_stmt);
+            sqlite3_clear_bindings(ann_stmt);
+
+            sqlite3_bind_blob(exact_stmt, 1, query.data(),
+                              static_cast<int>(query.size() * sizeof(float)), SQLITE_TRANSIENT);
+            sqlite3_bind_int64(exact_stmt, 2, 10);
+            auto exact_ids = collect_ids(exact_stmt);
+            sqlite3_reset(exact_stmt);
+            sqlite3_clear_bindings(exact_stmt);
+
+            std::unordered_set<std::int64_t> exact_set(exact_ids.begin(), exact_ids.end());
+            for (std::int64_t id : ann_ids) {
+                hits += exact_set.contains(id) ? 1 : 0;
+            }
+        }
+        if (hits == 0) {
+            throw std::runtime_error("Expected overlap between ANN and exact result sets");
+        }
+    });
+
+    sqlite3_finalize(ann_stmt);
+    sqlite3_finalize(exact_stmt);
+
+    if (ann_only_us <= 0.0 || exact_only_us <= 0.0) {
+        throw std::runtime_error("Expected positive benchmark timings");
+    }
+    if (combined_us <= ann_only_us) {
+        throw std::runtime_error("Combined ANN+exact loop should exceed ANN-only latency");
+    }
+    if (combined_us <= ann_only_us + (0.25 * exact_only_us)) {
+        throw std::runtime_error("Combined loop did not materially exceed ANN-only latency");
+    }
+
+    std::cout << "  ✓ Combined ANN+exact loop materially overstates ANN-only latency" << std::endl;
+}
+
+void test_vec0_ann_reopen_rebuild() {
+    std::cout << "Testing vec0 ANN rebuild after reopen..." << std::endl;
+
+    namespace fs = std::filesystem;
+    const fs::path db_path = fs::temp_directory_path() / "sqlite_vec_cpp_vec0_ann_reopen.db";
+    std::error_code ec;
+    fs::remove(db_path, ec);
+
+    {
+        SQLiteDB db(db_path.string());
+        sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+        db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+        db.exec("INSERT INTO t(rowid, embedding) VALUES (1, '[0,0]')");
+        db.exec("INSERT INTO t(rowid, embedding) VALUES (2, '[1,0]')");
+        db.exec("INSERT INTO t(rowid, embedding) VALUES (3, '[2,0]')");
+    }
+
+    {
+        SQLiteDB db(db_path.string());
+        sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+        const std::string sql = "SELECT rowid, distance FROM t "
+                                "WHERE embedding MATCH vec_f32('[1.1,0]') AND k = 2 "
+                                "ORDER BY distance";
+
+        auto rows = query_row_distances(db.get(), sql);
+        assert(rows.size() == 2);
+        assert(rows[0].rowid == 2);
+        assert(rows[1].rowid == 3);
+    }
+
+    fs::remove(db_path, ec);
+
+    std::cout << "  ✓ vec0 ANN rebuilds after reopen" << std::endl;
+}
+
 void test_integration_similarity_search() {
     std::cout << "Testing integration: similarity search..." << std::endl;
 
@@ -1145,6 +1542,15 @@ int main() {
     run_test("vec0_update_delete_paths", test_vec0_update_delete_paths);
     run_test("vec0_explicit_rowid_insert", test_vec0_explicit_rowid_insert);
     run_test("vec0_dimension_validation", test_vec0_dimension_validation);
+    run_test("vec0_ann_match_query", test_vec0_ann_match_query);
+    run_test("vec0_ann_hidden_query", test_vec0_ann_hidden_query);
+    run_test("vec0_ann_insert_visibility", test_vec0_ann_insert_visibility);
+    run_test("vec0_ann_match_respects_rowid_filter", test_vec0_ann_match_respects_rowid_filter);
+    run_test("vec0_ann_hidden_query_respects_rowid_filter",
+             test_vec0_ann_hidden_query_respects_rowid_filter);
+    run_test("vec0_benchmark_combined_loop_overstates_ann_latency",
+             test_vec0_benchmark_combined_loop_overstates_ann_latency);
+    run_test("vec0_ann_reopen_rebuild", test_vec0_ann_reopen_rebuild);
 
     std::cout << "\nTesting Distance Subtypes (Bit/Int8):\n";
     run_test("distance_int8_l1_l2_cosine", test_distance_int8_l1_l2_cosine);

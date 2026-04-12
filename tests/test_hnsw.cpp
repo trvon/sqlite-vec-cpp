@@ -26,6 +26,16 @@ bool approx_equal(float a, float b, float epsilon = 0.001f) {
     return std::abs(a - b) < epsilon;
 }
 
+void assert_results_match(const std::vector<std::pair<size_t, float>>& lhs,
+                          const std::vector<std::pair<size_t, float>>& rhs,
+                          float epsilon = 0.001f) {
+    assert(lhs.size() == rhs.size());
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        assert(lhs[i].first == rhs[i].first);
+        assert(approx_equal(lhs[i].second, rhs[i].second, epsilon));
+    }
+}
+
 // Generate random vector
 std::vector<float> generate_vector(size_t dim, std::mt19937& rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -387,15 +397,13 @@ void test_persistence_roundtrip() {
     // Verify search results match
     auto query = generate_vector(dim, rng);
     auto original_results = original_index.search(std::span{query}, k, 100);
+    auto original_read_mostly = original_index.search_read_mostly(std::span{query}, k, 100);
     auto loaded_results = loaded_index.search(std::span{query}, k, 100);
+    auto loaded_read_mostly = loaded_index.search_read_mostly(std::span{query}, k, 100);
 
-    assert(original_results.size() == loaded_results.size());
-
-    // Results should be identical (same IDs, same distances)
-    for (size_t i = 0; i < original_results.size(); ++i) {
-        assert(original_results[i].first == loaded_results[i].first);
-        assert(approx_equal(original_results[i].second, loaded_results[i].second));
-    }
+    assert_results_match(original_results, loaded_results);
+    assert_results_match(original_results, original_read_mostly);
+    assert_results_match(loaded_results, loaded_read_mostly);
 
     std::cout << "  ✓ Save/load round-trip passed" << std::endl;
     std::cout << "    - Saved and loaded " << num_vectors << " vectors" << std::endl;
@@ -873,6 +881,97 @@ void test_config_for_corpus() {
     std::cout << "  ✓ Config factory passed" << std::endl;
 }
 
+// Test 21b: Read-mostly search matches safe search
+void test_read_mostly_search_parity() {
+    std::cout << "Test 21b: Read-mostly search parity..." << std::endl;
+
+    constexpr size_t num_vectors = 512;
+    constexpr size_t dim = 64;
+    constexpr size_t k = 12;
+
+    std::mt19937 rng(42);
+    HNSWIndex<float, L2Metric<float>> index;
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        auto vec = generate_vector(dim, rng);
+        index.insert(i, std::span{vec});
+    }
+
+    for (size_t q = 0; q < 10; ++q) {
+        auto query = generate_vector(dim, rng);
+        auto safe = index.search(std::span{query}, k, 80);
+        auto read_mostly = index.search_read_mostly(std::span{query}, k, 80);
+        assert_results_match(safe, read_mostly);
+    }
+
+    std::cout << "  ✓ Read-mostly search parity passed" << std::endl;
+}
+
+// Test 21c: Read-mostly filtered search matches safe search
+void test_read_mostly_filter_parity() {
+    std::cout << "Test 21c: Read-mostly filter parity..." << std::endl;
+
+    constexpr size_t num_vectors = 256;
+    constexpr size_t dim = 48;
+    constexpr size_t k = 8;
+
+    std::mt19937 rng(123);
+    HNSWIndex<float, L2Metric<float>> index;
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        auto vec = generate_vector(dim, rng);
+        index.insert(i, std::span{vec});
+    }
+
+    HNSWIndex<float, L2Metric<float>>::FilterFn filter = [](size_t node_id) {
+        return (node_id % 4) != 0;
+    };
+
+    for (size_t q = 0; q < 8; ++q) {
+        auto query = generate_vector(dim, rng);
+        auto safe = index.search_with_filter(std::span{query}, k, 60, filter);
+        auto read_mostly = index.search_read_mostly_with_filter(std::span{query}, k, 60, filter);
+        assert_results_match(safe, read_mostly);
+    }
+
+    std::cout << "  ✓ Read-mostly filter parity passed" << std::endl;
+}
+
+// Test 21d: Read-mostly deleted-node search matches safe search
+void test_read_mostly_deleted_parity() {
+    std::cout << "Test 21d: Read-mostly deleted-node parity..." << std::endl;
+
+    constexpr size_t num_vectors = 256;
+    constexpr size_t dim = 32;
+    constexpr size_t k = 10;
+
+    std::mt19937 rng(999);
+    HNSWIndex<float, L2Metric<float>> index;
+
+    for (size_t i = 0; i < num_vectors; ++i) {
+        auto vec = generate_vector(dim, rng);
+        index.insert(i, std::span{vec});
+    }
+
+    for (size_t i = 0; i < num_vectors; i += 7) {
+        index.remove(i);
+    }
+    index.isolate_deleted();
+
+    for (size_t q = 0; q < 8; ++q) {
+        auto query = generate_vector(dim, rng);
+        auto safe = index.search(std::span{query}, k, 60);
+        auto read_mostly = index.search_read_mostly(std::span{query}, k, 60);
+        assert_results_match(safe, read_mostly);
+        for (const auto& [id, dist] : read_mostly) {
+            (void)dist;
+            assert(!index.is_deleted(id));
+        }
+    }
+
+    std::cout << "  ✓ Read-mostly deleted-node parity passed" << std::endl;
+}
+
 // ============================================================================
 // Normalization regression tests
 // ============================================================================
@@ -1233,6 +1332,9 @@ int main() {
     test_graph_stats();
     test_adaptive_search();
     test_config_for_corpus();
+    test_read_mostly_search_parity();
+    test_read_mostly_filter_parity();
+    test_read_mostly_deleted_parity();
 
     // Normalization regression tests
     test_normalized_build_correctness();

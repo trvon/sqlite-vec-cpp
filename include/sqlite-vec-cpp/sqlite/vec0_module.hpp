@@ -1,12 +1,19 @@
 #pragma once
 
 #include <sqlite3.h>
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
+#include "../distances/l2.hpp"
+#include "../index/hnsw.hpp"
 #include "../utils/error.hpp"
 #include "parsers.hpp"
 #include "value.hpp"
@@ -18,6 +25,26 @@ namespace sqlite_vec_cpp::sqlite {
 // Provides full CREATE VIRTUAL TABLE ... USING vec0(...) support
 // Compatible with original sqlite-vec C implementation
 
+using Vec0AnnIndex = index::HNSWIndex<float, distances::L2Metric<float>>;
+
+constexpr int kVec0ColRowid = 0;
+constexpr int kVec0ColEmbedding = 1;
+constexpr int kVec0ColDistance = 2;
+constexpr int kVec0ColK = 3;
+constexpr int kVec0ColEfSearch = 4;
+constexpr int kVec0ColQuery = 5;
+
+constexpr int kVec0PlanFullScan = 0;
+constexpr int kVec0PlanAnnMatch = 1 << 0;
+constexpr int kVec0PlanAnnHiddenQuery = 1 << 1;
+constexpr int kVec0PlanHasK = 1 << 2;
+constexpr int kVec0PlanHasEfSearch = 1 << 3;
+constexpr int kVec0PlanHasRowidEq = 1 << 4;
+constexpr int kVec0PlanHasRowidIn = 1 << 5;
+
+constexpr size_t kVec0DefaultK = 10;
+constexpr size_t kVec0DefaultEfSearch = 64;
+
 struct Vec0Table {
     sqlite3_vtab base{};
     sqlite3* db = nullptr;
@@ -26,6 +53,9 @@ struct Vec0Table {
     std::string embedding_column;
     size_t dimensions = 384;
     bool use_shadow_tables = true;
+    std::shared_ptr<Vec0AnnIndex> ann_index;
+    bool ann_ready = false;
+    mutable std::mutex ann_mutex;
 
     Vec0Table() = default;
 };
@@ -36,6 +66,11 @@ struct Vec0Cursor {
     sqlite3_stmt* stmt = nullptr; // For shadow table queries
     int64_t current_rowid = 0;
     bool eof = true;
+    bool ann_mode = false;
+    float current_distance = 0.0f;
+    size_t ann_pos = 0;
+    std::vector<std::pair<int64_t, float>> ann_results;
+    std::shared_ptr<Vec0AnnIndex> ann_index;
 
     Vec0Cursor() = default;
 
@@ -47,10 +82,191 @@ struct Vec0Cursor {
     }
 };
 
+struct Vec0RowidFilter {
+    bool active = false;
+    std::unordered_set<int64_t> allowed_rowids;
+
+    [[nodiscard]] bool matches(int64_t rowid) const {
+        return !active || allowed_rowids.contains(rowid);
+    }
+};
+
 inline int vec0_set_error(Vec0Table* table, const std::string& message,
                           int rc = SQLITE_CONSTRAINT) {
     VTab(&table->base).set_error(message);
     return rc;
+}
+
+inline std::string vec0_vectors_table_name(const Vec0Table& table) {
+    std::ostringstream sql;
+    sql << "\"" << table.schema_name << "\".\"" << table.table_name << "_vectors\"";
+    return sql.str();
+}
+
+inline void vec0_invalidate_ann_index(Vec0Table* table) {
+    std::lock_guard<std::mutex> lock(table->ann_mutex);
+    table->ann_index.reset();
+    table->ann_ready = false;
+}
+
+inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* table) {
+    std::lock_guard<std::mutex> lock(table->ann_mutex);
+    if (table->ann_ready && table->ann_index) {
+        return Result<std::shared_ptr<Vec0AnnIndex>>(table->ann_index);
+    }
+
+    const std::string vectors_table = vec0_vectors_table_name(*table);
+
+    sqlite3_stmt* count_stmt = nullptr;
+    std::string count_sql = "SELECT COUNT(*) FROM " + vectors_table;
+    int rc = sqlite3_prepare_v2(table->db, count_sql.c_str(), -1, &count_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        return err<std::shared_ptr<Vec0AnnIndex>>(
+            Error::sqlite_error("Failed to count vec0 rows", rc));
+    }
+
+    size_t row_count = 0;
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) {
+        row_count = static_cast<size_t>(sqlite3_column_int64(count_stmt, 0));
+    }
+    sqlite3_finalize(count_stmt);
+
+    auto cfg = Vec0AnnIndex::Config::for_corpus(std::max<size_t>(row_count, 1), table->dimensions);
+    cfg.normalize_vectors = false;
+
+    auto ann_index = std::make_shared<Vec0AnnIndex>(cfg);
+    ann_index->reserve(row_count);
+
+    sqlite3_stmt* scan_stmt = nullptr;
+    std::string scan_sql = "SELECT rowid, \"" + table->embedding_column + "\" FROM " +
+                           vectors_table + " ORDER BY rowid";
+    rc = sqlite3_prepare_v2(table->db, scan_sql.c_str(), -1, &scan_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        return err<std::shared_ptr<Vec0AnnIndex>>(
+            Error::sqlite_error("Failed to scan vec0 vectors", rc));
+    }
+
+    while ((rc = sqlite3_step(scan_stmt)) == SQLITE_ROW) {
+        std::int64_t rowid = sqlite3_column_int64(scan_stmt, 0);
+        const void* blob = sqlite3_column_blob(scan_stmt, 1);
+        int bytes = sqlite3_column_bytes(scan_stmt, 1);
+
+        if (!blob || bytes <= 0) {
+            continue;
+        }
+
+        const int expected_bytes = static_cast<int>(table->dimensions * sizeof(float));
+        if (bytes != expected_bytes) {
+            sqlite3_finalize(scan_stmt);
+            return err<std::shared_ptr<Vec0AnnIndex>>(Error::invalid_argument(
+                "vec0 stored vector size mismatch for rowid " + std::to_string(rowid)));
+        }
+
+        std::vector<float> vec(table->dimensions);
+        std::memcpy(vec.data(), blob, static_cast<size_t>(bytes));
+        ann_index->insert_single_threaded(static_cast<size_t>(rowid), std::span<const float>(vec));
+    }
+
+    if (rc != SQLITE_DONE) {
+        sqlite3_finalize(scan_stmt);
+        return err<std::shared_ptr<Vec0AnnIndex>>(
+            Error::sqlite_error("Failed while rebuilding vec0 ANN index", rc));
+    }
+
+    sqlite3_finalize(scan_stmt);
+    table->ann_index = ann_index;
+    table->ann_ready = true;
+    return Result<std::shared_ptr<Vec0AnnIndex>>(ann_index);
+}
+
+inline Result<std::vector<std::pair<int64_t, float>>>
+vec0_run_ann_query(Vec0Table* table, const Value& query_value, size_t k, size_t ef_search,
+                   const Vec0RowidFilter& rowid_filter) {
+    auto parsed_query = parse_vector_from_value<float>(query_value);
+    if (!parsed_query) {
+        return err<std::vector<std::pair<int64_t, float>>>(parsed_query.error());
+    }
+    if (parsed_query->size() != table->dimensions) {
+        return err<std::vector<std::pair<int64_t, float>>>(Error::invalid_argument(
+            "vec0 query dimension mismatch: expected " + std::to_string(table->dimensions) +
+            ", got " + std::to_string(parsed_query->size())));
+    }
+
+    auto ann_index = vec0_ensure_ann_index(table);
+    if (!ann_index) {
+        return err<std::vector<std::pair<int64_t, float>>>(ann_index.error());
+    }
+
+    std::vector<std::pair<int64_t, float>> results;
+
+    if (rowid_filter.active) {
+        results.reserve(rowid_filter.allowed_rowids.size());
+        for (int64_t rowid : rowid_filter.allowed_rowids) {
+            const auto* node = ann_index.value()->get_node(static_cast<size_t>(rowid));
+            if (!node || node->vector.empty()) {
+                continue;
+            }
+
+            float dist = distances::l2_distance(std::span<const float>(*parsed_query),
+                                                std::span<const float>(node->vector));
+            results.emplace_back(rowid, dist);
+        }
+
+        std::sort(results.begin(), results.end(),
+                  [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+        if (results.size() > k) {
+            results.resize(k);
+        }
+    } else {
+        auto raw_results = ann_index.value()->search_read_mostly(
+            std::span<const float>(*parsed_query), k, ef_search);
+        results.reserve(raw_results.size());
+        for (const auto& [id, dist] : raw_results) {
+            results.emplace_back(static_cast<int64_t>(id), dist);
+        }
+    }
+
+    return Result<std::vector<std::pair<int64_t, float>>>(std::move(results));
+}
+
+inline Result<Vec0RowidFilter> vec0_extract_rowid_filter(int idxNum, int argc, sqlite3_value** argv,
+                                                         int& arg_idx) {
+    Vec0RowidFilter filter;
+
+    if ((idxNum & kVec0PlanHasRowidEq) != 0) {
+        if (arg_idx >= argc) {
+            return err<Vec0RowidFilter>(
+                Error::invalid_argument("vec0 ANN query missing rowid equality argument"));
+        }
+        filter.active = true;
+        filter.allowed_rowids.insert(sqlite3_value_int64(argv[arg_idx++]));
+    }
+
+    if ((idxNum & kVec0PlanHasRowidIn) != 0) {
+        if (arg_idx >= argc) {
+            return err<Vec0RowidFilter>(
+                Error::invalid_argument("vec0 ANN query missing rowid IN argument"));
+        }
+
+        filter.active = true;
+        sqlite3_value* list_value = argv[arg_idx++];
+        sqlite3_value* item_value = nullptr;
+        int rc = sqlite3_vtab_in_first(list_value, &item_value);
+        if (rc != SQLITE_OK && rc != SQLITE_DONE) {
+            return err<Vec0RowidFilter>(
+                Error::sqlite_error("Failed to iterate vec0 rowid IN values", rc));
+        }
+        while (rc == SQLITE_OK && item_value) {
+            filter.allowed_rowids.insert(sqlite3_value_int64(item_value));
+            rc = sqlite3_vtab_in_next(list_value, &item_value);
+        }
+        if (rc != SQLITE_DONE) {
+            return err<Vec0RowidFilter>(
+                Error::sqlite_error("Failed to advance vec0 rowid IN values", rc));
+        }
+    }
+
+    return Result<Vec0RowidFilter>(std::move(filter));
 }
 
 // Helper: Parse CREATE VIRTUAL TABLE statement for embedding column and dimensions
@@ -165,7 +381,11 @@ inline int vec0Create(sqlite3* db, void* pAux, int argc, const char* const* argv
     // Declare virtual table schema
     std::ostringstream schema;
     schema << "CREATE TABLE x(rowid INTEGER PRIMARY KEY, "
-           << "\"" << embedding_col << "\")";
+           << "\"" << embedding_col << "\", "
+           << "distance HIDDEN, "
+           << "k HIDDEN, "
+           << "ef_search HIDDEN, "
+           << "query HIDDEN)";
 
     rc = sqlite3_declare_vtab(db, schema.str().c_str());
     if (rc != SQLITE_OK) {
@@ -215,10 +435,96 @@ inline int vec0Destroy(sqlite3_vtab* pVTab) {
 inline int vec0BestIndex(sqlite3_vtab* pVTab, sqlite3_index_info* pInfo) {
     (void)pVTab;
 
-    // Simple implementation: full table scan
-    pInfo->estimatedCost = 1000000.0;
-    pInfo->estimatedRows = 1000000;
-    pInfo->idxNum = 0;
+    int match_constraint = -1;
+    int query_constraint = -1;
+    int k_constraint = -1;
+    int ef_constraint = -1;
+    int rowid_eq_constraint = -1;
+    int rowid_in_constraint = -1;
+
+    for (int i = 0; i < pInfo->nConstraint; ++i) {
+        const auto& constraint = pInfo->aConstraint[i];
+        if (!constraint.usable) {
+            continue;
+        }
+
+        if (constraint.iColumn == kVec0ColEmbedding &&
+            constraint.op == SQLITE_INDEX_CONSTRAINT_MATCH && match_constraint < 0) {
+            match_constraint = i;
+        } else if (constraint.iColumn == kVec0ColQuery &&
+                   constraint.op == SQLITE_INDEX_CONSTRAINT_EQ && query_constraint < 0) {
+            query_constraint = i;
+        } else if (constraint.iColumn == kVec0ColK && constraint.op == SQLITE_INDEX_CONSTRAINT_EQ &&
+                   k_constraint < 0) {
+            k_constraint = i;
+        } else if (constraint.iColumn == kVec0ColEfSearch &&
+                   constraint.op == SQLITE_INDEX_CONSTRAINT_EQ && ef_constraint < 0) {
+            ef_constraint = i;
+        } else if ((constraint.iColumn == kVec0ColRowid || constraint.iColumn < 0) &&
+                   constraint.op == SQLITE_INDEX_CONSTRAINT_EQ) {
+            if (sqlite3_vtab_in(pInfo, i, -1)) {
+                if (rowid_in_constraint < 0 && rowid_eq_constraint < 0) {
+                    rowid_in_constraint = i;
+                }
+            } else if (rowid_eq_constraint < 0 && rowid_in_constraint < 0) {
+                rowid_eq_constraint = i;
+            }
+        }
+    }
+
+    int next_argv = 1;
+    if (match_constraint >= 0) {
+        pInfo->idxNum |= kVec0PlanAnnMatch;
+        pInfo->aConstraintUsage[match_constraint].argvIndex = next_argv++;
+        pInfo->aConstraintUsage[match_constraint].omit = 1;
+        if (query_constraint >= 0) {
+            pInfo->aConstraintUsage[query_constraint].omit = 1;
+        }
+    } else if (query_constraint >= 0) {
+        pInfo->idxNum |= kVec0PlanAnnHiddenQuery;
+        pInfo->aConstraintUsage[query_constraint].argvIndex = next_argv++;
+        pInfo->aConstraintUsage[query_constraint].omit = 1;
+    }
+
+    if ((pInfo->idxNum & (kVec0PlanAnnMatch | kVec0PlanAnnHiddenQuery)) != 0) {
+        if (k_constraint >= 0) {
+            pInfo->idxNum |= kVec0PlanHasK;
+            pInfo->aConstraintUsage[k_constraint].argvIndex = next_argv++;
+            pInfo->aConstraintUsage[k_constraint].omit = 1;
+        }
+        if (ef_constraint >= 0) {
+            pInfo->idxNum |= kVec0PlanHasEfSearch;
+            pInfo->aConstraintUsage[ef_constraint].argvIndex = next_argv++;
+            pInfo->aConstraintUsage[ef_constraint].omit = 1;
+        }
+        if (rowid_eq_constraint >= 0) {
+            pInfo->idxNum |= kVec0PlanHasRowidEq;
+            pInfo->aConstraintUsage[rowid_eq_constraint].argvIndex = next_argv++;
+            pInfo->aConstraintUsage[rowid_eq_constraint].omit = 1;
+        }
+        if (rowid_in_constraint >= 0) {
+            sqlite3_vtab_in(pInfo, rowid_in_constraint, 1);
+            pInfo->idxNum |= kVec0PlanHasRowidIn;
+            pInfo->aConstraintUsage[rowid_in_constraint].argvIndex = next_argv++;
+            pInfo->aConstraintUsage[rowid_in_constraint].omit = 1;
+        }
+
+        bool orders_by_distance =
+            (pInfo->nOrderBy == 1 && pInfo->aOrderBy[0].iColumn == kVec0ColDistance &&
+             !pInfo->aOrderBy[0].desc);
+        pInfo->orderByConsumed = orders_by_distance ? 1 : 0;
+        pInfo->estimatedCost = 1000.0;
+        pInfo->estimatedRows = static_cast<sqlite3_int64>(kVec0DefaultK);
+        const bool is_match = (pInfo->idxNum & kVec0PlanAnnMatch) != 0;
+        pInfo->idxStr = sqlite3_mprintf(is_match ? "ann-match" : "ann-query");
+        pInfo->needToFreeIdxStr = 1;
+    } else {
+        pInfo->estimatedCost = 1000000.0;
+        pInfo->estimatedRows = 1000000;
+        pInfo->idxNum = kVec0PlanFullScan;
+        pInfo->idxStr = sqlite3_mprintf("fullscan");
+        pInfo->needToFreeIdxStr = 1;
+    }
 
     return SQLITE_OK;
 }
@@ -242,18 +548,83 @@ inline int vec0Close(sqlite3_vtab_cursor* pCursor) {
 // xFilter: Begin iteration
 inline int vec0Filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char* idxStr, int argc,
                       sqlite3_value** argv) {
-    (void)idxNum;
     (void)idxStr;
-    (void)argc;
-    (void)argv;
 
     auto* cursor = reinterpret_cast<Vec0Cursor*>(pCursor);
     auto* table = cursor->table;
+
+    cursor->ann_mode = false;
+    cursor->ann_results.clear();
+    cursor->ann_index.reset();
+    cursor->ann_pos = 0;
+    cursor->current_distance = 0.0f;
 
     // Prepare query on shadow table
     if (cursor->stmt) {
         sqlite3_finalize(cursor->stmt);
         cursor->stmt = nullptr;
+    }
+
+    if ((idxNum & (kVec0PlanAnnMatch | kVec0PlanAnnHiddenQuery)) != 0) {
+        if (argc < 1) {
+            cursor->eof = true;
+            return vec0_set_error(table, "vec0 ANN query missing vector argument", SQLITE_MISUSE);
+        }
+
+        int arg_idx = 0;
+        Value query_value(argv[arg_idx++]);
+        size_t k = kVec0DefaultK;
+        size_t ef_search = kVec0DefaultEfSearch;
+
+        if ((idxNum & kVec0PlanHasK) != 0) {
+            if (arg_idx >= argc) {
+                cursor->eof = true;
+                return vec0_set_error(table, "vec0 ANN query missing k argument", SQLITE_MISUSE);
+            }
+            k = std::max<int64_t>(1, sqlite3_value_int64(argv[arg_idx++]));
+        }
+
+        if ((idxNum & kVec0PlanHasEfSearch) != 0) {
+            if (arg_idx >= argc) {
+                cursor->eof = true;
+                return vec0_set_error(table, "vec0 ANN query missing ef_search argument",
+                                      SQLITE_MISUSE);
+            }
+            ef_search =
+                std::max<int64_t>(static_cast<int64_t>(k), sqlite3_value_int64(argv[arg_idx++]));
+        } else {
+            ef_search = std::max(ef_search, k);
+        }
+
+        auto rowid_filter = vec0_extract_rowid_filter(idxNum, argc, argv, arg_idx);
+        if (!rowid_filter) {
+            cursor->eof = true;
+            return vec0_set_error(table, rowid_filter.error().message, SQLITE_ERROR);
+        }
+
+        auto ann_results =
+            vec0_run_ann_query(table, query_value, k, ef_search, rowid_filter.value());
+        if (!ann_results) {
+            cursor->eof = true;
+            return vec0_set_error(table, ann_results.error().message, SQLITE_ERROR);
+        }
+
+        auto ann_index = vec0_ensure_ann_index(table);
+        if (!ann_index) {
+            cursor->eof = true;
+            return vec0_set_error(table, ann_index.error().message, SQLITE_ERROR);
+        }
+
+        cursor->ann_mode = true;
+        cursor->ann_results = std::move(ann_results.value());
+        cursor->ann_index = ann_index.value();
+        cursor->eof = cursor->ann_results.empty();
+        if (!cursor->eof) {
+            cursor->current_rowid = cursor->ann_results[0].first;
+            cursor->current_distance = cursor->ann_results[0].second;
+        }
+
+        return SQLITE_OK;
     }
 
     std::ostringstream sql;
@@ -282,6 +653,21 @@ inline int vec0Filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char* idxS
 inline int vec0Next(sqlite3_vtab_cursor* pCursor) {
     auto* cursor = reinterpret_cast<Vec0Cursor*>(pCursor);
 
+    if (cursor->ann_mode) {
+        if (cursor->eof) {
+            return SQLITE_OK;
+        }
+
+        ++cursor->ann_pos;
+        if (cursor->ann_pos >= cursor->ann_results.size()) {
+            cursor->eof = true;
+        } else {
+            cursor->current_rowid = cursor->ann_results[cursor->ann_pos].first;
+            cursor->current_distance = cursor->ann_results[cursor->ann_pos].second;
+        }
+        return SQLITE_OK;
+    }
+
     if (!cursor->stmt || cursor->eof) {
         return SQLITE_OK;
     }
@@ -307,15 +693,54 @@ inline int vec0Eof(sqlite3_vtab_cursor* pCursor) {
 inline int vec0Column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int col) {
     auto* cursor = reinterpret_cast<Vec0Cursor*>(pCursor);
 
+    if (cursor->ann_mode) {
+        if (cursor->eof) {
+            sqlite3_result_null(ctx);
+            return SQLITE_OK;
+        }
+
+        if (col == kVec0ColRowid) {
+            sqlite3_result_int64(ctx, cursor->current_rowid);
+            return SQLITE_OK;
+        }
+
+        if (col == kVec0ColEmbedding) {
+            if (!cursor->ann_index) {
+                sqlite3_result_null(ctx);
+                return SQLITE_OK;
+            }
+
+            const auto* node =
+                cursor->ann_index->get_node(static_cast<size_t>(cursor->current_rowid));
+            if (!node || node->vector.empty()) {
+                sqlite3_result_null(ctx);
+                return SQLITE_OK;
+            }
+
+            sqlite3_result_blob(ctx, node->vector.data(),
+                                static_cast<int>(node->vector.size() * sizeof(float)),
+                                SQLITE_TRANSIENT);
+            return SQLITE_OK;
+        }
+
+        if (col == kVec0ColDistance) {
+            sqlite3_result_double(ctx, cursor->current_distance);
+            return SQLITE_OK;
+        }
+
+        sqlite3_result_null(ctx);
+        return SQLITE_OK;
+    }
+
     if (!cursor->stmt || cursor->eof) {
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
 
-    if (col == 0) {
+    if (col == kVec0ColRowid) {
         // rowid column
         sqlite3_result_int64(ctx, cursor->current_rowid);
-    } else if (col == 1) {
+    } else if (col == kVec0ColEmbedding) {
         // embedding column
         const void* blob = sqlite3_column_blob(cursor->stmt, 1);
         int bytes = sqlite3_column_bytes(cursor->stmt, 1);
@@ -324,6 +749,8 @@ inline int vec0Column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int co
         } else {
             sqlite3_result_null(ctx);
         }
+    } else if (col == kVec0ColDistance) {
+        sqlite3_result_null(ctx);
     } else {
         sqlite3_result_null(ctx);
     }
@@ -356,7 +783,11 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
         sqlite3_bind_int64(stmt, 1, sqlite3_value_int64(argv[0]));
         rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
-        return rc == SQLITE_DONE ? SQLITE_OK : rc;
+        if (rc == SQLITE_DONE) {
+            vec0_invalidate_ann_index(table);
+            return SQLITE_OK;
+        }
+        return rc;
     }
 
     // INSERT: argc>1, argv[0]=NULL, argv[1]=new_rowid or NULL
@@ -452,6 +883,9 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
             }
 
             sqlite3_finalize(stmt);
+            if (rc == SQLITE_OK) {
+                vec0_invalidate_ann_index(table);
+            }
             return rc;
         } else {
             std::ostringstream sql;
@@ -481,6 +915,9 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
             }
 
             sqlite3_finalize(stmt);
+            if (rc == SQLITE_OK) {
+                vec0_invalidate_ann_index(table);
+            }
             return rc;
         }
     }

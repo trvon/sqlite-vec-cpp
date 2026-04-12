@@ -99,3 +99,14 @@ hnsw_engine_comparison_benchmark_exe = executable(
   install: false
 )
 message('  ./hnsw_engine_comparison_benchmark (YAMS HNSW baseline + optional zvec)')
+
+vec0_ann_benchmark_exe = executable(
+  'vec0_ann_benchmark',
+  'vec0_ann_benchmark.cpp',
+  include_directories: include_directories('../include'),
+  sources: ['../src/sqlite_vec_c_api.cpp'],
+  dependencies: [sqlite3_dep],
+  cpp_args: cpp_args_list,
+  install: false
+)
+message('  ./vec0_ann_benchmark (warm vec0 ANN vs exact SQL full scan)')
