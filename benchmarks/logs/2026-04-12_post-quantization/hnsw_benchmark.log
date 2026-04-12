@@ -28,3 +28,6 @@ BM_HNSW_Search/10000/384/50/50            131959 ns       131949 ns         5363
 BM_HNSW_Search/10000/384/100/100          254703 ns       254685 ns         2569 QPS=1.52838/s corpus=10k ef=100 k=100
 BM_HNSW_Search/10000/384/10/50            138798 ns       138682 ns         5232 QPS=1.3782/s corpus=10k ef=50 k=10
 BM_HNSW_Search/10000/768/10/50            268651 ns       268171 ns         2772 QPS=1.34523/s corpus=10k ef=50 k=10
+BM_HNSW_Search/10000/1536/10/50           489237 ns       489178 ns         1434 QPS=1.42556/s corpus=10k ef=50 k=10
+BM_Brute_Force_Search/1000/384/10          22194 ns        22189 ns        31576 QPS=1.42729/s corpus=1k k=10
+BM_Brute_Force_Search/10000/384/10        224623 ns       224579 ns         3102 QPS=1.43545/s corpus=10k k=10
