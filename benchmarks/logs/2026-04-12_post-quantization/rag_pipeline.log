@@ -1,0 +1,25 @@
+Unable to determine clock rate from sysctl: hw.cpufrequency: No such file or directory
+This does not affect benchmark measurements, only the metadata output.
+***WARNING*** Failed to set thread affinity. Estimated CPU frequency may be incorrect.
+2026-04-12T16:50:48-04:00
+Running ./builddir-final/benchmarks/rag_pipeline_benchmark
+Run on (16 X 24 MHz CPU s)
+CPU Caches:
+  L1 Data 64 KiB
+  L1 Instruction 128 KiB
+  L2 Unified 4096 KiB (x16)
+Load Average: 5.07, 6.59, 6.95
+-----------------------------------------------------------------------------------------
+Benchmark                               Time             CPU   Iterations UserCounters...
+-----------------------------------------------------------------------------------------
+BM_RAG_Sequential_1K_384d_K5         26.6 us         26.6 us        28859 items_per_second=37.642M/s
+BM_RAG_Batch_1K_384d_K5              26.5 us         26.5 us        28513 items_per_second=37.7323M/s
+BM_RAG_Batch_10K_384d_K5              241 us          238 us         2203 items_per_second=41.9487M/s
+BM_RAG_Batch_100K_384d_K5            5.72 ms         5.68 ms          208 items_per_second=17.6049M/s
+BM_RAG_Batch_10K_384d_K1              377 us          376 us         2654 items_per_second=26.6114M/s
+BM_RAG_Batch_10K_384d_K10             314 us          313 us         2968 items_per_second=31.9119M/s
+BM_RAG_Batch_10K_384d_K50             241 us          240 us         2183 items_per_second=41.6084M/s
+BM_RAG_Batch_10K_768d_K5              810 us          810 us         1000 items_per_second=12.353M/s
+BM_RAG_Batch_10K_1536d_K5            1092 us         1088 us          738 items_per_second=9.19355M/s
+BM_RAG_Batch_10K_384d_K5_int8         159 us          159 us         4384 items_per_second=62.8149M/s
+BM_RAG_Throughput_10K_384d_10Q       2.32 ms         2.32 ms          216 items_per_second=43.1468M/s

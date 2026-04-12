@@ -1,0 +1,42 @@
+=== Quantized HNSW Search Benchmark ===
+Corpus: 5000 vectors, 384d, 100 queries, k=10
+Generating corpus... done.
+Computing ground truth... done.
+Building HNSW index... done (10600.2 ms).
+
+--- ef_search = 50 ---
+
+| Method | Build (ms) | Latency (us) | QPS | Recall@10 | Quant Memory |
+|--------|------------|--------------|-----|-----------|--------------|
+| FP32 baseline    |        0.8 |        139.0 |  7192 |     91.0% |          0 B |
+| LVQ-8 (2x rerank) |        1.9 |        246.8 |  4052 |     98.1% |    1960000 B |
+| LVQ-8 (3x rerank) |        1.9 |        314.1 |  3184 |     99.5% |    1960000 B |
+| LVQ-4 (3x rerank) |        3.1 |        305.2 |  3276 |     99.4% |    1000000 B |
+| RaBitQ (3x rerank) |        9.3 |        171.4 |  5834 |     75.5% |     261536 B |
+| RaBitQ (5x rerank) |        9.4 |        239.9 |  4169 |     86.3% |     261536 B |
+
+
+--- ef_search = 100 ---
+
+| Method | Build (ms) | Latency (us) | QPS | Recall@10 | Quant Memory |
+|--------|------------|--------------|-----|-----------|--------------|
+| FP32 baseline    |        0.5 |        240.7 |  4155 |     98.2% |          0 B |
+| LVQ-8 (2x rerank) |        1.7 |        361.2 |  2769 |     99.9% |    1960000 B |
+| LVQ-8 (3x rerank) |        1.7 |        446.4 |  2240 |    100.0% |    1960000 B |
+| LVQ-4 (3x rerank) |        3.3 |        430.9 |  2321 |    100.0% |    1000000 B |
+| RaBitQ (3x rerank) |        9.4 |        249.6 |  4006 |     88.5% |     261536 B |
+| RaBitQ (5x rerank) |        9.6 |        393.8 |  2539 |     93.7% |     261536 B |
+
+
+--- ef_search = 200 ---
+
+| Method | Build (ms) | Latency (us) | QPS | Recall@10 | Quant Memory |
+|--------|------------|--------------|-----|-----------|--------------|
+| FP32 baseline    |        0.5 |        321.4 |  3111 |     99.9% |          0 B |
+| LVQ-8 (2x rerank) |        1.8 |        530.6 |  1885 |    100.0% |    1960000 B |
+| LVQ-8 (3x rerank) |        1.8 |        712.3 |  1404 |    100.0% |    1960000 B |
+| LVQ-4 (3x rerank) |        3.1 |        749.5 |  1334 |    100.0% |    1000000 B |
+| RaBitQ (3x rerank) |        9.5 |        526.2 |  1900 |     94.8% |     261536 B |
+| RaBitQ (5x rerank) |        9.4 |        758.7 |  1318 |     98.4% |     261536 B |
+
+FP32 vector memory: 7680000 bytes (7 MB)

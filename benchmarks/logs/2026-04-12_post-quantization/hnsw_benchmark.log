@@ -1,0 +1,30 @@
+Unable to determine clock rate from sysctl: hw.cpufrequency: No such file or directory
+This does not affect benchmark measurements, only the metadata output.
+***WARNING*** Failed to set thread affinity. Estimated CPU frequency may be incorrect.
+2026-04-12T16:52:45-04:00
+Running ./builddir-final/benchmarks/hnsw_benchmark
+Run on (16 X 24 MHz CPU s)
+CPU Caches:
+  L1 Data 64 KiB
+  L1 Instruction 128 KiB
+  L2 Unified 4096 KiB (x16)
+Load Average: 9.53, 7.61, 7.29
+------------------------------------------------------------------------------------------------
+Benchmark                                      Time             CPU   Iterations UserCounters...
+------------------------------------------------------------------------------------------------
+BM_HNSW_Build/1000/384                1014774625 ns   1003745000 ns            1 vectors=1k vectors/sec=996.269/s
+BM_HNSW_Build/10000/384               3.0771e+10 ns   2.9829e+10 ns            1 vectors=10k vectors/sec=335.244/s
+BM_HNSW_Search/1000/384/10/50              66831 ns        66704 ns        10046 QPS=1.49229/s corpus=1k ef=50 k=10
+BM_HNSW_Search/10000/384/10/50            138981 ns       138837 ns         4739 QPS=1.51988/s corpus=10k ef=50 k=10
+BM_HNSW_Search/10000/384/10/10             38897 ns        38866 ns        16427 QPS=1.56629/s corpus=10k ef=10 k=10
+BM_HNSW_Search/10000/384/10/20             85020 ns        84978 ns        11341 QPS=1.03762/s corpus=10k ef=20 k=10
+BM_HNSW_Search/10000/384/10/50            156966 ns       156495 ns         4892 QPS=1.30621/s corpus=10k ef=50 k=10
+BM_HNSW_Search/10000/384/10/100           278429 ns       278197 ns         2371 QPS=1.51606/s corpus=10k ef=100 k=10
+BM_HNSW_Search/10000/384/10/200           434945 ns       434777 ns         1602 QPS=1.43572/s corpus=10k ef=200 k=10
+BM_HNSW_Search/10000/384/1/50             133219 ns       133207 ns         5052 QPS=1.48597/s corpus=10k ef=50 k=1
+BM_HNSW_Search/10000/384/5/50             145455 ns       145442 ns         5205 QPS=1.32096/s corpus=10k ef=50 k=5
+BM_HNSW_Search/10000/384/10/50            130349 ns       130337 ns         4696 QPS=1.63382/s corpus=10k ef=50 k=10
+BM_HNSW_Search/10000/384/50/50            131959 ns       131949 ns         5363 QPS=1.41315/s corpus=10k ef=50 k=50
+BM_HNSW_Search/10000/384/100/100          254703 ns       254685 ns         2569 QPS=1.52838/s corpus=10k ef=100 k=100
+BM_HNSW_Search/10000/384/10/50            138798 ns       138682 ns         5232 QPS=1.3782/s corpus=10k ef=50 k=10
+BM_HNSW_Search/10000/768/10/50            268651 ns       268171 ns         2772 QPS=1.34523/s corpus=10k ef=50 k=10

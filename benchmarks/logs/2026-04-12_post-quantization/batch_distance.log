@@ -1,0 +1,22 @@
+Unable to determine clock rate from sysctl: hw.cpufrequency: No such file or directory
+This does not affect benchmark measurements, only the metadata output.
+***WARNING*** Failed to set thread affinity. Estimated CPU frequency may be incorrect.
+2026-04-12T16:50:47-04:00
+Running ./builddir-final/benchmarks/batch_distance_benchmark
+Run on (16 X 24 MHz CPU s)
+CPU Caches:
+  L1 Data 64 KiB
+  L1 Instruction 128 KiB
+  L2 Unified 4096 KiB (x16)
+Load Average: 5.07, 6.59, 6.95
+-------------------------------------------------------------------------------------
+Benchmark                           Time             CPU   Iterations UserCounters...
+-------------------------------------------------------------------------------------
+BM_Sequential_100x384            2223 ns         2222 ns       316563 items_per_second=45.0128M/s
+BM_Batch_100x384                 2207 ns         2201 ns       315929 items_per_second=45.4245M/s
+BM_Sequential_1Kx384            24076 ns        24037 ns        31799 items_per_second=41.6029M/s
+BM_Batch_1Kx384                 24058 ns        24034 ns        31837 items_per_second=41.608M/s
+BM_TopK_1Kx384_K10              25488 ns        25372 ns        29978 items_per_second=39.4132M/s
+BM_Batch_Contiguous_1Kx384      21897 ns        21321 ns        32455 items_per_second=46.9018M/s
+BM_Batch_Int8_1Kx384            16354 ns        16243 ns        44755 items_per_second=61.5667M/s
+BM_Batch_1Kx1536                97789 ns        96628 ns         7070 items_per_second=10.349M/s

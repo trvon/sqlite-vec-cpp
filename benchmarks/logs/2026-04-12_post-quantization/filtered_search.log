@@ -1,0 +1,21 @@
+Unable to determine clock rate from sysctl: hw.cpufrequency: No such file or directory
+This does not affect benchmark measurements, only the metadata output.
+***WARNING*** Failed to set thread affinity. Estimated CPU frequency may be incorrect.
+2026-04-12T16:50:50-04:00
+Running ./builddir-final/benchmarks/filtered_search_benchmark
+Run on (16 X 24 MHz CPU s)
+CPU Caches:
+  L1 Data 64 KiB
+  L1 Instruction 128 KiB
+  L2 Unified 4096 KiB (x16)
+Load Average: 5.71, 6.70, 6.98
+------------------------------------------------------------------------------------------
+Benchmark                                Time             CPU   Iterations UserCounters...
+------------------------------------------------------------------------------------------
+BM_HNSW_Search_NoFilter           11086173 ns     11069405 ns           74 items_per_second=9.03391k/s
+BM_HNSW_Search_Filter_Bitset/10   61477095 ns     61402727 ns           11 allowed_pct=10 items_per_second=1.62859k/s
+BM_HNSW_Search_Filter_Bitset/50   19858254 ns     19853971 ns           34 allowed_pct=50 items_per_second=5.03678k/s
+BM_HNSW_Search_Filter_Bitset/90   13402690 ns     13386529 ns           51 allowed_pct=90 items_per_second=7.4702k/s
+BM_HNSW_Search_Filter_Set/10      75607031 ns     75366750 ns            8 allowed_pct=10 items_per_second=1.32685k/s
+BM_HNSW_Search_Filter_Set/50      30147583 ns     30112238 ns           21 allowed_pct=50 items_per_second=3.32091k/s
+BM_HNSW_Search_Filter_Set/90      12069455 ns     12062431 ns           58 allowed_pct=90 items_per_second=8.2902k/s
