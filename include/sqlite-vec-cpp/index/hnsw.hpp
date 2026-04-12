@@ -309,6 +309,8 @@ public:
                 current = candidates[0].first;
             }
         }
+
+        mutation_generation_.fetch_add(1, std::memory_order_release);
     }
 
     /// Single-threaded insert — no locking, no edge copies, fastest path for bulk builds
@@ -412,6 +414,8 @@ public:
             if (!candidates.empty())
                 current = candidates[0].first;
         }
+
+        mutation_generation_.fetch_add(1, std::memory_order_release);
     }
 
     /// Search for k nearest neighbors (query is always float32)
@@ -787,6 +791,84 @@ public:
         return search(query, k, ef);
     }
 
+    // ========== Quantized Two-Stage Search ==========
+
+    /// Two-stage search: quantized distances for graph traversal, exact FP32 for reranking.
+    ///
+    /// This runs inside the HNSW internals with full access to the visited pool,
+    /// prefetching, and lock-free neighbor access — unlike external wrappers that
+    /// reimplement beam search with hash map lookups.
+    ///
+    /// @tparam ApproxDistFn Callable: float(std::span<const float> query, size_t dense_id)
+    ///         Returns approximate distance for a node given its dense_id.
+    /// @tparam PrefetchFn Callable: void(size_t dense_id) — prefetch quantized data
+    /// @param query Query vector (float32)
+    /// @param k Number of results to return
+    /// @param ef_search Beam width for quantized traversal
+    /// @param rerank_factor Multiplier: collect ef_search * rerank_factor candidates,
+    ///        then rerank the top ef_search with exact distance
+    /// @param approx_dist Approximate distance function (quantized)
+    /// @param prefetch_fn Prefetch function for quantized codes
+    /// @param filter Optional filter function
+    /// @return Vector of (id, exact_distance) pairs, sorted by distance
+    template <typename ApproxDistFn, typename PrefetchFn>
+    std::vector<std::pair<size_t, float>>
+    search_quantized_rerank(std::span<const float> query, size_t k, size_t ef_search,
+                            size_t rerank_factor, ApproxDistFn&& approx_dist,
+                            PrefetchFn&& prefetch_fn,
+                            const FilterFn& filter = nullptr) const {
+        if (nodes_.empty())
+            return {};
+
+        std::vector<float> norm_query;
+        std::span<const float> effective_query = query;
+        if (config_.normalize_vectors) {
+            norm_query = normalize_vector(query);
+            effective_query = std::span<const float>(norm_query);
+        }
+
+        size_t expanded_ef = ef_search * rerank_factor;
+        expanded_ef = std::max(expanded_ef, k);
+
+        std::shared_lock lock(nodes_mutex_);
+        std::shared_lock deleted_lock(deleted_mutex_);
+
+        const FilterFn* filter_ptr = filter ? &filter : nullptr;
+
+        // Stage 1: Greedy descent through upper layers (cheap, use FP32)
+        size_t current = entry_point_id_.load(std::memory_order_acquire);
+        for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > 0; --lc) {
+            current = greedy_search_layer_shared<true>(effective_query, current, lc, filter_ptr);
+        }
+
+        // Stage 2: Beam search at layer 0 using quantized distances
+        auto approx_candidates = beam_search_layer_quantized(
+            effective_query, current, expanded_ef, 0, filter_ptr, approx_dist, prefetch_fn);
+
+        // Stage 3: Rerank with exact FP32 distances
+        std::vector<std::pair<size_t, float>> reranked;
+        reranked.reserve(approx_candidates.size());
+
+        for (const auto& [id, approx_d] : approx_candidates) {
+            const auto* node = try_get_node(id);
+            if (!node)
+                continue;
+            float exact_dist = distance_query_node(effective_query, *node);
+            if (exact_dist >= 0.0f) {
+                reranked.emplace_back(id, exact_dist);
+            }
+        }
+
+        std::sort(reranked.begin(), reranked.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        if (reranked.size() > k) {
+            reranked.resize(k);
+        }
+
+        return reranked;
+    }
+
     // ========== Graph Quality Metrics ==========
 
     /// Statistics about the HNSW graph structure
@@ -897,6 +979,7 @@ public:
             return;
         std::unique_lock deleted_lock(deleted_mutex_);
         deleted_ids_.insert(id);
+        mutation_generation_.fetch_add(1, std::memory_order_release);
     }
 
     /// Check if node is soft-deleted
@@ -922,6 +1005,12 @@ public:
 
     /// Get the set of deleted IDs (for serialization)
     [[nodiscard]] const std::unordered_set<size_t>& deleted_ids() const { return deleted_ids_; }
+
+    /// Monotonically increasing counter, bumped on every insert/delete.
+    /// Used by HNSWQuantizedSearch to detect stale quantization snapshots.
+    [[nodiscard]] uint64_t mutation_generation() const {
+        return mutation_generation_.load(std::memory_order_acquire);
+    }
 
     /// Check if compaction is recommended
     /// @param threshold Fraction of deleted nodes (default 0.2 = 20%)
@@ -1024,6 +1113,7 @@ private:
     mutable std::shared_mutex deleted_mutex_;
     std::unordered_map<size_t, NodeType> nodes_;
     std::unordered_set<size_t> deleted_ids_;
+    std::atomic<uint64_t> mutation_generation_{0}; ///< Incremented on insert/delete for staleness detection
     std::atomic<size_t> next_dense_id_{0};
 
     // Flat lookup table for O(1) node access during single-threaded construction.
@@ -1836,6 +1926,156 @@ private:
                                                             size_t layer,
                                                             const FilterFn* filter) const {
         return beam_search_layer_locked(query, entry_point, ef, layer, filter);
+    }
+
+    /// Beam search using a user-supplied approximate distance function.
+    /// Runs inside the HNSW internals with visited pool, prefetching, and
+    /// read-mostly unlocked neighbor access — the same hot path as standard search.
+    ///
+    /// @tparam ApproxDistFn float(std::span<const float> query, size_t dense_id)
+    /// @tparam PrefetchFn void(size_t dense_id)
+    template <typename ApproxDistFn, typename PrefetchFn>
+    std::vector<std::pair<size_t, float>>
+    beam_search_layer_quantized(std::span<const float> query, size_t entry_point, size_t ef,
+                                size_t layer, const FilterFn* filter,
+                                ApproxDistFn&& approx_dist,
+                                PrefetchFn&& prefetch_fn) const {
+        auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
+        std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
+                            decltype(cmp)>
+            top_candidates(cmp);
+
+        auto cmp_min = [](const auto& a, const auto& b) { return a.first > b.first; };
+        std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
+                            decltype(cmp_min)>
+            candidates(cmp_min);
+
+        auto& visited = ThreadLocalVisitedPool::get(nodes_.size() + 1);
+
+        const auto* entry_node = try_get_node(entry_point);
+        if (!entry_node)
+            return {};
+
+        size_t entry_dense = entry_node->dense_id;
+        if (entry_dense == kInvalidDenseId)
+            return {};
+
+        float entry_dist = approx_dist(query, entry_dense);
+        candidates.emplace(entry_dist, entry_point);
+        visited.visit(entry_dense);
+
+        auto passes_filter = [&](size_t id) {
+            return !is_deleted_unlocked(id) && (!filter || (*filter)(id));
+        };
+
+        const float kDistanceEpsilon =
+            config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
+
+        if (passes_filter(entry_point) && entry_dist >= kDistanceEpsilon) {
+            float score =
+                config_.clamp_negative_distances ? std::max(0.0f, entry_dist) : entry_dist;
+            top_candidates.emplace(score, entry_point);
+        }
+
+        while (!candidates.empty()) {
+            auto [current_dist, current_id] = candidates.top();
+            candidates.pop();
+
+            const auto* current_node = try_get_node(current_id);
+            if (!current_node)
+                continue;
+
+            if (!top_candidates.empty() && current_dist > top_candidates.top().first &&
+                top_candidates.size() >= ef) {
+                break;
+            }
+
+            // Read-mostly: direct reference, no mutex, no copy
+            const auto& neighbors = current_node->neighbors_unlocked(layer);
+
+            // Prefetch first unvisited neighbor's quantized codes
+            for (size_t neighbor : neighbors) {
+                const auto* neighbor_node = try_get_node(neighbor);
+                if (!neighbor_node)
+                    continue;
+                size_t neighbor_dense = neighbor_node->dense_id;
+                if (neighbor_dense == kInvalidDenseId)
+                    continue;
+                if (!visited.is_visited(neighbor_dense)) {
+                    prefetch_fn(neighbor_dense);
+                    break;
+                }
+            }
+
+            size_t prefetch_idx = 0;
+            for (size_t i = 0; i < neighbors.size(); ++i) {
+                size_t neighbor = neighbors[i];
+                const auto* neighbor_node = try_get_node(neighbor);
+                if (!neighbor_node)
+                    continue;
+                size_t neighbor_dense = neighbor_node->dense_id;
+                if (neighbor_dense == kInvalidDenseId)
+                    continue;
+                if (visited.is_visited(neighbor_dense))
+                    continue;
+                visited.visit(neighbor_dense);
+
+                // Prefetch next unvisited neighbor's quantized codes
+                for (size_t j = i + 1; j < neighbors.size() && prefetch_idx <= i; ++j) {
+                    const auto* next_node = try_get_node(neighbors[j]);
+                    if (!next_node)
+                        continue;
+                    size_t next_dense = next_node->dense_id;
+                    if (next_dense == kInvalidDenseId)
+                        continue;
+                    if (!visited.is_visited(next_dense)) {
+                        prefetch_fn(next_dense);
+                        prefetch_idx = j;
+                        break;
+                    }
+                }
+
+                float neighbor_dist = approx_dist(query, neighbor_dense);
+                if (neighbor_dist < kDistanceEpsilon)
+                    continue;
+
+                bool should_explore = top_candidates.empty() || top_candidates.size() < ef ||
+                                      neighbor_dist < top_candidates.top().first;
+
+                if (should_explore) {
+                    float score = config_.clamp_negative_distances
+                                      ? std::max(0.0f, neighbor_dist)
+                                      : neighbor_dist;
+                    candidates.emplace(score, neighbor);
+                }
+
+                if (passes_filter(neighbor)) {
+                    if (top_candidates.size() < ef ||
+                        neighbor_dist < top_candidates.top().first) {
+                        float top_score = config_.clamp_negative_distances
+                                              ? std::max(0.0f, neighbor_dist)
+                                              : neighbor_dist;
+                        top_candidates.emplace(top_score, neighbor);
+                        if (top_candidates.size() > ef) {
+                            top_candidates.pop();
+                        }
+                    }
+                }
+            }
+        }
+
+        std::vector<std::pair<size_t, float>> result;
+        result.reserve(top_candidates.size());
+        while (!top_candidates.empty()) {
+            auto [dist, id] = top_candidates.top();
+            top_candidates.pop();
+            result.emplace_back(id, dist);
+        }
+
+        std::sort(result.begin(), result.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        return result;
     }
 
     /// Connect node to M nearest neighbors at layer

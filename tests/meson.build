@@ -72,3 +72,12 @@ test('Utilities (Array)', test_utils)
 test('SQLite Functions (Comprehensive)', test_sqlite_functions, timeout: 60)
 test('Batch Distance Operations', test_batch_distance)
 test('HNSW Index', test_hnsw, timeout: hnsw_timeout)
+
+test_quantization = executable(
+  'test_quantization',
+  'test_quantization.cpp',
+  include_directories: inc_dirs,
+  dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args,
+)
+test('Quantization (LVQ + RaBitQ + Two-Stage HNSW)', test_quantization, timeout: hnsw_timeout)

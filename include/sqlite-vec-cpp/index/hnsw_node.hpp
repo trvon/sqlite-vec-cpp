@@ -13,6 +13,7 @@ namespace sqlite_vec_cpp::index {
 /// Each node represents a vector with connections to neighbors at each layer
 /// @tparam T Storage type (float or float16_t)
 template <concepts::VectorElement T> struct HNSWNode {
+    using value_type = T;                   ///< Element type alias for generic code
     size_t id;                              ///< External ID (e.g., SQLite rowid)
     size_t dense_id;                        ///< Dense, contiguous ID for visited tracking
     std::vector<T> vector;                  ///< Embedded vector (owned copy)

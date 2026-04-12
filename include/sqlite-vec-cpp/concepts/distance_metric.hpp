@@ -55,12 +55,18 @@ template <typename M> struct is_metric_space : std::false_type {};
 /// Check if a metric is a similarity (vs distance)
 template <typename M> struct is_similarity : std::false_type {};
 
+/// Check if a metric uses L2 (Euclidean) distance.
+/// Quantized stores (LVQ, RaBitQ) only implement L2 distance estimation.
+template <typename M> struct is_l2_family : std::false_type {};
+
 /// Helper variable templates
 template <typename M> inline constexpr bool is_symmetric_v = is_symmetric<M>::value;
 
 template <typename M> inline constexpr bool is_metric_space_v = is_metric_space<M>::value;
 
 template <typename M> inline constexpr bool is_similarity_v = is_similarity<M>::value;
+
+template <typename M> inline constexpr bool is_l2_family_v = is_l2_family<M>::value;
 
 } // namespace traits
 

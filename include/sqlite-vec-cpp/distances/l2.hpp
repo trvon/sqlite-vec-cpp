@@ -112,6 +112,9 @@ struct is_symmetric<sqlite_vec_cpp::distances::L2Metric<T>> : std::true_type {};
 
 template <typename T>
 struct is_metric_space<sqlite_vec_cpp::distances::L2Metric<T>> : std::true_type {};
+
+template <typename T>
+struct is_l2_family<sqlite_vec_cpp::distances::L2Metric<T>> : std::true_type {};
 } // namespace sqlite_vec_cpp::concepts::traits
 
 namespace sqlite_vec_cpp::distances {

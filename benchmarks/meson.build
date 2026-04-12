@@ -100,6 +100,16 @@ hnsw_engine_comparison_benchmark_exe = executable(
 )
 message('  ./hnsw_engine_comparison_benchmark (YAMS HNSW baseline + optional zvec)')
 
+# Quantized search benchmark (standalone, no Google Benchmark dependency)
+quantized_search_benchmark_exe = executable(
+  'quantized_search_benchmark',
+  'quantized_search_benchmark.cpp',
+  include_directories: include_directories('../include'),
+  cpp_args: cpp_args_list,
+  install: false
+)
+message('  ./quantized_search_benchmark (LVQ-8, LVQ-4, RaBitQ vs FP32 baseline)')
+
 vec0_ann_benchmark_exe = executable(
   'vec0_ann_benchmark',
   'vec0_ann_benchmark.cpp',

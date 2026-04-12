@@ -265,6 +265,7 @@ install_headers(
     'include/sqlite-vec-cpp/index/hnsw.hpp',
     'include/sqlite-vec-cpp/index/hnsw_node.hpp',
     'include/sqlite-vec-cpp/index/hnsw_persistence.hpp',
+    'include/sqlite-vec-cpp/index/hnsw_quantized.hpp',
     'include/sqlite-vec-cpp/index/hnsw_threading.hpp',
   ],
   subdir: 'sqlite-vec-cpp/index',
@@ -301,6 +302,16 @@ install_headers(
   ],
   subdir: 'sqlite-vec-cpp/utils',
 )
+
+install_headers(
+  [
+    'include/sqlite-vec-cpp/quantization/lvq.hpp',
+    'include/sqlite-vec-cpp/quantization/rabitq.hpp',
+    'include/sqlite-vec-cpp/quantization/store.hpp',
+  ],
+  subdir: 'sqlite-vec-cpp/quantization',
+)
+
 
 pkg.generate(
   sqlite_vec_cpp_lib,
