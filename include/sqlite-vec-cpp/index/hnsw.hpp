@@ -53,6 +53,7 @@ template <concepts::VectorElement, typename> class HNSWQuantizedSearch;
 /// @tparam MetricT Distance metric type (must work with float spans)
 template <concepts::VectorElement StorageT, typename MetricT> class HNSWIndex {
     friend class HNSWQuantizedSearch<StorageT, MetricT>;
+
 public:
     /// Configuration parameters for HNSW index
     /// Tuned for high recall on large corpora (10K+ vectors) with high-dimensional embeddings
@@ -1071,7 +1072,8 @@ private:
     mutable std::shared_mutex deleted_mutex_;
     std::unordered_map<size_t, NodeType> nodes_;
     std::unordered_set<size_t> deleted_ids_;
-    std::atomic<uint64_t> mutation_generation_{0}; ///< Incremented on insert/delete for staleness detection
+    std::atomic<uint64_t> mutation_generation_{
+        0}; ///< Incremented on insert/delete for staleness detection
     std::atomic<size_t> next_dense_id_{0};
 
     // Flat lookup table for O(1) node access during single-threaded construction.
@@ -1895,8 +1897,7 @@ private:
     std::vector<std::pair<size_t, float>>
     search_quantized_rerank(std::span<const float> query, size_t k, size_t ef_search,
                             size_t rerank_factor, ApproxDistFn&& approx_dist,
-                            PrefetchFn&& prefetch_fn,
-                            const FilterFn& filter = nullptr) const {
+                            PrefetchFn&& prefetch_fn, const FilterFn& filter = nullptr) const {
         if (nodes_.empty())
             return {};
 
@@ -1957,8 +1958,7 @@ private:
     requires(concepts::traits::is_l2_family_v<MetricT>)
     std::vector<std::pair<size_t, float>>
     beam_search_layer_quantized(std::span<const float> query, size_t entry_point, size_t ef,
-                                size_t layer, const FilterFn* filter,
-                                ApproxDistFn&& approx_dist,
+                                size_t layer, const FilterFn* filter, ApproxDistFn&& approx_dist,
                                 PrefetchFn&& prefetch_fn) const {
         auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
@@ -2063,15 +2063,13 @@ private:
                                       neighbor_dist < top_candidates.top().first;
 
                 if (should_explore) {
-                    float score = config_.clamp_negative_distances
-                                      ? std::max(0.0f, neighbor_dist)
-                                      : neighbor_dist;
+                    float score = config_.clamp_negative_distances ? std::max(0.0f, neighbor_dist)
+                                                                   : neighbor_dist;
                     candidates.emplace(score, neighbor);
                 }
 
                 if (passes_filter(neighbor)) {
-                    if (top_candidates.size() < ef ||
-                        neighbor_dist < top_candidates.top().first) {
+                    if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
                         float top_score = config_.clamp_negative_distances
                                               ? std::max(0.0f, neighbor_dist)
                                               : neighbor_dist;

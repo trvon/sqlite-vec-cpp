@@ -78,17 +78,17 @@ public:
         auto snap = base_index_.snapshot_for_quantization();
 
         switch (config_.quantization) {
-        case QuantizationType::LVQ8:
-            lvq8_store_.build(snap);
-            break;
-        case QuantizationType::LVQ4:
-            lvq4_store_.build(snap);
-            break;
-        case QuantizationType::RaBitQ:
-            rabitq_store_.build(snap);
-            break;
-        case QuantizationType::None:
-            break;
+            case QuantizationType::LVQ8:
+                lvq8_store_.build(snap);
+                break;
+            case QuantizationType::LVQ4:
+                lvq4_store_.build(snap);
+                break;
+            case QuantizationType::RaBitQ:
+                rabitq_store_.build(snap);
+                break;
+            case QuantizationType::None:
+                break;
         }
 
         quantization_generation_ = snap.generation;
@@ -114,28 +114,28 @@ public:
         }
 
         switch (config_.quantization) {
-        case QuantizationType::LVQ8:
-            return search_with_store(lvq8_store_, query, k, ef_search, filter);
-        case QuantizationType::LVQ4:
-            return search_with_store(lvq4_store_, query, k, ef_search, filter);
-        case QuantizationType::RaBitQ:
-            return search_rabitq(query, k, ef_search, filter);
-        default:
-            return base_index_.search(query, k, ef_search);
+            case QuantizationType::LVQ8:
+                return search_with_store(lvq8_store_, query, k, ef_search, filter);
+            case QuantizationType::LVQ4:
+                return search_with_store(lvq4_store_, query, k, ef_search, filter);
+            case QuantizationType::RaBitQ:
+                return search_rabitq(query, k, ef_search, filter);
+            default:
+                return base_index_.search(query, k, ef_search);
         }
     }
 
     /// Check if quantization data is available
     [[nodiscard]] bool has_quantization() const {
         switch (config_.quantization) {
-        case QuantizationType::LVQ8:
-            return lvq8_store_.count > 0;
-        case QuantizationType::LVQ4:
-            return lvq4_store_.count > 0;
-        case QuantizationType::RaBitQ:
-            return rabitq_store_.count > 0;
-        case QuantizationType::None:
-            return false;
+            case QuantizationType::LVQ8:
+                return lvq8_store_.count > 0;
+            case QuantizationType::LVQ4:
+                return lvq4_store_.count > 0;
+            case QuantizationType::RaBitQ:
+                return rabitq_store_.count > 0;
+            case QuantizationType::None:
+                return false;
         }
         return false;
     }
@@ -146,21 +146,20 @@ public:
     /// Check if the base index was mutated after build_quantization().
     /// When stale, search falls back to exact (slower but correct).
     [[nodiscard]] bool is_stale() const {
-        return has_quantization() &&
-               base_index_.mutation_generation() != quantization_generation_;
+        return has_quantization() && base_index_.mutation_generation() != quantization_generation_;
     }
 
     /// Get memory usage of quantized data (approximate bytes)
     [[nodiscard]] size_t quantized_memory_bytes() const {
         switch (config_.quantization) {
-        case QuantizationType::LVQ8:
-            return lvq8_store_.memory_bytes();
-        case QuantizationType::LVQ4:
-            return lvq4_store_.memory_bytes();
-        case QuantizationType::RaBitQ:
-            return rabitq_store_.memory_bytes();
-        case QuantizationType::None:
-            return 0;
+            case QuantizationType::LVQ8:
+                return lvq8_store_.memory_bytes();
+            case QuantizationType::LVQ4:
+                return lvq4_store_.memory_bytes();
+            case QuantizationType::RaBitQ:
+                return rabitq_store_.memory_bytes();
+            case QuantizationType::None:
+                return 0;
         }
         return 0;
     }
@@ -183,8 +182,8 @@ private:
     /// The store provides l2_distance(query, dense_id) and prefetch(dense_id)
     template <typename StoreT>
     std::vector<std::pair<size_t, float>>
-    search_with_store(const StoreT& store, std::span<const float> query, size_t k,
-                      size_t ef_search, const FilterFn& filter) const {
+    search_with_store(const StoreT& store, std::span<const float> query, size_t k, size_t ef_search,
+                      const FilterFn& filter) const {
         auto approx_dist = [&store](std::span<const float> q, size_t dense_id) -> float {
             return store.l2_distance(q, dense_id);
         };
@@ -195,13 +194,13 @@ private:
     }
 
     /// Search using RaBitQ (needs precomputed query state)
-    std::vector<std::pair<size_t, float>>
-    search_rabitq(std::span<const float> query, size_t k, size_t ef_search,
-                  const FilterFn& filter) const {
+    std::vector<std::pair<size_t, float>> search_rabitq(std::span<const float> query, size_t k,
+                                                        size_t ef_search,
+                                                        const FilterFn& filter) const {
         auto query_state = rabitq_store_.prepare_query(query);
 
         auto approx_dist = [this, &query_state](std::span<const float> /*q*/,
-                                                 size_t dense_id) -> float {
+                                                size_t dense_id) -> float {
             return rabitq_store_.l2_distance(query_state, dense_id);
         };
         auto prefetch_fn = [this](size_t dense_id) { rabitq_store_.prefetch(dense_id); };

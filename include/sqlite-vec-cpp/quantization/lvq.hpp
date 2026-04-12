@@ -126,7 +126,7 @@ struct LVQ8 {
         } else
 #endif
 #ifdef SQLITE_VEC_ENABLE_AVX
-        if (dim >= 16) {
+            if (dim >= 16) {
             sum_sq = l2_distance_avx(query, code, inv_scale, offset);
         } else
 #endif
@@ -370,8 +370,8 @@ struct LVQ4 {
 
 #ifdef SQLITE_VEC_ENABLE_NEON
         if (original_dim >= 32) {
-            sum_sq = l2_distance_neon(query.data(), code.codes.data(), original_dim, inv_scale,
-                                      offset);
+            sum_sq =
+                l2_distance_neon(query.data(), code.codes.data(), original_dim, inv_scale, offset);
         } else
 #endif
         {

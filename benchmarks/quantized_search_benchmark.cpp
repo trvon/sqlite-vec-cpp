@@ -158,8 +158,7 @@ int main(int argc, char* argv[]) {
         index.insert_single_threaded(i, std::span<const float>(corpus[i]));
     }
     auto build_end = std::chrono::high_resolution_clock::now();
-    double build_ms =
-        std::chrono::duration<double, std::milli>(build_end - build_start).count();
+    double build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
     std::cout << " done (" << std::fixed << std::setprecision(1) << build_ms << " ms)."
               << std::endl;
 
@@ -209,8 +208,7 @@ int main(int argc, char* argv[]) {
             auto search_start = std::chrono::high_resolution_clock::now();
 
             for (size_t q = 0; q < num_queries; ++q) {
-                auto results_q =
-                    qsearch.search(std::span<const float>(queries[q]), k, ef_search);
+                auto results_q = qsearch.search(std::span<const float>(queries[q]), k, ef_search);
                 total_recall += compute_recall(results_q, ground_truth[q], k);
             }
 
@@ -233,8 +231,8 @@ int main(int argc, char* argv[]) {
 
     // Memory summary
     size_t fp32_bytes = corpus_size * dim * sizeof(float);
-    std::cout << "FP32 vector memory: " << fp32_bytes << " bytes ("
-              << (fp32_bytes / 1024 / 1024) << " MB)" << std::endl;
+    std::cout << "FP32 vector memory: " << fp32_bytes << " bytes (" << (fp32_bytes / 1024 / 1024)
+              << " MB)" << std::endl;
 
     return 0;
 }

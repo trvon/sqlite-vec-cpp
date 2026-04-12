@@ -35,9 +35,9 @@ std::vector<float> generate_vector(size_t dim, std::mt19937& rng) {
 }
 
 /// Brute-force k-NN for ground truth
-std::vector<std::pair<size_t, float>>
-brute_force_knn(std::span<const float> query,
-                const std::vector<std::vector<float>>& corpus, size_t k) {
+std::vector<std::pair<size_t, float>> brute_force_knn(std::span<const float> query,
+                                                      const std::vector<std::vector<float>>& corpus,
+                                                      size_t k) {
     L2Metric<float> metric;
     std::vector<std::pair<size_t, float>> distances;
     for (size_t i = 0; i < corpus.size(); ++i) {
@@ -341,8 +341,7 @@ void test_rabitq_distance_ordering() {
 
                 // Check if ordering is preserved
                 if ((exact_i < exact_j && rabitq_i < rabitq_j) ||
-                    (exact_i > exact_j && rabitq_i > rabitq_j) ||
-                    (exact_i == exact_j)) {
+                    (exact_i > exact_j && rabitq_i > rabitq_j) || (exact_i == exact_j)) {
                     ++ordering_preserved;
                 }
                 ++total_comparisons;
@@ -417,10 +416,10 @@ void test_two_stage_search_recall() {
 
     // Test each quantization type
     for (auto qtype : {QuantizationType::LVQ8, QuantizationType::LVQ4, QuantizationType::RaBitQ}) {
-        const char* name = qtype == QuantizationType::LVQ8    ? "LVQ-8"
-                           : qtype == QuantizationType::LVQ4  ? "LVQ-4"
+        const char* name = qtype == QuantizationType::LVQ8     ? "LVQ-8"
+                           : qtype == QuantizationType::LVQ4   ? "LVQ-4"
                            : qtype == QuantizationType::RaBitQ ? "RaBitQ"
-                                                              : "Unknown";
+                                                               : "Unknown";
 
         HNSWQuantizedSearch<float, L2Metric<float>>::Config qconfig;
         qconfig.quantization = qtype;
@@ -542,10 +541,10 @@ void test_two_stage_memory_savings() {
         size_t quant_bytes = qsearch.quantized_memory_bytes();
         float compression = static_cast<float>(fp32_bytes) / static_cast<float>(quant_bytes);
 
-        const char* name = qtype == QuantizationType::LVQ8    ? "LVQ-8"
-                           : qtype == QuantizationType::LVQ4  ? "LVQ-4"
+        const char* name = qtype == QuantizationType::LVQ8     ? "LVQ-8"
+                           : qtype == QuantizationType::LVQ4   ? "LVQ-4"
                            : qtype == QuantizationType::RaBitQ ? "RaBitQ"
-                                                              : "Unknown";
+                                                               : "Unknown";
 
         std::cout << "  " << name << ": " << quant_bytes << " bytes, " << compression
                   << "x compression vs FP32" << std::endl;
@@ -771,7 +770,7 @@ void test_stale_restore_and_clear() {
     // Rebuild, then clear_deletions on empty set -> should NOT bump (no-op)
     qsearch.build_quantization();
     assert(!qsearch.is_stale());
-    index.clear_deletions(); // nothing to clear
+    index.clear_deletions();     // nothing to clear
     assert(!qsearch.is_stale()); // generation unchanged
 
     // Delete, rebuild, then clear_deletions with actual deletions -> stale
