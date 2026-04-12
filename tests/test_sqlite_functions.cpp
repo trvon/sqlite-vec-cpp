@@ -1228,6 +1228,147 @@ void test_vec0_ann_hidden_query_respects_rowid_filter() {
     std::cout << "  ✓ vec0 hidden query respects rowid filter" << std::endl;
 }
 
+void test_vec0_exact_match_without_k() {
+    std::cout << "Testing vec0 exact MATCH query without explicit k..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    for (int i = 0; i < 12; ++i) {
+        db.exec("INSERT INTO t(rowid, embedding) VALUES (" + std::to_string(i + 1) + ", '[" +
+                std::to_string(i) + ",0]')");
+    }
+
+    const std::string sql =
+        "SELECT rowid, distance FROM t WHERE embedding MATCH vec_f32('[0,0]') ORDER BY distance";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    if (plan.find("exact") == std::string::npos || plan.find("ann") != std::string::npos) {
+        throw std::runtime_error("Expected exact vec0 plan without explicit k");
+    }
+
+    auto rows = query_row_distances(db.get(), sql);
+    if (rows.size() != 12) {
+        throw std::runtime_error("Expected exact query to return all 12 rows, got " +
+                                 std::to_string(rows.size()));
+    }
+    if (rows.front().rowid != 1 || rows.back().rowid != 12) {
+        throw std::runtime_error("Expected rows ordered by exact distance without truncation");
+    }
+
+    std::cout << "  ✓ vec0 exact MATCH query without k works" << std::endl;
+}
+
+void test_vec0_exact_match_count_without_k() {
+    std::cout << "Testing vec0 COUNT(*) MATCH query without explicit k..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    for (int i = 0; i < 7; ++i) {
+        db.exec("INSERT INTO t(rowid, embedding) VALUES (" + std::to_string(i + 1) + ", '[" +
+                std::to_string(i) + ",0]')");
+    }
+
+    const std::string sql = "SELECT COUNT(*) FROM t WHERE embedding MATCH vec_f32('[0,0]')";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    if (plan.find("exact") == std::string::npos || plan.find("ann") != std::string::npos) {
+        throw std::runtime_error("Expected exact vec0 plan for COUNT(*) without explicit k");
+    }
+
+    if (db.exec_scalar(sql) != "7") {
+        throw std::runtime_error("Expected COUNT(*) over exact vec0 query to return 7");
+    }
+
+    std::cout << "  ✓ vec0 COUNT(*) MATCH query without k works" << std::endl;
+}
+
+void test_vec0_exact_match_order_by_rowid() {
+    std::cout << "Testing vec0 MATCH query with ORDER BY rowid..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (30, '[0.3,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (10, '[0.2,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (20, '[0.1,0]')");
+
+    const std::string sql = "SELECT rowid, distance FROM t "
+                            "WHERE embedding MATCH vec_f32('[0,0]') AND k = 2 ORDER BY rowid";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    if (plan.find("exact") == std::string::npos || plan.find("ann") != std::string::npos) {
+        throw std::runtime_error("Expected exact vec0 plan for ORDER BY rowid");
+    }
+
+    auto rows = query_row_distances(db.get(), sql);
+    if (rows.size() != 2 || rows[0].rowid != 10 || rows[1].rowid != 20) {
+        throw std::runtime_error("Expected exact vec0 ORDER BY rowid results [10,20]");
+    }
+
+    std::cout << "  ✓ vec0 MATCH query with ORDER BY rowid works" << std::endl;
+}
+
+void test_vec0_exact_match_order_by_distance_desc() {
+    std::cout << "Testing vec0 MATCH query with ORDER BY distance DESC..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (10, '[0.2,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (20, '[0.4,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (30, '[0.8,0]')");
+
+    const std::string sql =
+        "SELECT rowid, distance FROM t "
+        "WHERE embedding MATCH vec_f32('[0,0]') AND k = 2 ORDER BY distance DESC";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    if (plan.find("exact") == std::string::npos || plan.find("ann") != std::string::npos) {
+        throw std::runtime_error("Expected exact vec0 plan for ORDER BY distance DESC");
+    }
+
+    auto rows = query_row_distances(db.get(), sql);
+    if (rows.size() != 2 || rows[0].rowid != 20 || rows[1].rowid != 10) {
+        throw std::runtime_error("Expected exact vec0 DESC results [20,10]");
+    }
+
+    std::cout << "  ✓ vec0 MATCH query with ORDER BY distance DESC works" << std::endl;
+}
+
+void test_vec0_exact_match_rowid_range() {
+    std::cout << "Testing vec0 MATCH query with rowid range filter..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (10, '[0.1,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (20, '[0.2,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (30, '[0.3,0]')");
+
+    const std::string sql =
+        "SELECT rowid, distance FROM t "
+        "WHERE embedding MATCH vec_f32('[0,0]') AND rowid >= 20 AND k = 1 ORDER BY distance";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    if (plan.find("exact") == std::string::npos || plan.find("ann") != std::string::npos) {
+        throw std::runtime_error("Expected exact vec0 plan for rowid range filter");
+    }
+
+    auto rows = query_row_distances(db.get(), sql);
+    if (rows.size() != 1 || rows[0].rowid != 20) {
+        throw std::runtime_error("Expected exact vec0 rowid range result rowid=20");
+    }
+
+    std::cout << "  ✓ vec0 MATCH query with rowid range works" << std::endl;
+}
+
 void test_vec0_benchmark_combined_loop_overstates_ann_latency() {
     std::cout << "Testing vec0 benchmark timing sanity..." << std::endl;
 
@@ -1548,6 +1689,12 @@ int main() {
     run_test("vec0_ann_match_respects_rowid_filter", test_vec0_ann_match_respects_rowid_filter);
     run_test("vec0_ann_hidden_query_respects_rowid_filter",
              test_vec0_ann_hidden_query_respects_rowid_filter);
+    run_test("vec0_exact_match_without_k", test_vec0_exact_match_without_k);
+    run_test("vec0_exact_match_count_without_k", test_vec0_exact_match_count_without_k);
+    run_test("vec0_exact_match_order_by_rowid", test_vec0_exact_match_order_by_rowid);
+    run_test("vec0_exact_match_order_by_distance_desc",
+             test_vec0_exact_match_order_by_distance_desc);
+    run_test("vec0_exact_match_rowid_range", test_vec0_exact_match_rowid_range);
     run_test("vec0_benchmark_combined_loop_overstates_ann_latency",
              test_vec0_benchmark_combined_loop_overstates_ann_latency);
     run_test("vec0_ann_reopen_rebuild", test_vec0_ann_reopen_rebuild);

@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -41,6 +42,12 @@ constexpr int kVec0PlanHasK = 1 << 2;
 constexpr int kVec0PlanHasEfSearch = 1 << 3;
 constexpr int kVec0PlanHasRowidEq = 1 << 4;
 constexpr int kVec0PlanHasRowidIn = 1 << 5;
+constexpr int kVec0PlanExactMatch = 1 << 6;
+constexpr int kVec0PlanExactHiddenQuery = 1 << 7;
+constexpr int kVec0PlanHasRowidGt = 1 << 8;
+constexpr int kVec0PlanHasRowidGe = 1 << 9;
+constexpr int kVec0PlanHasRowidLt = 1 << 10;
+constexpr int kVec0PlanHasRowidLe = 1 << 11;
 
 constexpr size_t kVec0DefaultK = 10;
 constexpr size_t kVec0DefaultEfSearch = 64;
@@ -85,9 +92,34 @@ struct Vec0Cursor {
 struct Vec0RowidFilter {
     bool active = false;
     std::unordered_set<int64_t> allowed_rowids;
+    std::optional<int64_t> min_rowid;
+    std::optional<int64_t> max_rowid;
+    bool include_min = true;
+    bool include_max = true;
 
     [[nodiscard]] bool matches(int64_t rowid) const {
-        return !active || allowed_rowids.contains(rowid);
+        if (!allowed_rowids.empty() && !allowed_rowids.contains(rowid)) {
+            return false;
+        }
+        if (min_rowid) {
+            if (include_min) {
+                if (rowid < *min_rowid) {
+                    return false;
+                }
+            } else if (rowid <= *min_rowid) {
+                return false;
+            }
+        }
+        if (max_rowid) {
+            if (include_max) {
+                if (rowid > *max_rowid) {
+                    return false;
+                }
+            } else if (rowid >= *max_rowid) {
+                return false;
+            }
+        }
+        return !active || true;
     }
 };
 
@@ -179,17 +211,26 @@ inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* ta
     return Result<std::shared_ptr<Vec0AnnIndex>>(ann_index);
 }
 
+inline Result<std::vector<float>> vec0_parse_query_vector(Vec0Table* table,
+                                                          const Value& query_value) {
+    auto parsed_query = parse_vector_from_value<float>(query_value);
+    if (!parsed_query) {
+        return err<std::vector<float>>(parsed_query.error());
+    }
+    if (parsed_query->size() != table->dimensions) {
+        return err<std::vector<float>>(Error::invalid_argument(
+            "vec0 query dimension mismatch: expected " + std::to_string(table->dimensions) +
+            ", got " + std::to_string(parsed_query->size())));
+    }
+    return Result<std::vector<float>>(std::move(parsed_query.value()));
+}
+
 inline Result<std::vector<std::pair<int64_t, float>>>
 vec0_run_ann_query(Vec0Table* table, const Value& query_value, size_t k, size_t ef_search,
                    const Vec0RowidFilter& rowid_filter) {
-    auto parsed_query = parse_vector_from_value<float>(query_value);
+    auto parsed_query = vec0_parse_query_vector(table, query_value);
     if (!parsed_query) {
         return err<std::vector<std::pair<int64_t, float>>>(parsed_query.error());
-    }
-    if (parsed_query->size() != table->dimensions) {
-        return err<std::vector<std::pair<int64_t, float>>>(Error::invalid_argument(
-            "vec0 query dimension mismatch: expected " + std::to_string(table->dimensions) +
-            ", got " + std::to_string(parsed_query->size())));
     }
 
     auto ann_index = vec0_ensure_ann_index(table);
@@ -207,7 +248,7 @@ vec0_run_ann_query(Vec0Table* table, const Value& query_value, size_t k, size_t 
                 continue;
             }
 
-            float dist = distances::l2_distance(std::span<const float>(*parsed_query),
+            float dist = distances::l2_distance(std::span<const float>(parsed_query.value()),
                                                 std::span<const float>(node->vector));
             results.emplace_back(rowid, dist);
         }
@@ -219,13 +260,68 @@ vec0_run_ann_query(Vec0Table* table, const Value& query_value, size_t k, size_t 
         }
     } else {
         auto raw_results = ann_index.value()->search_read_mostly(
-            std::span<const float>(*parsed_query), k, ef_search);
+            std::span<const float>(parsed_query.value()), k, ef_search);
         results.reserve(raw_results.size());
         for (const auto& [id, dist] : raw_results) {
             results.emplace_back(static_cast<int64_t>(id), dist);
         }
     }
 
+    return Result<std::vector<std::pair<int64_t, float>>>(std::move(results));
+}
+
+inline Result<std::vector<std::pair<int64_t, float>>>
+vec0_run_exact_query(Vec0Table* table, const Value& query_value, std::optional<size_t> k,
+                     const Vec0RowidFilter& rowid_filter) {
+    auto parsed_query = vec0_parse_query_vector(table, query_value);
+    if (!parsed_query) {
+        return err<std::vector<std::pair<int64_t, float>>>(parsed_query.error());
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    std::string sql = "SELECT rowid, \"" + table->embedding_column + "\" FROM " +
+                      vec0_vectors_table_name(*table) + " ORDER BY rowid";
+    int rc = sqlite3_prepare_v2(table->db, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        return err<std::vector<std::pair<int64_t, float>>>(
+            Error::sqlite_error("Failed to scan vec0 vectors for exact query", rc));
+    }
+
+    std::vector<std::pair<int64_t, float>> results;
+    std::vector<float> buffer(table->dimensions);
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int64_t rowid = sqlite3_column_int64(stmt, 0);
+        if (!rowid_filter.matches(rowid)) {
+            continue;
+        }
+
+        const void* blob = sqlite3_column_blob(stmt, 1);
+        int bytes = sqlite3_column_bytes(stmt, 1);
+        if (!blob || bytes != static_cast<int>(table->dimensions * sizeof(float))) {
+            sqlite3_finalize(stmt);
+            return err<std::vector<std::pair<int64_t, float>>>(Error::invalid_argument(
+                "vec0 exact query encountered stored vector size mismatch for rowid " +
+                std::to_string(rowid)));
+        }
+
+        std::memcpy(buffer.data(), blob, static_cast<size_t>(bytes));
+        float dist = distances::l2_distance(std::span<const float>(parsed_query.value()),
+                                            std::span<const float>(buffer));
+        results.emplace_back(rowid, dist);
+    }
+
+    if (rc != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        return err<std::vector<std::pair<int64_t, float>>>(
+            Error::sqlite_error("Failed during vec0 exact query scan", rc));
+    }
+
+    sqlite3_finalize(stmt);
+    std::sort(results.begin(), results.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+    if (k && results.size() > *k) {
+        results.resize(*k);
+    }
     return Result<std::vector<std::pair<int64_t, float>>>(std::move(results));
 }
 
@@ -264,6 +360,46 @@ inline Result<Vec0RowidFilter> vec0_extract_rowid_filter(int idxNum, int argc, s
             return err<Vec0RowidFilter>(
                 Error::sqlite_error("Failed to advance vec0 rowid IN values", rc));
         }
+    }
+
+    if ((idxNum & kVec0PlanHasRowidGt) != 0) {
+        if (arg_idx >= argc) {
+            return err<Vec0RowidFilter>(
+                Error::invalid_argument("vec0 query missing rowid greater-than argument"));
+        }
+        filter.active = true;
+        filter.min_rowid = sqlite3_value_int64(argv[arg_idx++]);
+        filter.include_min = false;
+    }
+
+    if ((idxNum & kVec0PlanHasRowidGe) != 0) {
+        if (arg_idx >= argc) {
+            return err<Vec0RowidFilter>(
+                Error::invalid_argument("vec0 query missing rowid greater-equal argument"));
+        }
+        filter.active = true;
+        filter.min_rowid = sqlite3_value_int64(argv[arg_idx++]);
+        filter.include_min = true;
+    }
+
+    if ((idxNum & kVec0PlanHasRowidLt) != 0) {
+        if (arg_idx >= argc) {
+            return err<Vec0RowidFilter>(
+                Error::invalid_argument("vec0 query missing rowid less-than argument"));
+        }
+        filter.active = true;
+        filter.max_rowid = sqlite3_value_int64(argv[arg_idx++]);
+        filter.include_max = false;
+    }
+
+    if ((idxNum & kVec0PlanHasRowidLe) != 0) {
+        if (arg_idx >= argc) {
+            return err<Vec0RowidFilter>(
+                Error::invalid_argument("vec0 query missing rowid less-equal argument"));
+        }
+        filter.active = true;
+        filter.max_rowid = sqlite3_value_int64(argv[arg_idx++]);
+        filter.include_max = true;
     }
 
     return Result<Vec0RowidFilter>(std::move(filter));
@@ -441,6 +577,10 @@ inline int vec0BestIndex(sqlite3_vtab* pVTab, sqlite3_index_info* pInfo) {
     int ef_constraint = -1;
     int rowid_eq_constraint = -1;
     int rowid_in_constraint = -1;
+    int rowid_gt_constraint = -1;
+    int rowid_ge_constraint = -1;
+    int rowid_lt_constraint = -1;
+    int rowid_le_constraint = -1;
 
     for (int i = 0; i < pInfo->nConstraint; ++i) {
         const auto& constraint = pInfo->aConstraint[i];
@@ -469,24 +609,58 @@ inline int vec0BestIndex(sqlite3_vtab* pVTab, sqlite3_index_info* pInfo) {
             } else if (rowid_eq_constraint < 0 && rowid_in_constraint < 0) {
                 rowid_eq_constraint = i;
             }
+        } else if ((constraint.iColumn == kVec0ColRowid || constraint.iColumn < 0) &&
+                   constraint.op == SQLITE_INDEX_CONSTRAINT_GT && rowid_gt_constraint < 0) {
+            rowid_gt_constraint = i;
+        } else if ((constraint.iColumn == kVec0ColRowid || constraint.iColumn < 0) &&
+                   constraint.op == SQLITE_INDEX_CONSTRAINT_GE && rowid_ge_constraint < 0) {
+            rowid_ge_constraint = i;
+        } else if ((constraint.iColumn == kVec0ColRowid || constraint.iColumn < 0) &&
+                   constraint.op == SQLITE_INDEX_CONSTRAINT_LT && rowid_lt_constraint < 0) {
+            rowid_lt_constraint = i;
+        } else if ((constraint.iColumn == kVec0ColRowid || constraint.iColumn < 0) &&
+                   constraint.op == SQLITE_INDEX_CONSTRAINT_LE && rowid_le_constraint < 0) {
+            rowid_le_constraint = i;
         }
     }
 
+    const bool has_query_constraint = (match_constraint >= 0 || query_constraint >= 0);
+    const bool has_rowid_range = (rowid_gt_constraint >= 0 || rowid_ge_constraint >= 0 ||
+                                  rowid_lt_constraint >= 0 || rowid_le_constraint >= 0);
+    const bool safe_ann_order =
+        (pInfo->nOrderBy == 0) ||
+        (pInfo->nOrderBy == 1 && pInfo->aOrderBy[0].iColumn == kVec0ColDistance &&
+         !pInfo->aOrderBy[0].desc);
+    const bool ann_eligible =
+        has_query_constraint && k_constraint >= 0 && !has_rowid_range && safe_ann_order;
+
     int next_argv = 1;
-    if (match_constraint >= 0) {
+    if (ann_eligible && match_constraint >= 0) {
         pInfo->idxNum |= kVec0PlanAnnMatch;
         pInfo->aConstraintUsage[match_constraint].argvIndex = next_argv++;
         pInfo->aConstraintUsage[match_constraint].omit = 1;
         if (query_constraint >= 0) {
             pInfo->aConstraintUsage[query_constraint].omit = 1;
         }
-    } else if (query_constraint >= 0) {
+    } else if (ann_eligible && query_constraint >= 0) {
         pInfo->idxNum |= kVec0PlanAnnHiddenQuery;
+        pInfo->aConstraintUsage[query_constraint].argvIndex = next_argv++;
+        pInfo->aConstraintUsage[query_constraint].omit = 1;
+    } else if (match_constraint >= 0) {
+        pInfo->idxNum |= kVec0PlanExactMatch;
+        pInfo->aConstraintUsage[match_constraint].argvIndex = next_argv++;
+        pInfo->aConstraintUsage[match_constraint].omit = 1;
+        if (query_constraint >= 0) {
+            pInfo->aConstraintUsage[query_constraint].omit = 1;
+        }
+    } else if (query_constraint >= 0) {
+        pInfo->idxNum |= kVec0PlanExactHiddenQuery;
         pInfo->aConstraintUsage[query_constraint].argvIndex = next_argv++;
         pInfo->aConstraintUsage[query_constraint].omit = 1;
     }
 
-    if ((pInfo->idxNum & (kVec0PlanAnnMatch | kVec0PlanAnnHiddenQuery)) != 0) {
+    if ((pInfo->idxNum & (kVec0PlanAnnMatch | kVec0PlanAnnHiddenQuery | kVec0PlanExactMatch |
+                          kVec0PlanExactHiddenQuery)) != 0) {
         if (k_constraint >= 0) {
             pInfo->idxNum |= kVec0PlanHasK;
             pInfo->aConstraintUsage[k_constraint].argvIndex = next_argv++;
@@ -508,15 +682,41 @@ inline int vec0BestIndex(sqlite3_vtab* pVTab, sqlite3_index_info* pInfo) {
             pInfo->aConstraintUsage[rowid_in_constraint].argvIndex = next_argv++;
             pInfo->aConstraintUsage[rowid_in_constraint].omit = 1;
         }
+        if (rowid_gt_constraint >= 0) {
+            pInfo->idxNum |= kVec0PlanHasRowidGt;
+            pInfo->aConstraintUsage[rowid_gt_constraint].argvIndex = next_argv++;
+            pInfo->aConstraintUsage[rowid_gt_constraint].omit = 1;
+        }
+        if (rowid_ge_constraint >= 0) {
+            pInfo->idxNum |= kVec0PlanHasRowidGe;
+            pInfo->aConstraintUsage[rowid_ge_constraint].argvIndex = next_argv++;
+            pInfo->aConstraintUsage[rowid_ge_constraint].omit = 1;
+        }
+        if (rowid_lt_constraint >= 0) {
+            pInfo->idxNum |= kVec0PlanHasRowidLt;
+            pInfo->aConstraintUsage[rowid_lt_constraint].argvIndex = next_argv++;
+            pInfo->aConstraintUsage[rowid_lt_constraint].omit = 1;
+        }
+        if (rowid_le_constraint >= 0) {
+            pInfo->idxNum |= kVec0PlanHasRowidLe;
+            pInfo->aConstraintUsage[rowid_le_constraint].argvIndex = next_argv++;
+            pInfo->aConstraintUsage[rowid_le_constraint].omit = 1;
+        }
 
         bool orders_by_distance =
             (pInfo->nOrderBy == 1 && pInfo->aOrderBy[0].iColumn == kVec0ColDistance &&
              !pInfo->aOrderBy[0].desc);
-        pInfo->orderByConsumed = orders_by_distance ? 1 : 0;
-        pInfo->estimatedCost = 1000.0;
-        pInfo->estimatedRows = static_cast<sqlite3_int64>(kVec0DefaultK);
-        const bool is_match = (pInfo->idxNum & kVec0PlanAnnMatch) != 0;
-        pInfo->idxStr = sqlite3_mprintf(is_match ? "ann-match" : "ann-query");
+        const bool ann_plan = (pInfo->idxNum & (kVec0PlanAnnMatch | kVec0PlanAnnHiddenQuery)) != 0;
+        pInfo->orderByConsumed = (ann_plan && orders_by_distance) ? 1 : 0;
+        pInfo->estimatedCost = ann_plan ? 1000.0 : 100000.0;
+        pInfo->estimatedRows =
+            static_cast<sqlite3_int64>(k_constraint >= 0 ? kVec0DefaultK : 1000000);
+        const bool is_match = (pInfo->idxNum & (kVec0PlanAnnMatch | kVec0PlanExactMatch)) != 0;
+        if (ann_plan) {
+            pInfo->idxStr = sqlite3_mprintf(is_match ? "ann-match" : "ann-query");
+        } else {
+            pInfo->idxStr = sqlite3_mprintf(is_match ? "exact-match" : "exact-query");
+        }
         pInfo->needToFreeIdxStr = 1;
     } else {
         pInfo->estimatedCost = 1000000.0;
@@ -565,23 +765,25 @@ inline int vec0Filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char* idxS
         cursor->stmt = nullptr;
     }
 
-    if ((idxNum & (kVec0PlanAnnMatch | kVec0PlanAnnHiddenQuery)) != 0) {
+    if ((idxNum & (kVec0PlanAnnMatch | kVec0PlanAnnHiddenQuery | kVec0PlanExactMatch |
+                   kVec0PlanExactHiddenQuery)) != 0) {
         if (argc < 1) {
             cursor->eof = true;
-            return vec0_set_error(table, "vec0 ANN query missing vector argument", SQLITE_MISUSE);
+            return vec0_set_error(table, "vec0 vector query missing vector argument",
+                                  SQLITE_MISUSE);
         }
 
         int arg_idx = 0;
         Value query_value(argv[arg_idx++]);
-        size_t k = kVec0DefaultK;
+        std::optional<size_t> k;
         size_t ef_search = kVec0DefaultEfSearch;
 
         if ((idxNum & kVec0PlanHasK) != 0) {
             if (arg_idx >= argc) {
                 cursor->eof = true;
-                return vec0_set_error(table, "vec0 ANN query missing k argument", SQLITE_MISUSE);
+                return vec0_set_error(table, "vec0 vector query missing k argument", SQLITE_MISUSE);
             }
-            k = std::max<int64_t>(1, sqlite3_value_int64(argv[arg_idx++]));
+            k = static_cast<size_t>(std::max<int64_t>(1, sqlite3_value_int64(argv[arg_idx++])));
         }
 
         if ((idxNum & kVec0PlanHasEfSearch) != 0) {
@@ -590,10 +792,10 @@ inline int vec0Filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char* idxS
                 return vec0_set_error(table, "vec0 ANN query missing ef_search argument",
                                       SQLITE_MISUSE);
             }
-            ef_search =
-                std::max<int64_t>(static_cast<int64_t>(k), sqlite3_value_int64(argv[arg_idx++]));
+            ef_search = std::max<int64_t>(static_cast<int64_t>(k.value_or(kVec0DefaultK)),
+                                          sqlite3_value_int64(argv[arg_idx++]));
         } else {
-            ef_search = std::max(ef_search, k);
+            ef_search = std::max(ef_search, k.value_or(kVec0DefaultK));
         }
 
         auto rowid_filter = vec0_extract_rowid_filter(idxNum, argc, argv, arg_idx);
@@ -602,22 +804,28 @@ inline int vec0Filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char* idxS
             return vec0_set_error(table, rowid_filter.error().message, SQLITE_ERROR);
         }
 
-        auto ann_results =
-            vec0_run_ann_query(table, query_value, k, ef_search, rowid_filter.value());
-        if (!ann_results) {
+        const bool ann_plan = (idxNum & (kVec0PlanAnnMatch | kVec0PlanAnnHiddenQuery)) != 0;
+        auto buffered_results =
+            ann_plan ? vec0_run_ann_query(table, query_value, *k, ef_search, rowid_filter.value())
+                     : vec0_run_exact_query(table, query_value, k, rowid_filter.value());
+        if (!buffered_results) {
             cursor->eof = true;
-            return vec0_set_error(table, ann_results.error().message, SQLITE_ERROR);
+            return vec0_set_error(table, buffered_results.error().message, SQLITE_ERROR);
         }
 
-        auto ann_index = vec0_ensure_ann_index(table);
-        if (!ann_index) {
-            cursor->eof = true;
-            return vec0_set_error(table, ann_index.error().message, SQLITE_ERROR);
+        if (ann_plan) {
+            auto ann_index = vec0_ensure_ann_index(table);
+            if (!ann_index) {
+                cursor->eof = true;
+                return vec0_set_error(table, ann_index.error().message, SQLITE_ERROR);
+            }
+            cursor->ann_index = ann_index.value();
+        } else {
+            cursor->ann_index.reset();
         }
 
         cursor->ann_mode = true;
-        cursor->ann_results = std::move(ann_results.value());
-        cursor->ann_index = ann_index.value();
+        cursor->ann_results = std::move(buffered_results.value());
         cursor->eof = cursor->ann_results.empty();
         if (!cursor->eof) {
             cursor->current_rowid = cursor->ann_results[0].first;
@@ -705,21 +913,42 @@ inline int vec0Column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int co
         }
 
         if (col == kVec0ColEmbedding) {
-            if (!cursor->ann_index) {
-                sqlite3_result_null(ctx);
-                return SQLITE_OK;
+            if (cursor->ann_index) {
+                const auto* node =
+                    cursor->ann_index->get_node(static_cast<size_t>(cursor->current_rowid));
+                if (node && !node->vector.empty()) {
+                    sqlite3_result_blob(ctx, node->vector.data(),
+                                        static_cast<int>(node->vector.size() * sizeof(float)),
+                                        SQLITE_TRANSIENT);
+                    return SQLITE_OK;
+                }
             }
 
-            const auto* node =
-                cursor->ann_index->get_node(static_cast<size_t>(cursor->current_rowid));
-            if (!node || node->vector.empty()) {
+            sqlite3_stmt* stmt = nullptr;
+            std::string sql = "SELECT \"" + cursor->table->embedding_column + "\" FROM " +
+                              vec0_vectors_table_name(*cursor->table) + " WHERE rowid=?";
+            int rc = sqlite3_prepare_v2(cursor->table->db, sql.c_str(), -1, &stmt, nullptr);
+            if (rc != SQLITE_OK || !stmt) {
                 sqlite3_result_null(ctx);
+                if (stmt) {
+                    sqlite3_finalize(stmt);
+                }
                 return SQLITE_OK;
             }
-
-            sqlite3_result_blob(ctx, node->vector.data(),
-                                static_cast<int>(node->vector.size() * sizeof(float)),
-                                SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 1, cursor->current_rowid);
+            rc = sqlite3_step(stmt);
+            if (rc == SQLITE_ROW) {
+                const void* blob = sqlite3_column_blob(stmt, 0);
+                int bytes = sqlite3_column_bytes(stmt, 0);
+                if (blob && bytes > 0) {
+                    sqlite3_result_blob(ctx, blob, bytes, SQLITE_TRANSIENT);
+                } else {
+                    sqlite3_result_null(ctx);
+                }
+            } else {
+                sqlite3_result_null(ctx);
+            }
+            sqlite3_finalize(stmt);
             return SQLITE_OK;
         }
 
