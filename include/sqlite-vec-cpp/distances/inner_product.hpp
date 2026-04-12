@@ -173,6 +173,11 @@ float inner_product_distance(std::span<const T> a, std::span<const T> b) {
             return simd::inner_product_int8_neon(a, b);
         }
 #endif
+#ifdef SQLITE_VEC_ENABLE_AVX2
+        if (a.size() >= 16) {
+            return simd::inner_product_int8_avx2(a, b);
+        }
+#endif
         return inner_product_distance_int(a, b);
     } else if constexpr (concepts::IntegerElement<T>) {
         return inner_product_distance_int(a, b);

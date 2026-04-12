@@ -333,4 +333,65 @@ BENCHMARK(BM_Int8_InnerProduct_Scalar_384);
 
 #endif // SQLITE_VEC_ENABLE_NEON
 
+// ============================================================================
+// AVX2 int8 Benchmarks
+// ============================================================================
+
+#if defined(SQLITE_VEC_ENABLE_AVX2)
+#include "../include/sqlite-vec-cpp/simd/avx.hpp"
+
+static void BM_Int8_L2_AVX2_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        float result = simd::l2_distance_int8_avx2(std::span<const int8_t>(a),
+                                                    std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_L2_AVX2_384);
+
+static void BM_Int8_Cosine_AVX2_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        float result = simd::cosine_distance_int8_avx2(std::span<const int8_t>(a),
+                                                        std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_Cosine_AVX2_384);
+
+static void BM_Int8_InnerProduct_AVX2_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        float result = simd::inner_product_int8_avx2(std::span<const int8_t>(a),
+                                                      std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_InnerProduct_AVX2_384);
+
+static void BM_L1_Float_AVX_128(benchmark::State& state) {
+    auto a = generate_random_vector<float>(128);
+    auto b = generate_random_vector<float>(128);
+
+    for (auto _ : state) {
+        float result = simd::l1_distance_float_avx(std::span<const float>(a),
+                                                    std::span<const float>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 128);
+}
+BENCHMARK(BM_L1_Float_AVX_128);
+
+#endif // SQLITE_VEC_ENABLE_AVX2
+
 BENCHMARK_MAIN();

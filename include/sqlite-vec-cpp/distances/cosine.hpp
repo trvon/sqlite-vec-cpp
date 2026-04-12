@@ -125,6 +125,11 @@ float cosine_distance(std::span<const T> a, std::span<const T> b) {
             return simd::cosine_distance_int8_neon(a, b);
         }
 #endif
+#ifdef SQLITE_VEC_ENABLE_AVX2
+        if (a.size() >= 16) {
+            return simd::cosine_distance_int8_avx2(a, b);
+        }
+#endif
         return cosine_distance_int(a, b);
     } else if constexpr (concepts::IntegerElement<T>) {
         return cosine_distance_int(a, b);

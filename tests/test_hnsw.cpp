@@ -21,6 +21,16 @@ using namespace sqlite_vec_cpp::index;
 using namespace sqlite_vec_cpp::distances;
 using namespace sqlite_vec_cpp::utils;
 
+// Detect sanitizer builds — TSAN/ASAN add 10-20x overhead to atomics/locks,
+// so we reduce corpus sizes to keep tests within CI timeout.
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define SQLITE_VEC_SANITIZER_BUILD 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define SQLITE_VEC_SANITIZER_BUILD 1
+#endif
+#endif
+
 // Helper to compare floats with tolerance
 bool approx_equal(float a, float b, float epsilon = 0.001f) {
     return std::abs(a - b) < epsilon;
@@ -813,7 +823,11 @@ void test_graph_stats() {
 void test_adaptive_search() {
     std::cout << "Test 20: Adaptive ef_search..." << std::endl;
 
+#ifdef SQLITE_VEC_SANITIZER_BUILD
+    constexpr size_t num_vectors = 1000;
+#else
     constexpr size_t num_vectors = 5000;
+#endif
     constexpr size_t dim = 128;
     constexpr size_t k = 10;
     std::mt19937 rng(42);
@@ -1036,7 +1050,13 @@ void test_normalized_build_correctness() {
 void test_normalized_recall_parity() {
     std::cout << "Test 23: Normalized vs non-normalized recall parity..." << std::endl;
 
+#ifdef SQLITE_VEC_SANITIZER_BUILD
+    constexpr size_t num_vectors = 500;
+    constexpr size_t ef_c = 100;
+#else
     constexpr size_t num_vectors = 2000;
+    constexpr size_t ef_c = 200;
+#endif
     constexpr size_t dim = 128;
     constexpr size_t k = 10;
 
@@ -1053,13 +1073,13 @@ void test_normalized_recall_parity() {
     using CosineIndex = HNSWIndex<float, CosineMetric<float>>;
     CosineIndex::Config cfg_normal;
     cfg_normal.normalize_vectors = false;
-    cfg_normal.ef_construction = 200;
+    cfg_normal.ef_construction = ef_c;
     CosineIndex normal_index(cfg_normal);
 
     // Build normalized index
     CosineIndex::Config cfg_norm;
     cfg_norm.normalize_vectors = true;
-    cfg_norm.ef_construction = 200;
+    cfg_norm.ef_construction = ef_c;
     CosineIndex norm_index(cfg_norm);
 
     for (size_t i = 0; i < num_vectors; ++i) {

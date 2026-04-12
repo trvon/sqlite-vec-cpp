@@ -80,6 +80,11 @@ template <concepts::VectorElement T> float l2_distance(std::span<const T> a, std
 #endif
         return l2_distance_float(a, b);
     } else if constexpr (std::is_same_v<T, std::int8_t>) {
+#ifdef SQLITE_VEC_ENABLE_AVX2
+        if (a.size() >= 16) {
+            return simd::l2_distance_int8_avx2(a, b);
+        }
+#endif
 #ifdef SQLITE_VEC_ENABLE_NEON
         if (a.size() > 7) {
             return simd::l2_distance_int8_neon(a, b);

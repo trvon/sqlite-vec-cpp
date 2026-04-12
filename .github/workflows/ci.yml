@@ -91,6 +91,37 @@ jobs:
           path: coverage/
 
   # =============================================================================
+  # Linux Tests (AVX/AVX2 SIMD)
+  # =============================================================================
+  test-linux-avx:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson \
+            ninja-build \
+            pkg-config \
+            libsqlite3-dev
+
+      - name: Configure (AVX enabled)
+        run: |
+          meson setup build_avx \
+            -Dbuildtype=debugoptimized \
+            -Denable_simd_avx=true \
+            -Denable_simd_neon=false
+
+      - name: Build
+        run: meson compile -C build_avx
+
+      - name: Test
+        run: meson test -C build_avx
+
+  # =============================================================================
   # Linux TSAN
   # =============================================================================
   tsan-linux:
@@ -148,12 +179,12 @@ jobs:
             libsqlite3-dev \
             libbenchmark-dev
 
-      - name: Configure (release + benchmarks, no SIMD)
+      - name: Configure (release + benchmarks, AVX enabled)
         run: |
           meson setup build_bench \
             -Dbuildtype=release \
             -Denable_benchmarks=true \
-            -Denable_simd_avx=false \
+            -Denable_simd_avx=true \
             -Denable_simd_neon=false
 
       - name: Build

@@ -374,6 +374,12 @@ struct LVQ4 {
                 l2_distance_neon(query.data(), code.codes.data(), original_dim, inv_scale, offset);
         } else
 #endif
+#ifdef SQLITE_VEC_ENABLE_AVX2
+        if (original_dim >= 32) {
+            sum_sq = l2_distance_avx2(query.data(), code.codes.data(), original_dim, inv_scale,
+                                       offset);
+        } else
+#endif
         {
             sum_sq = l2_distance_scalar(query.data(), code.codes.data(), original_dim, inv_scale,
                                         offset);
@@ -479,6 +485,91 @@ private:
         float sum = vaddvq_f32(total);
 
         // Scalar tail for remaining dims
+        while (i < dim) {
+            uint8_t c = (i % 2 == 0) ? (codes[i / 2] & 0x0F) : ((codes[i / 2] >> 4) & 0x0F);
+            float q_normalized = (query[i] - offset) * inv_scale;
+            float diff = q_normalized - static_cast<float>(c);
+            sum += diff * diff;
+            ++i;
+        }
+
+        return sum;
+    }
+#endif
+
+#ifdef SQLITE_VEC_ENABLE_AVX2
+    /// AVX2 LVQ-4 L2 distance: process 32 dims (16 packed bytes) per iteration
+    static float l2_distance_avx2(const float* query, const uint8_t* codes, size_t dim,
+                                  float inv_scale, float offset) {
+        const size_t end32 = (dim / 32) * 32;
+
+        __m256 voffset = _mm256_set1_ps(offset);
+        __m256 vinv_scale = _mm256_set1_ps(inv_scale);
+        __m256 sum0 = _mm256_setzero_ps();
+        __m256 sum1 = _mm256_setzero_ps();
+
+        // Nibble mask: 0x0F repeated
+        __m128i mask_lo = _mm_set1_epi8(0x0F);
+
+        size_t i = 0;
+        while (i < end32) {
+            // Load 16 packed bytes = 32 nibbles = 32 dimensions
+            __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes + i / 2));
+
+            // Extract low nibbles (even dims) and high nibbles (odd dims)
+            __m128i lo_nibbles = _mm_and_si128(packed, mask_lo);
+            __m128i hi_nibbles = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_lo);
+
+            // Interleave to natural order: lo[0],hi[0],lo[1],hi[1],...
+            __m128i unpacked_0_15 = _mm_unpacklo_epi8(lo_nibbles, hi_nibbles);
+            __m128i unpacked_16_31 = _mm_unpackhi_epi8(lo_nibbles, hi_nibbles);
+
+            // === Process dims i..i+15 ===
+            // Widen first 8 bytes to int32 then float
+            __m256i codes32_a = _mm256_cvtepu8_epi32(unpacked_0_15);
+            __m256 cf_a = _mm256_cvtepi32_ps(codes32_a);
+            __m256 q_a = _mm256_loadu_ps(query + i);
+            __m256 qn_a = _mm256_mul_ps(_mm256_sub_ps(q_a, voffset), vinv_scale);
+            __m256 d_a = _mm256_sub_ps(qn_a, cf_a);
+            sum0 = _mm256_fmadd_ps(d_a, d_a, sum0);
+
+            // Widen next 8 bytes
+            __m128i upper_0_15 = _mm_srli_si128(unpacked_0_15, 8);
+            __m256i codes32_b = _mm256_cvtepu8_epi32(upper_0_15);
+            __m256 cf_b = _mm256_cvtepi32_ps(codes32_b);
+            __m256 q_b = _mm256_loadu_ps(query + i + 8);
+            __m256 qn_b = _mm256_mul_ps(_mm256_sub_ps(q_b, voffset), vinv_scale);
+            __m256 d_b = _mm256_sub_ps(qn_b, cf_b);
+            sum1 = _mm256_fmadd_ps(d_b, d_b, sum1);
+
+            // === Process dims i+16..i+31 ===
+            __m256i codes32_c = _mm256_cvtepu8_epi32(unpacked_16_31);
+            __m256 cf_c = _mm256_cvtepi32_ps(codes32_c);
+            __m256 q_c = _mm256_loadu_ps(query + i + 16);
+            __m256 qn_c = _mm256_mul_ps(_mm256_sub_ps(q_c, voffset), vinv_scale);
+            __m256 d_c = _mm256_sub_ps(qn_c, cf_c);
+            sum0 = _mm256_fmadd_ps(d_c, d_c, sum0);
+
+            __m128i upper_16_31 = _mm_srli_si128(unpacked_16_31, 8);
+            __m256i codes32_d = _mm256_cvtepu8_epi32(upper_16_31);
+            __m256 cf_d = _mm256_cvtepi32_ps(codes32_d);
+            __m256 q_d = _mm256_loadu_ps(query + i + 24);
+            __m256 qn_d = _mm256_mul_ps(_mm256_sub_ps(q_d, voffset), vinv_scale);
+            __m256 d_d = _mm256_sub_ps(qn_d, cf_d);
+            sum1 = _mm256_fmadd_ps(d_d, d_d, sum1);
+
+            i += 32;
+        }
+
+        __m256 total = _mm256_add_ps(sum0, sum1);
+        __m128 hi128 = _mm256_extractf128_ps(total, 1);
+        __m128 lo128 = _mm256_castps256_ps128(total);
+        __m128 sum128 = _mm_add_ps(lo128, hi128);
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        float sum = _mm_cvtss_f32(sum128);
+
+        // Scalar tail
         while (i < dim) {
             uint8_t c = (i % 2 == 0) ? (codes[i / 2] & 0x0F) : ((codes[i / 2] >> 4) & 0x0F);
             float q_normalized = (query[i] - offset) * inv_scale;

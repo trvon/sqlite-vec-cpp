@@ -9,6 +9,10 @@
 #include "../concepts/vector_element.hpp"
 
 // Include SIMD implementations
+#ifdef SQLITE_VEC_ENABLE_AVX
+#include "../simd/avx.hpp"
+#endif
+
 #ifdef SQLITE_VEC_ENABLE_NEON
 #include "../simd/neon.hpp"
 #endif
@@ -60,6 +64,11 @@ template <concepts::VectorElement T> float l1_distance(std::span<const T> a, std
     assert(a.size() == b.size() && "Vector dimensions must match");
 
     if constexpr (std::is_same_v<T, float>) {
+#ifdef SQLITE_VEC_ENABLE_AVX
+        if (a.size() >= 8) {
+            return simd::l1_distance_float_avx(a, b);
+        }
+#endif
 #ifdef SQLITE_VEC_ENABLE_NEON
         if (a.size() > 3) {
             return static_cast<float>(simd::l1_distance_float_neon(a, b));
