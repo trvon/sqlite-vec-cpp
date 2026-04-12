@@ -260,6 +260,62 @@ void test_simd_consistency() {
     std::cout << "  SIMD consistency tests passed!" << std::endl;
 }
 
+void test_int8_neon_consistency() {
+    std::cout << "Testing int8 NEON vs scalar consistency..." << std::endl;
+
+#ifdef SQLITE_VEC_ENABLE_NEON
+    // Generate deterministic int8 vectors large enough for NEON (>= 16 elements)
+    constexpr size_t dims = 384;
+    std::vector<std::int8_t> a(dims), b(dims);
+    for (size_t i = 0; i < dims; ++i) {
+        a[i] = static_cast<std::int8_t>((i * 7 + 13) % 255 - 127);
+        b[i] = static_cast<std::int8_t>((i * 11 + 37) % 255 - 127);
+    }
+
+    // Cosine: dispatch (NEON) vs scalar
+    float cosine_dispatch = cosine_distance(std::span<const std::int8_t>(a),
+                                            std::span<const std::int8_t>(b));
+    float cosine_scalar = cosine_distance_int(std::span<const std::int8_t>(a),
+                                              std::span<const std::int8_t>(b));
+    assert(approx_equal(cosine_dispatch, cosine_scalar, 1e-4f));
+    assert(!std::isnan(cosine_dispatch));
+    assert(cosine_dispatch >= 0.0f && cosine_dispatch <= 2.0f);
+
+    // Inner product: dispatch (NEON) vs scalar
+    float ip_dispatch = inner_product_distance(std::span<const std::int8_t>(a),
+                                               std::span<const std::int8_t>(b));
+    float ip_scalar = inner_product_distance_int(std::span<const std::int8_t>(a),
+                                                 std::span<const std::int8_t>(b));
+    assert(approx_equal(ip_dispatch, ip_scalar, 1e-4f));
+    assert(!std::isnan(ip_dispatch));
+
+    // Test multiple dimensions to exercise both NEON and scalar tails
+    for (size_t dim : {16, 17, 32, 63, 128, 384, 768}) {
+        std::vector<std::int8_t> va(dim), vb(dim);
+        for (size_t i = 0; i < dim; ++i) {
+            va[i] = static_cast<std::int8_t>((i * 3 + 5) % 255 - 127);
+            vb[i] = static_cast<std::int8_t>((i * 9 + 17) % 255 - 127);
+        }
+
+        float cos_d = cosine_distance(std::span<const std::int8_t>(va),
+                                       std::span<const std::int8_t>(vb));
+        float cos_s = cosine_distance_int(std::span<const std::int8_t>(va),
+                                           std::span<const std::int8_t>(vb));
+        assert(approx_equal(cos_d, cos_s, 1e-4f));
+
+        float ip_d = inner_product_distance(std::span<const std::int8_t>(va),
+                                             std::span<const std::int8_t>(vb));
+        float ip_s = inner_product_distance_int(std::span<const std::int8_t>(va),
+                                                 std::span<const std::int8_t>(vb));
+        assert(approx_equal(ip_d, ip_s, 1e-4f));
+    }
+
+    std::cout << "  int8 NEON consistency tests passed!" << std::endl;
+#else
+    std::cout << "  (skipped: NEON not enabled)" << std::endl;
+#endif
+}
+
 int main() {
     try {
         test_l2_distance();
@@ -269,6 +325,7 @@ int main() {
         test_hamming_distance_unaligned();
         test_metric_traits();
         test_simd_consistency();
+        test_int8_neon_consistency();
 
         std::cout << "\nAll distance metric tests passed! ✓" << std::endl;
         return 0;

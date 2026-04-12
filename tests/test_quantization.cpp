@@ -17,6 +17,7 @@
 #include <sqlite-vec-cpp/index/hnsw_quantized.hpp>
 #include <sqlite-vec-cpp/quantization/lvq.hpp>
 #include <sqlite-vec-cpp/quantization/rabitq.hpp>
+#include <sqlite-vec-cpp/quantization/store.hpp>
 
 using namespace sqlite_vec_cpp::quantization;
 using namespace sqlite_vec_cpp::distances;
@@ -826,6 +827,64 @@ void test_snapshot_rebuild_consistency() {
     std::cout << "  PASS: snapshot rebuild produces identical results" << std::endl;
 }
 
+void test_store_snapshot_builds() {
+    std::cout << "Testing direct snapshot-based store builds..." << std::endl;
+
+    std::mt19937 rng(31415);
+    const size_t dim = 32;
+    const size_t corpus_size = 24;
+
+    HNSWIndex<float, L2Metric<float>> index;
+    std::vector<std::vector<float>> corpus;
+    corpus.reserve(corpus_size);
+    for (size_t i = 0; i < corpus_size; ++i) {
+        corpus.push_back(generate_vector(dim, rng));
+        index.insert_single_threaded(i, std::span<const float>(corpus.back()));
+    }
+
+    auto snap = index.snapshot_for_quantization();
+    assert(snap.entries.size() == corpus_size);
+    assert(snap.dim == dim);
+    assert(snap.generation == index.mutation_generation());
+
+    LVQ8Store lvq8_store;
+    LVQ4Store lvq4_store;
+    RaBitQStore rabitq_store;
+    lvq8_store.build(snap);
+    lvq4_store.build(snap);
+    rabitq_store.build(snap);
+
+    assert(lvq8_store.count == corpus_size);
+    assert(lvq8_store.dim == dim);
+    assert(lvq4_store.count == corpus_size);
+    assert(lvq4_store.dim == dim);
+    assert(rabitq_store.count == corpus_size);
+    assert(rabitq_store.dim == dim);
+    assert(rabitq_store.centroid.size() == dim);
+
+    auto query = generate_vector(dim, rng);
+    auto query_span = std::span<const float>(query);
+    auto rabitq_qs = rabitq_store.prepare_query(query_span);
+
+    for (const auto& entry : snap.entries) {
+        auto lvq8_code = LVQ8::encode(std::span<const float>(entry.vector));
+        float lvq8_expected = LVQ8::l2_distance(query_span, lvq8_code);
+        float lvq8_observed = lvq8_store.l2_distance(query_span, entry.dense_id);
+        assert(approx_equal(lvq8_expected, lvq8_observed, 0.0001f));
+
+        auto lvq4_code = LVQ4::encode(std::span<const float>(entry.vector));
+        float lvq4_expected = LVQ4::l2_distance(query_span, lvq4_code, dim);
+        float lvq4_observed = lvq4_store.l2_distance(query_span, entry.dense_id);
+        assert(approx_equal(lvq4_expected, lvq4_observed, 0.0001f));
+
+        float rabitq_dist = rabitq_store.l2_distance(rabitq_qs, entry.dense_id);
+        assert(std::isfinite(rabitq_dist));
+        assert(rabitq_dist >= 0.0f);
+    }
+
+    std::cout << "  PASS: snapshot-based store builds are valid" << std::endl;
+}
+
 void test_concurrent_insert_snapshot_staleness() {
     std::cout << "Testing concurrent insert snapshot staleness..." << std::endl;
 
@@ -927,6 +986,7 @@ int main() {
     test_stale_isolate_deleted();
     test_stale_restore_and_clear();
     test_snapshot_rebuild_consistency();
+    test_store_snapshot_builds();
     test_concurrent_insert_snapshot_staleness();
     std::cout << std::endl;
 

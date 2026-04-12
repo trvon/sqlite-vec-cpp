@@ -399,6 +399,45 @@ TEST_CASE_METHOD(DistanceMetricsFixture, "SIMD vs Scalar consistency", "[distanc
         REQUIRE(dist >= 0.0f);
         REQUIRE(dist <= 2.0f);
     }
+
+    SECTION("Int8 cosine: NEON vs scalar consistency") {
+        auto a = makeRandomVector<int8_t>(384, int8_t{-100}, int8_t{100});
+        auto b = makeRandomVector<int8_t>(384, int8_t{-100}, int8_t{100});
+
+        // This calls the dispatch function which uses NEON for size >= 16
+        auto dist_dispatch = cosine_distance(std::span{a}, std::span{b});
+        // Force scalar path
+        auto dist_scalar = cosine_distance_int(std::span<const int8_t>{a}, std::span<const int8_t>{b});
+
+        REQUIRE(std::isfinite(dist_dispatch));
+        REQUIRE(dist_dispatch >= 0.0f);
+        REQUIRE(dist_dispatch <= 2.0f);
+        REQUIRE_THAT(dist_dispatch, WithinRel(dist_scalar, 1e-4));
+    }
+
+    SECTION("Int8 inner product: NEON vs scalar consistency") {
+        auto a = makeRandomVector<int8_t>(384, int8_t{-100}, int8_t{100});
+        auto b = makeRandomVector<int8_t>(384, int8_t{-100}, int8_t{100});
+
+        auto dist_dispatch = inner_product_distance(std::span{a}, std::span{b});
+        auto dist_scalar = inner_product_distance_int(std::span<const int8_t>{a}, std::span<const int8_t>{b});
+
+        REQUIRE(std::isfinite(dist_dispatch));
+        REQUIRE_THAT(dist_dispatch, WithinRel(dist_scalar, 1e-4));
+    }
+
+    SECTION("Int8 cosine: multiple dimensions trigger NEON") {
+        for (auto dims : {32, 128, 384, 768}) {
+            auto a = makeRandomVector<int8_t>(dims, int8_t{-127}, int8_t{127});
+            auto b = makeRandomVector<int8_t>(dims, int8_t{-127}, int8_t{127});
+
+            auto dist_dispatch = cosine_distance(std::span{a}, std::span{b});
+            auto dist_scalar = cosine_distance_int(std::span<const int8_t>{a}, std::span<const int8_t>{b});
+
+            REQUIRE(std::isfinite(dist_dispatch));
+            REQUIRE_THAT(dist_dispatch, WithinRel(dist_scalar, 1e-4));
+        }
+    }
 }
 #endif
 

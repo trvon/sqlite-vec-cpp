@@ -36,44 +36,6 @@ struct LVQ8Store {
     /// Number of vectors stored
     size_t count = 0;
 
-    /// Build from an HNSW index. Iterates nodes, encodes each vector,
-    /// and stores the code at the position of node.dense_id.
-    template <typename IndexT> void build(const IndexT& index) {
-        if (index.empty())
-            return;
-
-        // Determine max dense_id and dimensionality
-        size_t max_dense_id = 0;
-        for (const auto& [id, node] : index) {
-            max_dense_id = std::max(max_dense_id, node.dense_id);
-            if (dim == 0)
-                dim = node.vector.size();
-        }
-
-        count = max_dense_id + 1;
-        codes.resize(count * dim, 0);
-        scales.resize(count, 0.0f);
-        offsets.resize(count, 0.0f);
-
-        for (const auto& [id, node] : index) {
-            // Get float vector
-            std::vector<float> fvec;
-            std::span<const float> vec_span;
-            if constexpr (std::same_as<typename IndexT::NodeType::value_type, float>) {
-                vec_span = node.as_span();
-            } else {
-                fvec = index.to_float_vector(node.as_span());
-                vec_span = std::span<const float>(fvec);
-            }
-
-            auto code = LVQ8::encode(vec_span);
-            size_t offset = node.dense_id * dim;
-            std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
-            scales[node.dense_id] = code.scale;
-            offsets[node.dense_id] = code.offset;
-        }
-    }
-
     /// Build from a locked quantization snapshot (preferred — no live graph iteration)
     void build(const index::QuantizationSnapshot& snap) {
         if (snap.entries.empty())
@@ -230,42 +192,6 @@ struct LVQ4Store {
     size_t bytes_per_vec = 0;
     /// Number of vectors stored
     size_t count = 0;
-
-    /// Build from an HNSW index
-    template <typename IndexT> void build(const IndexT& index) {
-        if (index.empty())
-            return;
-
-        size_t max_dense_id = 0;
-        for (const auto& [id, node] : index) {
-            max_dense_id = std::max(max_dense_id, node.dense_id);
-            if (dim == 0)
-                dim = node.vector.size();
-        }
-
-        bytes_per_vec = (dim + 1) / 2;
-        count = max_dense_id + 1;
-        codes.resize(count * bytes_per_vec, 0);
-        scales.resize(count, 0.0f);
-        offsets.resize(count, 0.0f);
-
-        for (const auto& [id, node] : index) {
-            std::vector<float> fvec;
-            std::span<const float> vec_span;
-            if constexpr (std::same_as<typename IndexT::NodeType::value_type, float>) {
-                vec_span = node.as_span();
-            } else {
-                fvec = index.to_float_vector(node.as_span());
-                vec_span = std::span<const float>(fvec);
-            }
-
-            auto code = LVQ4::encode(vec_span);
-            size_t offset = node.dense_id * bytes_per_vec;
-            std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
-            scales[node.dense_id] = code.scale;
-            offsets[node.dense_id] = code.offset;
-        }
-    }
 
     /// Build from a locked quantization snapshot (preferred — no live graph iteration)
     void build(const index::QuantizationSnapshot& snap) {
@@ -457,64 +383,6 @@ struct RaBitQStore {
     size_t dim = 0;
     /// Number of vectors stored
     size_t count = 0;
-
-    /// Build from an HNSW index
-    template <typename IndexT> void build(const IndexT& index) {
-        if (index.empty())
-            return;
-
-        // Collect vectors for centroid computation
-        size_t max_dense_id = 0;
-        std::vector<std::vector<float>> all_vecs;
-        std::vector<size_t> dense_ids;
-
-        for (const auto& [id, node] : index) {
-            max_dense_id = std::max(max_dense_id, node.dense_id);
-            if (dim == 0)
-                dim = node.vector.size();
-
-            std::vector<float> fvec;
-            if constexpr (std::same_as<typename IndexT::NodeType::value_type, float>) {
-                fvec.assign(node.vector.begin(), node.vector.end());
-            } else {
-                fvec = index.to_float_vector(node.as_span());
-            }
-            all_vecs.push_back(std::move(fvec));
-            dense_ids.push_back(node.dense_id);
-        }
-
-        // Compute centroid
-        centroid.assign(dim, 0.0f);
-        for (const auto& v : all_vecs) {
-            for (size_t i = 0; i < dim; ++i)
-                centroid[i] += v[i];
-        }
-        float inv_n = 1.0f / static_cast<float>(all_vecs.size());
-        for (size_t i = 0; i < dim; ++i)
-            centroid[i] *= inv_n;
-
-        // Encode all vectors
-        bytes_per_vec = (dim + 7) / 8;
-        count = max_dense_id + 1;
-        bits.resize(count * bytes_per_vec, 0);
-        norms.resize(count, 0.0f);
-
-        for (size_t idx = 0; idx < all_vecs.size(); ++idx) {
-            const auto& vec = all_vecs[idx];
-            size_t did = dense_ids[idx];
-            size_t bit_offset = did * bytes_per_vec;
-
-            float norm_sq = 0.0f;
-            for (size_t i = 0; i < dim; ++i) {
-                float centered = vec[i] - centroid[i];
-                norm_sq += vec[i] * vec[i];
-                if (centered >= 0.0f) {
-                    bits[bit_offset + i / 8] |= (1u << (i % 8));
-                }
-            }
-            norms[did] = std::sqrt(norm_sq);
-        }
-    }
 
     /// Build from a locked quantization snapshot (preferred — no live graph iteration)
     void build(const index::QuantizationSnapshot& snap) {

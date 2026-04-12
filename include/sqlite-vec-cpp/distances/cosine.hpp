@@ -115,6 +115,17 @@ float cosine_distance(std::span<const T> a, std::span<const T> b) {
         }
 #endif
         return cosine_distance_float(a, b);
+    } else if constexpr (std::is_same_v<T, std::int8_t>) {
+#if defined(SQLITE_VEC_ENABLE_NEON) && defined(__ARM_FEATURE_DOTPROD)
+        if (a.size() >= 16) {
+            return simd::cosine_distance_int8_neon_dotprod(a, b);
+        }
+#elif defined(SQLITE_VEC_ENABLE_NEON)
+        if (a.size() >= 16) {
+            return simd::cosine_distance_int8_neon(a, b);
+        }
+#endif
+        return cosine_distance_int(a, b);
     } else if constexpr (concepts::IntegerElement<T>) {
         return cosine_distance_int(a, b);
     } else {

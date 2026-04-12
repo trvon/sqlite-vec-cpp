@@ -4,6 +4,6 @@ option('enable_benchmarks', type: 'boolean', value: false, description: 'Build b
 option('enable_simd_avx', type: 'boolean', value: false, description: 'Enable x86 AVX/AVX2/FMA/AVX-512 optimizations (non-portable)')
 option('enable_simd_neon', type: 'boolean', value: true, description: 'Enable baseline AArch64 NEON optimizations')
 option('enable_simd_arm32_neon', type: 'boolean', value: false, description: 'Enable 32-bit ARM NEON optimizations via -mfpu=neon (non-portable)')
-option('enable_simd_dotprod', type: 'boolean', value: false, description: 'Enable AArch64 ARM DotProd via -march=armv8.2-a+dotprod (non-portable)')
+option('enable_simd_dotprod', type: 'boolean', value: true, description: 'Enable AArch64 ARM DotProd via -march=armv8.2-a+dotprod (compile-tested; safe on Apple Silicon)')
 option('use_system_expected', type: 'boolean', value: false, description: 'Use system-provided tl::expected if C++23 unavailable')
 option('zvec-root', type: 'string', value: '', description: 'Path to zvec source/build tree for hnsw engine comparison benchmark')

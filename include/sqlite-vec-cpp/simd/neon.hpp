@@ -279,6 +279,90 @@ inline float cosine_distance_float_neon(std::span<const float> a, std::span<cons
     return 1.0f - (dot / denom);
 }
 
+/// NEON-optimized inner product distance for int8 vectors (widening, no DotProd required)
+/// Uses int8→int16 widening + multiply + pairwise-add to int32.
+/// Processes 8 int8 values per iteration.
+inline float inner_product_int8_neon(std::span<const std::int8_t> a,
+                                     std::span<const std::int8_t> b) {
+    const std::size_t size = a.size();
+    std::int32_t dot_scalar = 0;
+    std::size_t i = 0;
+
+    while (i + 7 < size) {
+        int8x8_t v1 = vld1_s8(&a[i]);
+        int8x8_t v2 = vld1_s8(&b[i]);
+
+        int16x8_t v1_wide = vmovl_s8(v1);
+        int16x8_t v2_wide = vmovl_s8(v2);
+
+        int16x8_t prod = vmulq_s16(v1_wide, v2_wide);
+        int32x4_t sum = vpaddlq_s16(prod);
+
+        dot_scalar += vgetq_lane_s32(sum, 0) + vgetq_lane_s32(sum, 1) +
+                      vgetq_lane_s32(sum, 2) + vgetq_lane_s32(sum, 3);
+        i += 8;
+    }
+
+    while (i < size) {
+        dot_scalar += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
+        ++i;
+    }
+
+    return 1.0f - static_cast<float>(dot_scalar);
+}
+
+/// NEON-optimized cosine distance for int8 vectors (widening, no DotProd required)
+/// Computes dot(a,b), ||a||², ||b||² simultaneously using int8→int16→int32 widening.
+/// Processes 8 int8 values per iteration.
+inline float cosine_distance_int8_neon(std::span<const std::int8_t> a,
+                                       std::span<const std::int8_t> b) {
+    const std::size_t size = a.size();
+    std::int32_t dot_scalar = 0;
+    std::int32_t a_mag_scalar = 0;
+    std::int32_t b_mag_scalar = 0;
+    std::size_t i = 0;
+
+    while (i + 7 < size) {
+        int8x8_t v1 = vld1_s8(&a[i]);
+        int8x8_t v2 = vld1_s8(&b[i]);
+
+        int16x8_t v1_wide = vmovl_s8(v1);
+        int16x8_t v2_wide = vmovl_s8(v2);
+
+        int16x8_t dot_prod = vmulq_s16(v1_wide, v2_wide);
+        int16x8_t a_sq = vmulq_s16(v1_wide, v1_wide);
+        int16x8_t b_sq = vmulq_s16(v2_wide, v2_wide);
+
+        int32x4_t dot_sum = vpaddlq_s16(dot_prod);
+        int32x4_t a_sum = vpaddlq_s16(a_sq);
+        int32x4_t b_sum = vpaddlq_s16(b_sq);
+
+        dot_scalar += vgetq_lane_s32(dot_sum, 0) + vgetq_lane_s32(dot_sum, 1) +
+                      vgetq_lane_s32(dot_sum, 2) + vgetq_lane_s32(dot_sum, 3);
+        a_mag_scalar += vgetq_lane_s32(a_sum, 0) + vgetq_lane_s32(a_sum, 1) +
+                        vgetq_lane_s32(a_sum, 2) + vgetq_lane_s32(a_sum, 3);
+        b_mag_scalar += vgetq_lane_s32(b_sum, 0) + vgetq_lane_s32(b_sum, 1) +
+                        vgetq_lane_s32(b_sum, 2) + vgetq_lane_s32(b_sum, 3);
+        i += 8;
+    }
+
+    while (i < size) {
+        std::int32_t ai = static_cast<std::int32_t>(a[i]);
+        std::int32_t bi = static_cast<std::int32_t>(b[i]);
+        dot_scalar += ai * bi;
+        a_mag_scalar += ai * ai;
+        b_mag_scalar += bi * bi;
+        ++i;
+    }
+
+    float denom = std::sqrt(static_cast<float>(a_mag_scalar)) *
+                  std::sqrt(static_cast<float>(b_mag_scalar));
+    if (denom < 1e-8f) {
+        return 1.0f;
+    }
+    return 1.0f - (static_cast<float>(dot_scalar) / denom);
+}
+
 /// NEON-optimized dot product for int8 vectors using DotProd instruction
 /// Available on ARMv8.2+ (Apple M1, Cortex-A75+, etc.)
 /// Processes 16 int8 values per iteration with fused multiply-accumulate
@@ -393,6 +477,12 @@ inline float cosine_distance_int8_neon_dotprod(std::span<const std::int8_t> a,
         return 1.0f; // Avoid division by zero
     }
     return 1.0f - (static_cast<float>(dot) / denom);
+}
+/// NEON-optimized inner product distance for int8 vectors using DotProd instruction
+/// Reuses the fast dot product path and converts to distance.
+inline float inner_product_int8_neon_dotprod(std::span<const std::int8_t> a,
+                                             std::span<const std::int8_t> b) {
+    return 1.0f - static_cast<float>(dot_product_int8_neon_dotprod(a, b));
 }
 #endif // __ARM_FEATURE_DOTPROD
 

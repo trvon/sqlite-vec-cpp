@@ -10,16 +10,14 @@ if meson.is_subproject()
 endif
 
 if benchmark_dep.found()
-  # Note: distance_benchmark.cpp needs updating for C++ API
-  # Commented out temporarily
-  # distance_benchmark_exe = executable(
-  #   'distance_benchmark',
-  #   'distance_benchmark.cpp',
-  #   dependencies: [benchmark_dep],
-  #   include_directories: include_directories('../include'),
-  #   cpp_args: cpp_args_list,
-  #   install: false
-  # )
+  distance_benchmark_exe = executable(
+    'distance_benchmark',
+    'distance_benchmark.cpp',
+    dependencies: [benchmark_dep],
+    include_directories: include_directories('../include'),
+    cpp_args: cpp_args_list,
+    install: false
+  )
 
   batch_distance_benchmark_exe = executable(
     'batch_distance_benchmark',
@@ -67,7 +65,7 @@ if benchmark_dep.found()
   )
 
   message('Benchmarks enabled:')
-  # message('  ./distance_benchmark')  # TODO: Update for C++ API
+  message('  ./distance_benchmark')
   message('  ./batch_distance_benchmark')
   message('  ./rag_pipeline_benchmark')
   message('  ./hnsw_benchmark')

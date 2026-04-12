@@ -4,6 +4,8 @@
 #include <random>
 #include <vector>
 #include "../include/sqlite-vec-cpp/distances/cosine.hpp"
+#include "../include/sqlite-vec-cpp/distances/hamming.hpp"
+#include "../include/sqlite-vec-cpp/distances/inner_product.hpp"
 #include "../include/sqlite-vec-cpp/distances/l1.hpp"
 #include "../include/sqlite-vec-cpp/distances/l2.hpp"
 #include <benchmark/benchmark.h>
@@ -38,7 +40,7 @@ static void BM_L2_Float_128(benchmark::State& state) {
 
     for (auto _ : state) {
         float result =
-            distance_l2_sqeuclidean(std::span<const float>(a), std::span<const float>(b));
+            l2_distance(std::span<const float>(a), std::span<const float>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 128);
@@ -51,7 +53,7 @@ static void BM_L2_Float_256(benchmark::State& state) {
 
     for (auto _ : state) {
         float result =
-            distance_l2_sqeuclidean(std::span<const float>(a), std::span<const float>(b));
+            l2_distance(std::span<const float>(a), std::span<const float>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 256);
@@ -64,7 +66,7 @@ static void BM_L2_Float_512(benchmark::State& state) {
 
     for (auto _ : state) {
         float result =
-            distance_l2_sqeuclidean(std::span<const float>(a), std::span<const float>(b));
+            l2_distance(std::span<const float>(a), std::span<const float>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 512);
@@ -77,7 +79,7 @@ static void BM_L2_Float_1536(benchmark::State& state) {
 
     for (auto _ : state) {
         float result =
-            distance_l2_sqeuclidean(std::span<const float>(a), std::span<const float>(b));
+            l2_distance(std::span<const float>(a), std::span<const float>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 1536);
@@ -90,7 +92,7 @@ static void BM_L2_Int8_128(benchmark::State& state) {
 
     for (auto _ : state) {
         float result =
-            distance_l2_sqeuclidean(std::span<const int8_t>(a), std::span<const int8_t>(b));
+            l2_distance(std::span<const int8_t>(a), std::span<const int8_t>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 128);
@@ -106,7 +108,7 @@ static void BM_L1_Float_128(benchmark::State& state) {
     auto b = generate_random_vector<float>(128);
 
     for (auto _ : state) {
-        float result = distance_l1(std::span<const float>(a), std::span<const float>(b));
+        auto result = l1_distance(std::span<const float>(a), std::span<const float>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 128);
@@ -118,7 +120,7 @@ static void BM_L1_Float_1536(benchmark::State& state) {
     auto b = generate_random_vector<float>(1536);
 
     for (auto _ : state) {
-        float result = distance_l1(std::span<const float>(a), std::span<const float>(b));
+        auto result = l1_distance(std::span<const float>(a), std::span<const float>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 1536);
@@ -134,7 +136,7 @@ static void BM_Cosine_Float_128(benchmark::State& state) {
     auto b = generate_random_vector<float>(128);
 
     for (auto _ : state) {
-        float result = distance_cosine(std::span<const float>(a), std::span<const float>(b));
+        float result = cosine_distance(std::span<const float>(a), std::span<const float>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 128);
@@ -146,7 +148,7 @@ static void BM_Cosine_Float_1536(benchmark::State& state) {
     auto b = generate_random_vector<float>(1536);
 
     for (auto _ : state) {
-        float result = distance_cosine(std::span<const float>(a), std::span<const float>(b));
+        float result = cosine_distance(std::span<const float>(a), std::span<const float>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 1536);
@@ -162,8 +164,8 @@ static void BM_Hamming_128(benchmark::State& state) {
     auto b = generate_random_vector<unsigned char>(128, (unsigned char)0, (unsigned char)255);
 
     for (auto _ : state) {
-        int result =
-            distance_hamming(std::span<const unsigned char>(a), std::span<const unsigned char>(b));
+        float result =
+            hamming_distance_u8(std::span<const unsigned char>(a), std::span<const unsigned char>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 128);
@@ -175,8 +177,8 @@ static void BM_Hamming_1536(benchmark::State& state) {
     auto b = generate_random_vector<unsigned char>(1536, (unsigned char)0, (unsigned char)255);
 
     for (auto _ : state) {
-        int result =
-            distance_hamming(std::span<const unsigned char>(a), std::span<const unsigned char>(b));
+        float result =
+            hamming_distance_u8(std::span<const unsigned char>(a), std::span<const unsigned char>(b));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations() * 1536);
@@ -196,7 +198,7 @@ static void BM_L2_Float_Batch_1000x128(benchmark::State& state) {
 
     for (auto _ : state) {
         for (const auto& query : queries) {
-            float result = distance_l2_sqeuclidean(std::span<const float>(query),
+            float result = l2_distance(std::span<const float>(query),
                                                    std::span<const float>(target));
             benchmark::DoNotOptimize(result);
         }
@@ -253,6 +255,82 @@ static void BM_Int8_Cosine_NEON_DotProd_384(benchmark::State& state) {
 }
 BENCHMARK(BM_Int8_Cosine_NEON_DotProd_384);
 
+static void BM_Int8_InnerProduct_NEON_DotProd_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        float result = simd::inner_product_int8_neon_dotprod(std::span<const int8_t>(a),
+                                                              std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_InnerProduct_NEON_DotProd_384);
+
 #endif // SQLITE_VEC_ENABLE_NEON && __ARM_FEATURE_DOTPROD
+
+// ============================================================================
+// NEON int8 Benchmarks (widening, no DotProd required)
+// ============================================================================
+
+#if defined(SQLITE_VEC_ENABLE_NEON)
+#ifndef __ARM_FEATURE_DOTPROD
+#include "../include/sqlite-vec-cpp/simd/neon.hpp"
+#endif
+
+static void BM_Int8_InnerProduct_NEON_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        float result = simd::inner_product_int8_neon(std::span<const int8_t>(a),
+                                                      std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_InnerProduct_NEON_384);
+
+static void BM_Int8_Cosine_NEON_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        float result = simd::cosine_distance_int8_neon(std::span<const int8_t>(a),
+                                                        std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_Cosine_NEON_384);
+
+static void BM_Int8_Cosine_Scalar_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        float result = cosine_distance_int(std::span<const int8_t>(a),
+                                                       std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_Cosine_Scalar_384);
+
+static void BM_Int8_InnerProduct_Scalar_384(benchmark::State& state) {
+    auto a = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+    auto b = generate_random_vector<int8_t>(384, int8_t{-127}, int8_t{127});
+
+    for (auto _ : state) {
+        float result = inner_product_distance_int(std::span<const int8_t>(a),
+                                                              std::span<const int8_t>(b));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * 384);
+}
+BENCHMARK(BM_Int8_InnerProduct_Scalar_384);
+
+#endif // SQLITE_VEC_ENABLE_NEON
 
 BENCHMARK_MAIN();

@@ -31,3 +31,16 @@ BM_HNSW_Search/10000/768/10/50            268651 ns       268171 ns         2772
 BM_HNSW_Search/10000/1536/10/50           489237 ns       489178 ns         1434 QPS=1.42556/s corpus=10k ef=50 k=10
 BM_Brute_Force_Search/1000/384/10          22194 ns        22189 ns        31576 QPS=1.42729/s corpus=1k k=10
 BM_Brute_Force_Search/10000/384/10        224623 ns       224579 ns         3102 QPS=1.43545/s corpus=10k k=10
+BM_HNSW_Recall_Quality/10                  26754 ns        26745 ns        24455 ef=10 recall=0
+BM_HNSW_Recall_Quality/20                  35329 ns        35080 ns        18812 ef=20 recall=40
+BM_HNSW_Recall_Quality/50                  83299 ns        83288 ns         8749 ef=50 recall=60
+BM_HNSW_Recall_Quality/100                150649 ns       150248 ns         4461 ef=100 recall=80
+BM_HNSW_Recall_Quality/200                257448 ns       257365 ns         2735 ef=200 recall=100
+BM_HNSW_Recall_Quality/500                516091 ns       515566 ns         1395 ef=500 recall=100
+BM_HNSW_Batch_Search/10000/384/100/1    19052684 ns     19049437 ns           32 QPS=5.2495k/s corpus=10k queries=100 threads=1
+BM_HNSW_Batch_Search/10000/384/100/2     9545320 ns        36121 ns         1000 QPS=2.76847M/s corpus=10k queries=100 threads=2
+BM_HNSW_Batch_Search/10000/384/100/4     4725941 ns        51713 ns         1000 QPS=1.93375M/s corpus=10k queries=100 threads=4
+BM_HNSW_Batch_Search/10000/384/100/8     2757285 ns        85660 ns         1000 QPS=1.16741M/s corpus=10k queries=100 threads=8
+BM_HNSW_Batch_Search/10000/384/10/4       622596 ns        44472 ns        10000 QPS=224.86k/s corpus=10k queries=10 threads=4
+BM_HNSW_Batch_Search/10000/384/100/4     4908064 ns        54006 ns         1000 QPS=1.85165M/s corpus=10k queries=100 threads=4
+BM_HNSW_Batch_Search/10000/384/1000/4   47129073 ns        84360 ns          100 QPS=11.854M/s corpus=10k queries=1k threads=4
