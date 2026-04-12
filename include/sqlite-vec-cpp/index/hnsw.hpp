@@ -55,6 +55,18 @@ template <concepts::VectorElement StorageT, typename MetricT> class HNSWIndex {
     friend class HNSWQuantizedSearch<StorageT, MetricT>;
 
 public:
+#ifdef SQLITE_VEC_CPP_TESTING
+    using TestingAfterInsertPublishHook = std::function<void()>;
+
+    static void testing_set_after_insert_publish_hook(TestingAfterInsertPublishHook hook) {
+        testing_after_insert_publish_hook_ = std::move(hook);
+    }
+
+    static void testing_clear_after_insert_publish_hook() {
+        testing_after_insert_publish_hook_ = nullptr;
+    }
+#endif
+
     /// Configuration parameters for HNSW index
     /// Tuned for high recall on large corpora (10K+ vectors) with high-dimensional embeddings
     struct Config {
@@ -251,6 +263,12 @@ public:
             }
         } // Release write lock immediately
 
+#ifdef SQLITE_VEC_CPP_TESTING
+        if (testing_after_insert_publish_hook_) {
+            testing_after_insert_publish_hook_();
+        }
+#endif
+
         if (is_first_node) {
             return;
         }
@@ -273,6 +291,12 @@ public:
                     std::unique_lock lock(nodes_mutex_);
                     size_t M = (lc == 0) ? config_.M_max_0 : config_.M;
                     connect_neighbors(id, candidates, M, lc);
+                    if (lc == 0) {
+                        // Final insert generation bump: a snapshot captured after node publish but
+                        // before the graph connections completed must not look fresh after
+                        // insert().
+                        mutation_generation_.fetch_add(1, std::memory_order_release);
+                    }
                 }
 
                 if (lc == 0)
@@ -310,6 +334,11 @@ public:
                 std::unique_lock lock(nodes_mutex_);
                 size_t M = (lc == 0) ? config_.M_max_0 : config_.M;
                 connect_neighbors(id, candidates, M, lc);
+                if (lc == 0) {
+                    // Final insert generation bump: a snapshot captured after node publish but
+                    // before the graph connections completed must not look fresh after insert().
+                    mutation_generation_.fetch_add(1, std::memory_order_release);
+                }
             }
 
             if (lc == 0)
@@ -1075,6 +1104,10 @@ private:
     std::atomic<uint64_t> mutation_generation_{
         0}; ///< Incremented on insert/delete for staleness detection
     std::atomic<size_t> next_dense_id_{0};
+
+#ifdef SQLITE_VEC_CPP_TESTING
+    static inline TestingAfterInsertPublishHook testing_after_insert_publish_hook_{};
+#endif
 
     // Flat lookup table for O(1) node access during single-threaded construction.
     // Indexed by external ID. Falls back to hash lookup if ID is out of range.

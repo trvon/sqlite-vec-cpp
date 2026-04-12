@@ -61,6 +61,17 @@ test_hnsw = executable(
   cpp_args: test_cpp_args,
 )
 
+test_tls_linkage = executable(
+  'test_tls_linkage',
+  [
+    'test_tls_linkage.cpp',
+    'test_tls_linkage_helper.cpp',
+  ],
+  include_directories: inc_dirs,
+  dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args,
+)
+
 # Detect if sanitizers are enabled (TSAN/ASAN add significant overhead)
 # Meson doesn't expose b_sanitize directly, so we check compiler args
 is_sanitized = get_option('b_sanitize') != 'none'
@@ -72,12 +83,13 @@ test('Utilities (Array)', test_utils)
 test('SQLite Functions (Comprehensive)', test_sqlite_functions, timeout: 60)
 test('Batch Distance Operations', test_batch_distance)
 test('HNSW Index', test_hnsw, timeout: hnsw_timeout)
+test('TLS Linkage (Multi-TU)', test_tls_linkage)
 
 test_quantization = executable(
   'test_quantization',
   'test_quantization.cpp',
   include_directories: inc_dirs,
   dependencies: [sqlite3_dep],
-  cpp_args: test_cpp_args,
+  cpp_args: test_cpp_args + ['-DSQLITE_VEC_CPP_TESTING'],
 )
 test('Quantization (LVQ + RaBitQ + Two-Stage HNSW)', test_quantization, timeout: hnsw_timeout)

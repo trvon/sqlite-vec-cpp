@@ -39,8 +39,17 @@ public:
 /// Thread-local random number generator for parallel operations
 /// Avoids contention on shared RNG during parallel layer assignment
 class ThreadLocalRNG {
-    static inline thread_local std::mt19937 rng_{};
-    static inline thread_local bool seeded_{false};
+    static std::mt19937& rngStorage() {
+        // Function-local TLS avoids duplicate TLS init symbols on MinGW multi-TU builds.
+        static thread_local std::mt19937 rng{};
+        return rng;
+    }
+
+    static bool& seededStorage() {
+        static thread_local bool seeded = false;
+        return seeded;
+    }
+
     std::uniform_real_distribution<float> dist_{0.0f, 1.0f};
     uint32_t seed_{42};
 
@@ -56,9 +65,10 @@ class ThreadLocalRNG {
     }
 
     void ensureSeeded() {
-        if (!seeded_) {
-            rng_.seed(resolveSeed(seed_));
-            seeded_ = true;
+        auto& seeded = seededStorage();
+        if (!seeded) {
+            rngStorage().seed(resolveSeed(seed_));
+            seeded = true;
         }
     }
 
@@ -67,7 +77,7 @@ public:
 
     [[nodiscard]] float random() {
         ensureSeeded();
-        float r = dist_(rng_);
+        float r = dist_(rngStorage());
         if (r == 0.0f)
             r = 1e-9f;
         return r;
@@ -80,7 +90,7 @@ public:
     [[nodiscard]] uint32_t random_uint(uint32_t max) {
         ensureSeeded();
         std::uniform_int_distribution<uint32_t> dist(0, max - 1);
-        return dist(rng_);
+        return dist(rngStorage());
     }
 };
 
@@ -420,16 +430,21 @@ public:
 /// Thread-local visited tracker pool
 /// Each thread gets its own tracker to avoid contention
 class ThreadLocalVisitedPool {
-    static inline thread_local VisitedTracker tracker_{4096};
+    static VisitedTracker& trackerStorage() {
+        // Function-local TLS avoids duplicate TLS init symbols on MinGW multi-TU builds.
+        static thread_local VisitedTracker tracker{4096};
+        return tracker;
+    }
 
 public:
     /// Get thread-local visited tracker, resized if needed
     static VisitedTracker& get(size_t min_capacity = 0) {
-        if (min_capacity > 0 && tracker_.capacity() < min_capacity) {
-            tracker_.resize(min_capacity);
+        auto& tracker = trackerStorage();
+        if (min_capacity > 0 && tracker.capacity() < min_capacity) {
+            tracker.resize(min_capacity);
         }
-        tracker_.reset();
-        return tracker_;
+        tracker.reset();
+        return tracker;
     }
 };
 

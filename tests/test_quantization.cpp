@@ -3,10 +3,13 @@
 
 #include <cassert>
 #include <cmath>
+#include <condition_variable>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include <sqlite-vec-cpp/distances/l2.hpp>
@@ -823,6 +826,70 @@ void test_snapshot_rebuild_consistency() {
     std::cout << "  PASS: snapshot rebuild produces identical results" << std::endl;
 }
 
+void test_concurrent_insert_snapshot_staleness() {
+    std::cout << "Testing concurrent insert snapshot staleness..." << std::endl;
+
+    std::mt19937 rng(1234);
+    const size_t dim = 32;
+    const size_t corpus_size = 64;
+
+    HNSWIndex<float, L2Metric<float>> index;
+    for (size_t i = 0; i < corpus_size; ++i) {
+        auto vec = generate_vector(dim, rng);
+        index.insert_single_threaded(i, std::span<const float>(vec));
+    }
+
+    HNSWQuantizedSearch<float, L2Metric<float>>::Config qconfig;
+    qconfig.quantization = QuantizationType::LVQ8;
+    HNSWQuantizedSearch<float, L2Metric<float>> qsearch(index, qconfig);
+    qsearch.build_quantization();
+    assert(!qsearch.is_stale());
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool published = false;
+    bool allow_continue = false;
+
+    HNSWIndex<float, L2Metric<float>>::testing_set_after_insert_publish_hook([&]() {
+        std::unique_lock lk(m);
+        published = true;
+        cv.notify_all();
+        cv.wait(lk, [&]() { return allow_continue; });
+    });
+
+    auto new_vec = generate_vector(dim, rng);
+    std::thread inserter([&]() { index.insert(corpus_size, std::span<const float>(new_vec)); });
+
+    {
+        std::unique_lock lk(m);
+        cv.wait(lk, [&]() { return published; });
+    }
+
+    // Snapshot/build while insert is mid-flight (node visible, graph not fully connected yet).
+    qsearch.build_quantization();
+    bool stale_while_insert_paused = qsearch.is_stale();
+
+    {
+        std::lock_guard lk(m);
+        allow_continue = true;
+    }
+    cv.notify_all();
+    inserter.join();
+
+    bool stale_after_insert_complete = qsearch.is_stale();
+    HNSWIndex<float, L2Metric<float>>::testing_clear_after_insert_publish_hook();
+
+    assert(!stale_while_insert_paused);
+    assert(stale_after_insert_complete &&
+           "Snapshot built mid-insert must be stale after insertion completes");
+
+    auto query = generate_vector(dim, rng);
+    auto results = qsearch.search(std::span<const float>(query), 5, 50);
+    assert(!results.empty());
+
+    std::cout << "  PASS: concurrent insert invalidates mid-insert snapshot" << std::endl;
+}
+
 // ========== Main ==========
 
 int main() {
@@ -860,6 +927,7 @@ int main() {
     test_stale_isolate_deleted();
     test_stale_restore_and_clear();
     test_snapshot_rebuild_consistency();
+    test_concurrent_insert_snapshot_staleness();
     std::cout << std::endl;
 
     std::cout << "=== All quantization tests passed ===" << std::endl;
