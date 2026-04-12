@@ -29,6 +29,16 @@
 
 #ifdef SQLITE_VEC_ENABLE_AVX
 #include <immintrin.h>
+namespace sqlite_vec_cpp::quantization::detail {
+/// FMA-safe fused multiply-add: uses hardware FMA when available, otherwise mul+add.
+inline __m256 lvq_fmadd_ps(__m256 a, __m256 b, __m256 c) {
+#ifdef SQLITE_VEC_ENABLE_FMA
+    return _mm256_fmadd_ps(a, b, c);
+#else
+    return _mm256_add_ps(_mm256_mul_ps(a, b), c);
+#endif
+}
+} // namespace sqlite_vec_cpp::quantization::detail
 #endif
 
 namespace sqlite_vec_cpp::quantization {
@@ -252,7 +262,7 @@ private:
             __m256 q_lo = _mm256_loadu_ps(&query[i]);
             __m256 qn_lo = _mm256_mul_ps(_mm256_sub_ps(q_lo, voffset), vinv_scale);
             __m256 d_lo = _mm256_sub_ps(qn_lo, cf_lo);
-            sum0 = _mm256_fmadd_ps(d_lo, d_lo, sum0);
+            sum0 = detail::lvq_fmadd_ps(d_lo, d_lo, sum0);
 
             // Process next 8
             __m128i codes8_hi =
@@ -263,7 +273,7 @@ private:
             __m256 q_hi = _mm256_loadu_ps(&query[i + 8]);
             __m256 qn_hi = _mm256_mul_ps(_mm256_sub_ps(q_hi, voffset), vinv_scale);
             __m256 d_hi = _mm256_sub_ps(qn_hi, cf_hi);
-            sum1 = _mm256_fmadd_ps(d_hi, d_hi, sum1);
+            sum1 = detail::lvq_fmadd_ps(d_hi, d_hi, sum1);
 
             i += 16;
         }
@@ -531,7 +541,7 @@ private:
             __m256 q_a = _mm256_loadu_ps(query + i);
             __m256 qn_a = _mm256_mul_ps(_mm256_sub_ps(q_a, voffset), vinv_scale);
             __m256 d_a = _mm256_sub_ps(qn_a, cf_a);
-            sum0 = _mm256_fmadd_ps(d_a, d_a, sum0);
+            sum0 = detail::lvq_fmadd_ps(d_a, d_a, sum0);
 
             // Widen next 8 bytes
             __m128i upper_0_15 = _mm_srli_si128(unpacked_0_15, 8);
@@ -540,7 +550,7 @@ private:
             __m256 q_b = _mm256_loadu_ps(query + i + 8);
             __m256 qn_b = _mm256_mul_ps(_mm256_sub_ps(q_b, voffset), vinv_scale);
             __m256 d_b = _mm256_sub_ps(qn_b, cf_b);
-            sum1 = _mm256_fmadd_ps(d_b, d_b, sum1);
+            sum1 = detail::lvq_fmadd_ps(d_b, d_b, sum1);
 
             // === Process dims i+16..i+31 ===
             __m256i codes32_c = _mm256_cvtepu8_epi32(unpacked_16_31);
@@ -548,7 +558,7 @@ private:
             __m256 q_c = _mm256_loadu_ps(query + i + 16);
             __m256 qn_c = _mm256_mul_ps(_mm256_sub_ps(q_c, voffset), vinv_scale);
             __m256 d_c = _mm256_sub_ps(qn_c, cf_c);
-            sum0 = _mm256_fmadd_ps(d_c, d_c, sum0);
+            sum0 = detail::lvq_fmadd_ps(d_c, d_c, sum0);
 
             __m128i upper_16_31 = _mm_srli_si128(unpacked_16_31, 8);
             __m256i codes32_d = _mm256_cvtepu8_epi32(upper_16_31);
@@ -556,7 +566,7 @@ private:
             __m256 q_d = _mm256_loadu_ps(query + i + 24);
             __m256 qn_d = _mm256_mul_ps(_mm256_sub_ps(q_d, voffset), vinv_scale);
             __m256 d_d = _mm256_sub_ps(qn_d, cf_d);
-            sum1 = _mm256_fmadd_ps(d_d, d_d, sum1);
+            sum1 = detail::lvq_fmadd_ps(d_d, d_d, sum1);
 
             i += 32;
         }

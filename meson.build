@@ -98,10 +98,21 @@ elif host_cpu == 'arm'
 endif
 
 # x86/x86_64 AVX Detection
+#
+# IMPORTANT: We use cpp.run() for native builds to verify the CPU actually
+# supports the instruction set at runtime. cpp.compiles() only checks whether
+# the compiler can generate the instructions — any modern GCC/Clang will pass
+# for AVX/AVX2/FMA/AVX-512 regardless of the host CPU, leading to SIGILL at
+# runtime on VMs or older CPUs that lack those features.
+# For cross-builds (where we can't run host binaries), we fall back to
+# compile-tests and trust the user's configuration.
 has_avx = false
 has_avx2 = false
 has_fma = false
 has_avx512 = false
+
+# Helper: check SIMD support via runtime test (native) or compile test (cross).
+can_run = meson.can_run_host_binaries()
 
 if host_cpu in ['x86', 'x86_64']
   if get_option('enable_simd_avx')
@@ -114,12 +125,20 @@ if host_cpu in ['x86', 'x86_64']
         return 0;
     }
     '''
-    if cpp.compiles(avx_test, args: ['-mavx'], name: 'AVX')
+    avx_ok = false
+    if can_run
+      avx_run = cpp.run(avx_test, args: ['-mavx'], name: 'AVX (runtime)')
+      avx_ok = avx_run.compiled() and avx_run.returncode() == 0
+    else
+      avx_ok = cpp.compiles(avx_test, args: ['-mavx'], name: 'AVX (compile-only)')
+    endif
+
+    if avx_ok
       has_avx = true
       simd_defines += '-DSQLITE_VEC_ENABLE_AVX'
       simd_args += '-mavx'
-      message('AVX: enabled (non-portable opt-in)')
-      
+      message('AVX: enabled')
+
       # Test AVX2 (needed for integer operations)
       avx2_test = '''
       #include <immintrin.h>
@@ -129,15 +148,23 @@ if host_cpu in ['x86', 'x86_64']
           return 0;
       }
       '''
-      if cpp.compiles(avx2_test, args: ['-mavx2'], name: 'AVX2')
+      avx2_ok = false
+      if can_run
+        avx2_run = cpp.run(avx2_test, args: ['-mavx2'], name: 'AVX2 (runtime)')
+        avx2_ok = avx2_run.compiled() and avx2_run.returncode() == 0
+      else
+        avx2_ok = cpp.compiles(avx2_test, args: ['-mavx2'], name: 'AVX2 (compile-only)')
+      endif
+
+      if avx2_ok
         has_avx2 = true
         simd_defines += '-DSQLITE_VEC_ENABLE_AVX2'
         simd_args += '-mavx2'
-        message('AVX2: enabled (non-portable opt-in)')
+        message('AVX2: enabled')
       else
-        message('AVX2: not available')
+        message('AVX2: not available on this CPU')
       endif
-      
+
       # Test FMA (fused multiply-add, usually with AVX2)
       fma_test = '''
       #include <immintrin.h>
@@ -149,15 +176,23 @@ if host_cpu in ['x86', 'x86_64']
           return 0;
       }
       '''
-      if cpp.compiles(fma_test, args: ['-mfma'], name: 'FMA')
+      fma_ok = false
+      if can_run
+        fma_run = cpp.run(fma_test, args: ['-mfma'], name: 'FMA (runtime)')
+        fma_ok = fma_run.compiled() and fma_run.returncode() == 0
+      else
+        fma_ok = cpp.compiles(fma_test, args: ['-mfma'], name: 'FMA (compile-only)')
+      endif
+
+      if fma_ok
         has_fma = true
         simd_defines += '-DSQLITE_VEC_ENABLE_FMA'
         simd_args += '-mfma'
-        message('FMA: enabled (non-portable opt-in)')
+        message('FMA: enabled')
       else
-        message('FMA: not available')
+        message('FMA: not available on this CPU')
       endif
-      
+
       # Test AVX-512 (optional, for future use)
       avx512_test = '''
       #include <immintrin.h>
@@ -167,16 +202,24 @@ if host_cpu in ['x86', 'x86_64']
           return 0;
       }
       '''
-      if cpp.compiles(avx512_test, args: ['-mavx512f'], name: 'AVX-512')
+      avx512_ok = false
+      if can_run
+        avx512_run = cpp.run(avx512_test, args: ['-mavx512f'], name: 'AVX-512 (runtime)')
+        avx512_ok = avx512_run.compiled() and avx512_run.returncode() == 0
+      else
+        avx512_ok = cpp.compiles(avx512_test, args: ['-mavx512f'], name: 'AVX-512 (compile-only)')
+      endif
+
+      if avx512_ok
         has_avx512 = true
         simd_defines += '-DSQLITE_VEC_ENABLE_AVX512'
         simd_args += '-mavx512f'
-        message('AVX-512: enabled (non-portable opt-in)')
+        message('AVX-512: enabled')
       else
-        message('AVX-512: not available')
+        message('AVX-512: not available on this CPU')
       endif
     else
-      message('AVX: requested but not available for this toolchain')
+      message('AVX: requested but not available for this toolchain/CPU')
     endif
   else
     message('AVX: disabled by default (enable_simd_avx=false)')
