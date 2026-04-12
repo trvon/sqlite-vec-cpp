@@ -895,6 +895,22 @@ void test_error_handling() {
         // Expected
     }
 
+    // Truncated JSON should be rejected.
+    try {
+        db.exec_scalar("SELECT vec_f32('[1,2')");
+        assert(false && "Should have thrown error for truncated JSON");
+    } catch (const std::runtime_error&) {
+        // Expected
+    }
+
+    // Trailing non-whitespace after the array should be rejected.
+    try {
+        db.exec_scalar("SELECT vec_f32('[1] trailing')");
+        assert(false && "Should have thrown error for trailing JSON garbage");
+    } catch (const std::runtime_error&) {
+        // Expected
+    }
+
     // Empty vector
     try {
         db.exec_scalar("SELECT vec_f32('[]')");
@@ -909,6 +925,93 @@ void test_error_handling() {
 // ============================================================================
 // TEST: Integration Scenarios
 // ============================================================================
+
+void test_stored_float_blobs_work_with_pairwise_helpers() {
+    std::cout << "Testing stored float blobs with pairwise helpers..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+    register_all_functions(db);
+
+    db.exec("CREATE TABLE docs (embedding BLOB)");
+    db.exec("INSERT INTO docs VALUES (vec_f32('[1,2,3]'))");
+
+    std::string dot_sql = "SELECT vec_dot(embedding, vec_f32('[4,5,6]')) FROM docs LIMIT 1";
+    double dot = std::stod(db.exec_scalar(dot_sql));
+    assert(approx_equal(dot, 32.0));
+
+    std::string sum_json =
+        db.exec_scalar("SELECT vec_to_json(vec_add(embedding, vec_f32('[1,1,1]'))) "
+                       "FROM docs LIMIT 1");
+    assert(sum_json.find("2") != std::string::npos);
+    assert(sum_json.find("3") != std::string::npos);
+    assert(sum_json.find("4") != std::string::npos);
+
+    std::cout << "  ✓ Stored float blobs work with pairwise helpers" << std::endl;
+}
+
+void test_sqlite3_vec_init_registers_extended_functions() {
+    std::cout << "Testing sqlite3_vec_init extended function registration..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    std::string json = db.exec_scalar("SELECT vec_to_json(vec_f32('[1, 2.5, 3]'))");
+    assert(json.front() == '[');
+    assert(json.back() == ']');
+
+    std::string normalized = db.exec_scalar("SELECT vec_to_json(vec_normalize(vec_f32('[3,4]')))");
+    assert(normalized.find("0.6") != std::string::npos);
+    assert(normalized.find("0.8") != std::string::npos);
+
+    double std_dev = std::stod(db.exec_scalar("SELECT vec_std(vec_f32('[1,2,3,4,5]'))"));
+    assert(std_dev > 0.0);
+
+    std::cout << "  ✓ sqlite3_vec_init registers extended functions" << std::endl;
+}
+
+void test_vec0_explicit_rowid_insert() {
+    std::cout << "Testing vec0 explicit rowid insert..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (42, '[1,2]')");
+
+    std::string rowid = db.exec_scalar("SELECT rowid FROM t LIMIT 1");
+    assert(rowid == "42");
+
+    std::cout << "  ✓ vec0 preserves explicit rowid inserts" << std::endl;
+}
+
+void test_vec0_dimension_validation() {
+    std::cout << "Testing vec0 dimension validation..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+
+    try {
+        db.exec("INSERT INTO t(embedding) VALUES ('[1,2,3]')");
+        assert(false && "Expected vec0 dimension mismatch for text input");
+    } catch (const std::runtime_error&) {
+        // Expected
+    }
+
+    try {
+        db.exec("INSERT INTO t(embedding) VALUES (X'000102')");
+        assert(false && "Expected vec0 blob alignment error");
+    } catch (const std::runtime_error&) {
+        // Expected
+    }
+
+    db.exec("INSERT INTO t(embedding) VALUES ('[1,2]')");
+    assert(db.exec_scalar("SELECT COUNT(*) FROM t") == "1");
+
+    std::cout << "  ✓ vec0 enforces declared dimensions" << std::endl;
+}
 
 void test_integration_similarity_search() {
     std::cout << "Testing integration: similarity search..." << std::endl;
@@ -1030,12 +1133,18 @@ int main() {
     run_test("error_handling", test_error_handling);
 
     std::cout << "\nTesting Integration Scenarios:\n";
+    run_test("stored_float_blobs_pairwise_helpers",
+             test_stored_float_blobs_work_with_pairwise_helpers);
+    run_test("sqlite3_vec_init_extended_functions",
+             test_sqlite3_vec_init_registers_extended_functions);
     run_test("integration_similarity_search", test_integration_similarity_search);
     run_test("integration_vector_operations", test_integration_vector_operations);
 
     std::cout << "\nTesting vec0 Virtual Table:\n";
     run_test("vec0_basic_create_insert_select", test_vec0_basic_create_insert_select);
     run_test("vec0_update_delete_paths", test_vec0_update_delete_paths);
+    run_test("vec0_explicit_rowid_insert", test_vec0_explicit_rowid_insert);
+    run_test("vec0_dimension_validation", test_vec0_dimension_validation);
 
     std::cout << "\nTesting Distance Subtypes (Bit/Int8):\n";
     run_test("distance_int8_l1_l2_cosine", test_distance_int8_l1_l2_cosine);

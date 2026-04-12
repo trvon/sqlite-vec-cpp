@@ -3,12 +3,12 @@
 **Version**: 0.1.0
 **Date**: 2026-01-19
 **Platform**: Apple M3 Max, 16 cores, 48 GB RAM (macOS 26.2)
-**Compiler**: Apple clang 17.0.0, C++23, Release mode (`-O3` via Meson `buildtype=release`)
+**Compiler**: Apple clang 17.0.0, C++23, Release benchmark mode (`-O3` via Meson `buildtype=release`)
 **SIMD**: NEON enabled, ARM DotProd enabled
 **Library**: Google Benchmark 1.8.3
 
-> Note: Google Benchmark reports “Library was built as DEBUG” even in this Release build; the Meson
-> configuration is `buildtype=release` with NEON/DotProd enabled.
+> Note: These benchmark settings are intentionally tuned for local performance measurement.
+> They are not the recommended defaults for packaging or portable distribution builds.
 
 ---
 

@@ -110,7 +110,8 @@ public:
     /// Move constructor (required because std::shared_mutex is move-only)
     HNSWIndex(HNSWIndex&& other) noexcept
         : config_(other.config_), nodes_mutex_(), nodes_(std::move(other.nodes_)),
-          deleted_ids_(std::move(other.deleted_ids_)), next_dense_id_(other.next_dense_id_),
+          deleted_ids_(std::move(other.deleted_ids_)),
+          next_dense_id_(other.next_dense_id_.load(std::memory_order_relaxed)),
           entry_point_id_(other.entry_point_id_.load(std::memory_order_relaxed)),
           entry_point_layer_(other.entry_point_layer_.load(std::memory_order_relaxed)),
           rng_generator_() {}
@@ -121,7 +122,8 @@ public:
             config_ = other.config_;
             nodes_ = std::move(other.nodes_);
             deleted_ids_ = std::move(other.deleted_ids_);
-            next_dense_id_ = other.next_dense_id_;
+            next_dense_id_.store(other.next_dense_id_.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
             entry_point_id_.store(other.entry_point_id_.load(std::memory_order_relaxed),
                                   std::memory_order_relaxed);
             entry_point_layer_.store(other.entry_point_layer_.load(std::memory_order_relaxed),
@@ -186,6 +188,7 @@ public:
 
         // Pre-normalize for cosine acceleration
         std::vector<float> norm_buffer;
+        std::vector<StorageT> normalized_store;
         std::span<const StorageT> store_vec = vector;
         if (config_.normalize_vectors) {
             if constexpr (std::same_as<StorageT, float>) {
@@ -196,6 +199,12 @@ public:
             } else {
                 norm_buffer.assign(vector_f32.begin(), vector_f32.end());
                 normalize_vector_inplace(norm_buffer);
+                if constexpr (std::same_as<StorageT, utils::float16_t>) {
+                    normalized_store = utils::to_float16(std::span<const float>(norm_buffer));
+                } else {
+                    normalized_store.assign(norm_buffer.begin(), norm_buffer.end());
+                }
+                store_vec = std::span<const StorageT>(normalized_store);
                 vector_f32 = std::span<const float>(norm_buffer);
             }
         }
@@ -327,6 +336,7 @@ public:
         // Pre-normalize for cosine: normalize the vector before storing.
         // After this, distance_nodes/distance_query_node use inner product (1 - dot).
         std::vector<float> norm_buffer;
+        std::vector<StorageT> normalized_store;
         std::span<const StorageT> store_vec = vector; // what gets stored in the node
         if (config_.normalize_vectors) {
             if constexpr (std::same_as<StorageT, float>) {
@@ -339,9 +349,13 @@ public:
                 // For fp16: normalize the float32 version, then store as fp16
                 norm_buffer.assign(vector_f32.begin(), vector_f32.end());
                 normalize_vector_inplace(norm_buffer);
+                if constexpr (std::same_as<StorageT, utils::float16_t>) {
+                    normalized_store = utils::to_float16(std::span<const float>(norm_buffer));
+                } else {
+                    normalized_store.assign(norm_buffer.begin(), norm_buffer.end());
+                }
+                store_vec = std::span<const StorageT>(normalized_store);
                 vector_f32 = std::span<const float>(norm_buffer);
-                // store_vec remains as original fp16; re-quantize from normalized float
-                // (the node stores fp16, but we search with normalized fp32)
             }
         }
 
@@ -351,7 +365,7 @@ public:
         auto [it, inserted] = nodes_.emplace(id, NodeType(id, store_vec, layer, config_.M_max));
         if (!inserted)
             return;
-        it->second.dense_id = next_dense_id_++;
+        it->second.dense_id = next_dense_id_.fetch_add(1, std::memory_order_relaxed);
         register_flat_lookup(id, &it->second);
 
         // First node
@@ -418,7 +432,7 @@ public:
     using FilterFn = std::function<bool(size_t node_id)>;
     std::vector<std::pair<size_t, float>> search_with_filter(std::span<const float> query, size_t k,
                                                              size_t ef_search,
-                                                             FilterFn filter) const {
+                                                             const FilterFn& filter) const {
         if (nodes_.empty())
             return {};
 
@@ -614,12 +628,25 @@ public:
 
                 // Pre-normalize vector for cosine acceleration
                 std::vector<float> norm_buf;
+                std::vector<StorageT> normalized_store;
                 std::span<const StorageT> store_vec = vectors_span[i];
                 if (config_.normalize_vectors) {
                     if constexpr (std::same_as<StorageT, float>) {
                         norm_buf.assign(vectors_span[i].begin(), vectors_span[i].end());
                         normalize_vector_inplace(norm_buf);
                         store_vec = std::span<const StorageT>(norm_buf);
+                    } else {
+                        norm_buf.reserve(vectors_span[i].size());
+                        for (const auto& value : vectors_span[i]) {
+                            norm_buf.push_back(static_cast<float>(value));
+                        }
+                        normalize_vector_inplace(norm_buf);
+                        if constexpr (std::same_as<StorageT, utils::float16_t>) {
+                            normalized_store = utils::to_float16(std::span<const float>(norm_buf));
+                        } else {
+                            normalized_store.assign(norm_buf.begin(), norm_buf.end());
+                        }
+                        store_vec = std::span<const StorageT>(normalized_store);
                     }
                 }
 
@@ -628,7 +655,7 @@ public:
                 if (!inserted) {
                     continue;
                 }
-                it->second.dense_id = next_dense_id_++;
+                it->second.dense_id = next_dense_id_.fetch_add(1, std::memory_order_relaxed);
 
                 size_t current_max = max_layer.load(std::memory_order_relaxed);
                 while (layer > current_max) {
@@ -753,16 +780,10 @@ public:
         double base = static_cast<double>(k) * std::sqrt(static_cast<double>(n)) / 10.0;
 
         // Recall multiplier: 1.0 at 90%, 1.5 at 95%, 3.0 at 99%
-        double recall_factor = 1.0;
-        if (target_recall >= 0.99f) {
-            recall_factor = 3.0;
-        } else if (target_recall >= 0.95f) {
-            recall_factor = 1.5;
-        } else if (target_recall >= 0.90f) {
-            recall_factor = 1.0;
-        } else {
-            recall_factor = 0.7; // Lower recall = less exploration needed
-        }
+        const double recall_factor = target_recall >= 0.99f   ? 3.0
+                                     : target_recall >= 0.95f ? 1.5
+                                     : target_recall >= 0.90f ? 1.0
+                                                              : 0.7;
 
         size_t ef = static_cast<size_t>(base * recall_factor);
 
@@ -1019,7 +1040,7 @@ private:
     mutable std::shared_mutex deleted_mutex_;
     std::unordered_map<size_t, NodeType> nodes_;
     std::unordered_set<size_t> deleted_ids_;
-    size_t next_dense_id_ = 0;
+    std::atomic<size_t> next_dense_id_{0};
 
     // Flat lookup table for O(1) node access during single-threaded construction.
     // Indexed by external ID. Falls back to hash lookup if ID is out of range.
@@ -1042,7 +1063,7 @@ private:
             (void)id;
             node.dense_id = dense_id++;
         }
-        next_dense_id_ = dense_id;
+        next_dense_id_.store(dense_id, std::memory_order_relaxed);
     }
 
     bool is_deleted_unlocked(size_t id) const { return deleted_ids_.contains(id); }

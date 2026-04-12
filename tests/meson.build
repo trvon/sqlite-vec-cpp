@@ -1,10 +1,20 @@
 # Tests
 
+test_cpp_args = []
+if cpp.get_id() != 'msvc'
+  test_cpp_args = [
+    '-Wno-unused-but-set-variable',
+    '-Wno-unused-parameter',
+    '-Wno-unused-variable',
+  ]
+endif
+
 test_concepts = executable(
   'test_concepts',
   'test_concepts.cpp',
   include_directories: inc_dirs,
   dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args,
 )
 
 test_distances = executable(
@@ -12,6 +22,7 @@ test_distances = executable(
   'test_distances.cpp',
   include_directories: inc_dirs,
   dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args,
 )
 
 test_utils = executable(
@@ -19,6 +30,7 @@ test_utils = executable(
   'test_utils.cpp',
   include_directories: inc_dirs,
   dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args,
 )
 
 test_sqlite_functions = executable(
@@ -29,8 +41,8 @@ test_sqlite_functions = executable(
     'test_sqlite_functions.cpp',
     '../src/sqlite_vec_c_api.cpp',
   ],
-  dependencies: [sqlite3_dep, dependency('sqlite-vec-cpp')],
-  cpp_args: ['-DSQLITE_VEC_CPP_TESTING'],
+  dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args + ['-DSQLITE_VEC_CPP_ENABLED', '-DSQLITE_VEC_CPP_TESTING'],
 )
 
 test_batch_distance = executable(
@@ -38,6 +50,7 @@ test_batch_distance = executable(
   'test_batch_distance.cpp',
   include_directories: inc_dirs,
   dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args,
 )
 
 test_hnsw = executable(
@@ -45,6 +58,7 @@ test_hnsw = executable(
   'test_hnsw.cpp',
   include_directories: inc_dirs,
   dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args,
 )
 
 # Detect if sanitizers are enabled (TSAN/ASAN add significant overhead)

@@ -235,9 +235,8 @@ benchmarkYamsHNSW(const BenchConfig& cfg, const std::vector<std::vector<float>>&
                 std::chrono::duration<double, std::micro>(searchEnd - searchStart).count();
             double latencyUs = totalUs / static_cast<double>(queries.size());
             double qps = 1e6 / latencyUs;
-            double recall =
-                100.0 * static_cast<double>(totalHits) /
-                static_cast<double>(queries.size() * cfg.k);
+            double recall = 100.0 * static_cast<double>(totalHits) /
+                            static_cast<double>(queries.size() * cfg.k);
 
             results.push_back(EngineResult{"yams-hnsw", M, ef, buildMs, latencyUs, qps, recall, 0});
         }
@@ -279,8 +278,7 @@ benchmarkZvec(const BenchConfig& cfg, const std::vector<std::vector<float>>& cor
         std::string indexPath = "/tmp/zvec_bench_" + std::to_string(M) + ".index";
         std::remove(indexPath.c_str());
 
-        int ret = index->Open(indexPath,
-                              StorageOptions{StorageOptions::StorageType::kMMAP, true});
+        int ret = index->Open(indexPath, StorageOptions{StorageOptions::StorageType::kMMAP, true});
         if (ret != 0) {
             fprintf(stderr, "zvec: Failed to open index at %s\n", indexPath.c_str());
             continue;
@@ -323,11 +321,11 @@ benchmarkZvec(const BenchConfig& cfg, const std::vector<std::vector<float>>& cor
                 std::chrono::duration<double, std::micro>(searchEnd - searchStart).count();
             double latencyUs = totalUs / static_cast<double>(queries.size());
             double qps = 1e6 / latencyUs;
-            double recall =
-                100.0 * static_cast<double>(totalHits) /
-                static_cast<double>(queries.size() * cfg.k);
+            double recall = 100.0 * static_cast<double>(totalHits) /
+                            static_cast<double>(queries.size() * cfg.k);
 
-            results.push_back(EngineResult{"zvec-proxima", M, ef, buildMs, latencyUs, qps, recall, 0});
+            results.push_back(
+                EngineResult{"zvec-proxima", M, ef, buildMs, latencyUs, qps, recall, 0});
         }
 
         // Clean up
@@ -366,8 +364,8 @@ int main(int argc, char* argv[]) {
     printf("================================================================\n");
     printf("HNSW Engine Comparison Benchmark\n");
     printf("================================================================\n");
-    printf("Corpus: %zu vectors, Dim: %zu, k: %zu, Queries: %zu\n", cfg.corpus_size, cfg.dim,
-           cfg.k, cfg.num_queries);
+    printf("Corpus: %zu vectors, Dim: %zu, k: %zu, Queries: %zu\n", cfg.corpus_size, cfg.dim, cfg.k,
+           cfg.num_queries);
     printf("ef_construction: %zu, Seed: %u\n", cfg.ef_construction, cfg.seed);
     printf("Threads: %u\n", std::thread::hardware_concurrency());
 #if YAMS_HAS_ZVEC
@@ -395,8 +393,7 @@ int main(int argc, char* argv[]) {
     auto gtStart = std::chrono::high_resolution_clock::now();
     auto gtSets = computeGroundTruth(queries, corpus, cfg.k);
     auto gtEnd = std::chrono::high_resolution_clock::now();
-    printf("Ground truth: %.1fs\n\n",
-           std::chrono::duration<double>(gtEnd - gtStart).count());
+    printf("Ground truth: %.1fs\n\n", std::chrono::duration<double>(gtEnd - gtStart).count());
     fflush(stdout);
 
     // === YAMS HNSW ===
@@ -411,8 +408,8 @@ int main(int argc, char* argv[]) {
 
     // === ef_construction sweep (M=24 fixed) ===
     printf("--- ef_construction sweep (M=24, normalized) ---\n");
-    printf("%-16s | %-4s | %-6s | %-10s | %-12s | %-10s\n",
-           "Engine", "M", "ef_c", "ef_search", "Build(ms)", "Recall@K");
+    printf("%-16s | %-4s | %-6s | %-10s | %-12s | %-10s\n", "Engine", "M", "ef_c", "ef_search",
+           "Build(ms)", "Recall@K");
     printf("-----------------+------+--------+------------+--------------+-----------\n");
     fflush(stdout);
     for (size_t ef_c : {50UL, 100UL, 200UL, 400UL}) {
@@ -441,11 +438,11 @@ int main(int argc, char* argv[]) {
                     ++totalHits;
             }
         }
-        double recall = 100.0 * static_cast<double>(totalHits)
-                       / static_cast<double>(queries.size() * cfg.k);
+        double recall =
+            100.0 * static_cast<double>(totalHits) / static_cast<double>(queries.size() * cfg.k);
 
-        printf("%-16s | %-4d | %-6zu | %-10d | %10.1f | %8.1f%%\n",
-               "yams-hnsw", 24, ef_c, 100, buildMs, recall);
+        printf("%-16s | %-4d | %-6zu | %-10d | %10.1f | %8.1f%%\n", "yams-hnsw", 24, ef_c, 100,
+               buildMs, recall);
         fflush(stdout);
     }
     printf("\n");
@@ -458,8 +455,11 @@ int main(int argc, char* argv[]) {
     {
         // Sequential (insert_single_threaded)
         HNSWIndex<float, CosineMetric<float>>::Config hnswCfg;
-        hnswCfg.M = 24; hnswCfg.M_max = 48; hnswCfg.M_max_0 = 96;
-        hnswCfg.ef_construction = 200; hnswCfg.normalize_vectors = true;
+        hnswCfg.M = 24;
+        hnswCfg.M_max = 48;
+        hnswCfg.M_max_0 = 96;
+        hnswCfg.ef_construction = 200;
+        hnswCfg.normalize_vectors = true;
 
         // Prepare spans
         std::vector<std::span<const float>> spans;
@@ -484,10 +484,11 @@ int main(int argc, char* argv[]) {
         for (size_t q = 0; q < queries.size(); ++q) {
             auto res = idx_seq.search(std::span<const float>{queries[q]}, cfg.k, 100);
             for (const auto& [id, _] : res)
-                if (gtSets[q].count(id)) ++seqHits;
+                if (gtSets[q].count(id))
+                    ++seqHits;
         }
-        double seqRecall = 100.0 * static_cast<double>(seqHits)
-                          / static_cast<double>(queries.size() * cfg.k);
+        double seqRecall =
+            100.0 * static_cast<double>(seqHits) / static_cast<double>(queries.size() * cfg.k);
         printf("%-24s | %10.1f | %8.1f%%\n", "sequential", seqMs, seqRecall);
 
         // Parallel (build_parallel with default threads)
@@ -501,15 +502,16 @@ int main(int argc, char* argv[]) {
         for (size_t q = 0; q < queries.size(); ++q) {
             auto res = idx_par.search(std::span<const float>{queries[q]}, cfg.k, 100);
             for (const auto& [id, _] : res)
-                if (gtSets[q].count(id)) ++parHits;
+                if (gtSets[q].count(id))
+                    ++parHits;
         }
-        double parRecall = 100.0 * static_cast<double>(parHits)
-                          / static_cast<double>(queries.size() * cfg.k);
+        double parRecall =
+            100.0 * static_cast<double>(parHits) / static_cast<double>(queries.size() * cfg.k);
         printf("%-24s | %10.1f | %8.1f%%\n", "parallel (auto threads)", parMs, parRecall);
 
         double speedup = seqMs / parMs;
-        printf("\n  Parallel speedup: %.1fx (%d threads available)\n",
-               speedup, static_cast<int>(std::thread::hardware_concurrency()));
+        printf("\n  Parallel speedup: %.1fx (%d threads available)\n", speedup,
+               static_cast<int>(std::thread::hardware_concurrency()));
     }
     printf("\n");
 

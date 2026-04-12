@@ -10,9 +10,9 @@
 #include <span>
 #include <vector>
 
-#include <sqlite-vec-cpp/distances/l2.hpp>
 #include <sqlite-vec-cpp/distances/cosine.hpp>
 #include <sqlite-vec-cpp/distances/inner_product.hpp>
+#include <sqlite-vec-cpp/distances/l2.hpp>
 #include <sqlite-vec-cpp/index/hnsw.hpp>
 #include <sqlite-vec-cpp/index/hnsw_persistence.hpp>
 #include <sqlite-vec-cpp/utils/float16.hpp>
@@ -898,12 +898,12 @@ void test_normalized_build_correctness() {
 
     // Simple 2D vectors with known cosine relationships
     std::vector<std::vector<float>> vectors = {
-        {1.0f, 0.0f},   // 0: pointing right
-        {0.0f, 1.0f},   // 1: pointing up
-        {1.0f, 1.0f},   // 2: 45 degrees (not normalized)
-        {-1.0f, 0.0f},  // 3: pointing left (opposite of 0)
-        {3.0f, 0.1f},   // 4: nearly right (not unit norm)
-        {0.5f, 0.0f},   // 5: same direction as 0, different magnitude
+        {1.0f, 0.0f},  // 0: pointing right
+        {0.0f, 1.0f},  // 1: pointing up
+        {1.0f, 1.0f},  // 2: 45 degrees (not normalized)
+        {-1.0f, 0.0f}, // 3: pointing left (opposite of 0)
+        {3.0f, 0.1f},  // 4: nearly right (not unit norm)
+        {0.5f, 0.0f},  // 5: same direction as 0, different magnitude
     };
 
     for (size_t i = 0; i < vectors.size(); ++i) {
@@ -1107,9 +1107,9 @@ void test_normalized_storage_invariant() {
 
     // Insert vectors with varying magnitudes (all same dimension)
     std::vector<std::vector<float>> vectors = {
-        {3.0f, 4.0f},       // norm = 5
-        {0.1f, 0.2f},       // small magnitude
-        {100.0f, 0.0f},     // large magnitude
+        {3.0f, 4.0f},   // norm = 5
+        {0.1f, 0.2f},   // small magnitude
+        {100.0f, 0.0f}, // large magnitude
     };
 
     // Use insert_single_threaded to keep it simple
@@ -1128,6 +1128,38 @@ void test_normalized_storage_invariant() {
     }
 
     std::cout << "  ✓ Normalized storage invariant passed" << std::endl;
+}
+
+// Test 26b: fp16 vectors are stored normalized when normalize_vectors is enabled
+void test_normalized_fp16_storage_invariant() {
+    std::cout << "Test 26b: Normalized fp16 storage invariant..." << std::endl;
+
+    using CosineIndex = HNSWIndex<sqlite_vec_cpp::utils::float16_t, CosineMetric<float>>;
+    CosineIndex::Config cfg;
+    cfg.normalize_vectors = true;
+
+    CosineIndex index(cfg);
+
+    std::vector<std::vector<float>> vectors = {
+        {3.0f, 4.0f},
+        {0.1f, 0.2f},
+        {100.0f, 0.0f},
+    };
+
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        auto f16 = to_float16(std::span{vectors[i]});
+        index.insert(i, std::span{f16});
+    }
+
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        const auto* node = index.get_node(i);
+        assert(node != nullptr);
+        auto stored_vec = node->as_float32();
+        float norm = vector_norm(std::span<const float>(stored_vec));
+        assert(std::abs(norm - 1.0f) < 0.02f);
+    }
+
+    std::cout << "  ✓ Normalized fp16 storage invariant passed" << std::endl;
 }
 
 // Test 27: SIMD inner product distance correctness for known values
@@ -1208,6 +1240,7 @@ int main() {
     test_normalized_batch_build();
     test_normalized_parallel_build();
     test_normalized_storage_invariant();
+    test_normalized_fp16_storage_invariant();
     test_inner_product_distance_correctness();
 
     std::cout << "\nAll HNSW tests passed!" << std::endl;

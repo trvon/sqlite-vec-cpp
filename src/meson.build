@@ -14,7 +14,7 @@ sqlite_vec_cpp_lib = static_library(
   sqlite_vec_cpp_sources.length() > 0 ? sqlite_vec_cpp_sources : [],
   include_directories: inc_dirs,
   dependencies: [sqlite3_dep],
-  install: false,  # Internal use in YAMS
+  install: sqlite_vec_cpp_sources.length() > 0,
   build_by_default: sqlite_vec_cpp_sources.length() > 0
 )
 

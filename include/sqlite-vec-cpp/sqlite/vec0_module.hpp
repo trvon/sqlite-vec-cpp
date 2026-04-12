@@ -10,6 +10,7 @@
 #include "../utils/error.hpp"
 #include "parsers.hpp"
 #include "value.hpp"
+#include "vtab.hpp"
 
 namespace sqlite_vec_cpp::sqlite {
 
@@ -45,6 +46,12 @@ struct Vec0Cursor {
         }
     }
 };
+
+inline int vec0_set_error(Vec0Table* table, const std::string& message,
+                          int rc = SQLITE_CONSTRAINT) {
+    VTab(&table->base).set_error(message);
+    return rc;
+}
 
 // Helper: Parse CREATE VIRTUAL TABLE statement for embedding column and dimensions
 inline bool parse_vec0_schema(int argc, const char* const* argv, std::string& embedding_col,
@@ -337,18 +344,31 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
 
     // DELETE: argc==1, argv[0]=old_rowid
     if (argc == 1) {
-        int64_t rowid = sqlite3_value_int64(argv[0]);
+        sqlite3_stmt* stmt = nullptr;
         std::ostringstream sql;
         sql << "DELETE FROM \"" << table->schema_name << "\".\"" << table->table_name
-            << "_vectors\" WHERE rowid=" << rowid;
-        return sqlite3_exec(table->db, sql.str().c_str(), nullptr, nullptr, nullptr);
+            << "_vectors\" WHERE rowid=?";
+        int rc = sqlite3_prepare_v2(table->db, sql.str().c_str(), -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            return rc;
+        }
+
+        sqlite3_bind_int64(stmt, 1, sqlite3_value_int64(argv[0]));
+        rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        return rc == SQLITE_DONE ? SQLITE_OK : rc;
     }
 
     // INSERT: argc>1, argv[0]=NULL, argv[1]=new_rowid or NULL
     // UPDATE: argc>1, argv[0]=old_rowid, argv[1]=new_rowid
     if (argc > 1) {
         bool is_insert = (sqlite3_value_type(argv[0]) == SQLITE_NULL);
-        int64_t rowid = is_insert ? 0 : sqlite3_value_int64(argv[0]);
+        int64_t old_rowid = is_insert ? 0 : sqlite3_value_int64(argv[0]);
+        bool has_declared_rowid = sqlite3_value_type(argv[2]) != SQLITE_NULL;
+        bool has_new_rowid = sqlite3_value_type(argv[1]) != SQLITE_NULL;
+        int64_t new_rowid = has_declared_rowid
+                                ? sqlite3_value_int64(argv[2])
+                                : (has_new_rowid ? sqlite3_value_int64(argv[1]) : old_rowid);
 
         // argv layout per SQLite vtab spec:
         // - argv[0]: old rowid (or NULL)
@@ -370,16 +390,41 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
             Value value(embedding_val);
             auto parsed = parse_vector_from_value<float>(value);
             if (parsed) {
+                if (parsed->size() != table->dimensions) {
+                    return vec0_set_error(table, "vec0 dimension mismatch: expected " +
+                                                     std::to_string(table->dimensions) + ", got " +
+                                                     std::to_string(parsed->size()));
+                }
                 parsed_vec = std::move(parsed.value());
                 blob = parsed_vec.data();
                 bytes = static_cast<int>(parsed_vec.size() * sizeof(float));
+            } else {
+                return vec0_set_error(table, parsed.error().message, SQLITE_MISMATCH);
+            }
+        } else if (sqlite3_value_type(embedding_val) == SQLITE_BLOB && blob && bytes > 0) {
+            if (bytes % static_cast<int>(sizeof(float)) != 0) {
+                return vec0_set_error(table,
+                                      "vec0 embeddings must be float32 blobs aligned to 4 bytes",
+                                      SQLITE_MISMATCH);
+            }
+
+            std::size_t dimensions = static_cast<std::size_t>(bytes) / sizeof(float);
+            if (dimensions != table->dimensions) {
+                return vec0_set_error(table, "vec0 dimension mismatch: expected " +
+                                                 std::to_string(table->dimensions) + ", got " +
+                                                 std::to_string(dimensions));
             }
         }
 
         if (is_insert) {
             std::ostringstream sql;
-            sql << "INSERT INTO \"" << table->schema_name << "\".\"" << table->table_name
-                << "_vectors\" (\"" << table->embedding_column << "\") VALUES (?)";
+            if (has_declared_rowid || has_new_rowid) {
+                sql << "INSERT INTO \"" << table->schema_name << "\".\"" << table->table_name
+                    << "_vectors\" (rowid, \"" << table->embedding_column << "\") VALUES (?, ?)";
+            } else {
+                sql << "INSERT INTO \"" << table->schema_name << "\".\"" << table->table_name
+                    << "_vectors\" (\"" << table->embedding_column << "\") VALUES (?)";
+            }
 
             sqlite3_stmt* stmt;
             int rc = sqlite3_prepare_v2(table->db, sql.str().c_str(), -1, &stmt, nullptr);
@@ -387,15 +432,22 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
                 return rc;
             }
 
+            int bind_idx = 1;
+            if (has_declared_rowid || has_new_rowid) {
+                sqlite3_bind_int64(stmt, bind_idx++, new_rowid);
+            }
+
             if (blob && bytes > 0) {
-                sqlite3_bind_blob(stmt, 1, blob, bytes, SQLITE_TRANSIENT);
+                sqlite3_bind_blob(stmt, bind_idx, blob, bytes, SQLITE_TRANSIENT);
             } else {
-                sqlite3_bind_null(stmt, 1);
+                sqlite3_bind_null(stmt, bind_idx);
             }
 
             rc = sqlite3_step(stmt);
             if (rc == SQLITE_DONE) {
-                *pRowid = sqlite3_last_insert_rowid(table->db);
+                *pRowid = (has_declared_rowid || has_new_rowid)
+                              ? new_rowid
+                              : sqlite3_last_insert_rowid(table->db);
                 rc = SQLITE_OK;
             }
 
@@ -404,7 +456,7 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
         } else {
             std::ostringstream sql;
             sql << "UPDATE \"" << table->schema_name << "\".\"" << table->table_name
-                << "_vectors\" SET \"" << table->embedding_column << "\"=? WHERE rowid=" << rowid;
+                << "_vectors\" SET rowid=?, \"" << table->embedding_column << "\"=? WHERE rowid=?";
 
             sqlite3_stmt* stmt;
             int rc = sqlite3_prepare_v2(table->db, sql.str().c_str(), -1, &stmt, nullptr);
@@ -412,15 +464,19 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
                 return rc;
             }
 
+            sqlite3_bind_int64(stmt, 1, new_rowid);
+
             if (blob && bytes > 0) {
-                sqlite3_bind_blob(stmt, 1, blob, bytes, SQLITE_TRANSIENT);
+                sqlite3_bind_blob(stmt, 2, blob, bytes, SQLITE_TRANSIENT);
             } else {
-                sqlite3_bind_null(stmt, 1);
+                sqlite3_bind_null(stmt, 2);
             }
+
+            sqlite3_bind_int64(stmt, 3, old_rowid);
 
             rc = sqlite3_step(stmt);
             if (rc == SQLITE_DONE) {
-                *pRowid = rowid;
+                *pRowid = new_rowid;
                 rc = SQLITE_OK;
             }
 

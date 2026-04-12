@@ -7,21 +7,74 @@ Modern C++20/23 implementation of [sqlite-vec](https://github.com/asg017/sqlite-
 ### Requirements
 
 - **Compiler**: GCC 10+, Clang 12+, MSVC 19.29+ with C++20 support
-- **C++23**: Recommended for native `std::expected` (auto-detects and falls back to `tl::expected`)
+- **C++23**: Optional. If the configured build standard provides `std::expected`, it will be used automatically.
 - **Dependencies**: SQLite3 ≥3.38.0 development headers
-- **Optional**: AVX2 (x86-64) or NEON (ARM64) for SIMD acceleration
+- **Optional**: CPU-specific SIMD tuning for AVX-family or ARM DotProd
 
 ### Meson (Recommended)
 
 ```bash
-meson setup build --buildtype=release -Dcpp_std=c++20
+meson setup build --buildtype=debugoptimized -Db_ndebug=true -Dcpp_std=c++20
 meson compile -C build
 meson test -C build
 ```
 
+This is the recommended default for packaging and distribution: portable optimized code with debug info.
+
+### Offline / System Dependencies
+
+`sqlite-vec-cpp` does not require Conan for normal builds. The primary integration path is direct Meson with system dependencies.
+
+```bash
+PKG_CONFIG_PATH=/opt/sqlite/lib/pkgconfig \
+meson setup build \
+  --buildtype=debugoptimized \
+  -Db_ndebug=true \
+  --wrap-mode=nofallback \
+  -Dcpp_std=c++20
+
+meson compile -C build
+```
+
+If your environment prefers CMake as the source-build entrypoint:
+
+```bash
+cmake -S . -B build/cmake-bootstrap
+cmake --build build/cmake-bootstrap
+```
+
+### Install / Packaging
+
+```bash
+meson setup build --buildtype=debugoptimized -Db_ndebug=true
+meson compile -C build
+meson install -C build
+```
+
+Installed package metadata includes:
+- `sqlite-vec-cpp.pc`
+- `sqlite-vec-cppConfig.cmake`
+
+### Conan (Optional Dev Bootstrap)
+
+Conan is optional and primarily intended for local development convenience:
+
+```bash
+conan install . -of build/conan -s build_type=Release
+```
+
+For benchmark dependencies as well:
+
+```bash
+conan install . -of build/conan -s build_type=Release -o with_benchmarks=True
+```
+
 Build options:
-- `-Denable_simd=true|false|auto`: SIMD detection (default: auto)
-- `-Dcpp_std=c++20|c++23`: Standard version (default: c++23)
+- `-Dcpp_std=c++20|c++23`: Standard version (default: `c++20`)
+- `-Denable_simd_neon=true|false`: baseline AArch64 NEON support (default: `true`)
+- `-Denable_simd_dotprod=true`: enable ARMv8.2 DotProd (`-march=armv8.2-a+dotprod`, non-portable)
+- `-Denable_simd_avx=true`: enable x86 AVX/AVX2/FMA/AVX-512 probing (`-mavx*`, non-portable)
+- `-Denable_simd_arm32_neon=true`: enable 32-bit ARM NEON via `-mfpu=neon` (non-portable)
 - `-Denable_benchmarks=true`: Build performance benchmarks
 
 ## Performance
@@ -34,6 +87,8 @@ Micro-benchmarks (1M vector pairs, 384 dimensions, AVX2 enabled):
 | Hamming distance  |   8.7 ms     | 8.8 ms  |  +1.1%   |
 
 Run benchmarks: `meson test -C build benchmark --benchmark`
+
+Benchmark configurations may intentionally use non-portable CPU tuning flags. Keep those settings separate from package-manager or distribution builds.
 
 ## Design Constraints
 

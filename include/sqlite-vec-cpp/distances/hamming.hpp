@@ -5,6 +5,7 @@
 #include <cassert>
 #include <climits>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include "../concepts/distance_metric.hpp"
 #include "../concepts/vector_element.hpp"
@@ -55,6 +56,23 @@ inline float hamming_distance_u64(std::span<const std::uint64_t> a,
     return static_cast<float>(count);
 }
 
+/// Hamming distance for byte spans processed in uint64_t chunks without alignment assumptions.
+inline float hamming_distance_u64_bytes(std::span<const std::uint8_t> a,
+                                        std::span<const std::uint8_t> b) {
+    assert(a.size() == b.size() && "Bitvector dimensions must match");
+    assert(a.size() % sizeof(std::uint64_t) == 0 && "Byte size must be divisible by 8");
+
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < a.size(); i += sizeof(std::uint64_t)) {
+        std::uint64_t lhs = 0;
+        std::uint64_t rhs = 0;
+        std::memcpy(&lhs, a.data() + i, sizeof(lhs));
+        std::memcpy(&rhs, b.data() + i, sizeof(rhs));
+        count += std::popcount(lhs ^ rhs);
+    }
+    return static_cast<float>(count);
+}
+
 /// Main hamming distance function
 /// Note: Input is bitvector data (bits packed into bytes)
 /// The 'dimensions' parameter in original code is the number of BITS, not bytes
@@ -67,12 +85,7 @@ inline float hamming_distance(std::span<const std::uint8_t> a, std::span<const s
 
     // Optimize for uint64_t if dimensions align
     if (bit_dimensions % 64 == 0) {
-        const std::size_t u64_size = bit_dimensions / 64;
-        auto a_u64 = std::span<const std::uint64_t>(
-            reinterpret_cast<const std::uint64_t*>(a.data()), u64_size);
-        auto b_u64 = std::span<const std::uint64_t>(
-            reinterpret_cast<const std::uint64_t*>(b.data()), u64_size);
-        return hamming_distance_u64(a_u64, b_u64);
+        return hamming_distance_u64_bytes(a.subspan(0, byte_size), b.subspan(0, byte_size));
     }
 
     // Fallback to byte-wise lookup table

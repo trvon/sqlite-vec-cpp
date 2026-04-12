@@ -178,6 +178,22 @@ void test_hamming_distance() {
     std::cout << "  Hamming distance tests passed!" << std::endl;
 }
 
+void test_hamming_distance_unaligned() {
+    std::cout << "Testing hamming distance with unaligned buffers..." << std::endl;
+
+    std::vector<std::uint8_t> storage_a = {0x00, 0xAA, 0x55, 0x0F, 0xF0, 0x12, 0x34, 0x56, 0x78};
+    std::vector<std::uint8_t> storage_b = {0x00, 0xAB, 0x55, 0x0E, 0xF0, 0x12, 0x35, 0x56, 0x79};
+
+    auto a = std::span<const std::uint8_t>(storage_a.data() + 1, 8);
+    auto b = std::span<const std::uint8_t>(storage_b.data() + 1, 8);
+
+    float dist = hamming_distance(a, b, 64);
+    float expected = hamming_distance_u8(a, b);
+    assert(approx_equal(dist, expected));
+
+    std::cout << "  Unaligned hamming distance test passed!" << std::endl;
+}
+
 void test_metric_traits() {
     std::cout << "Testing metric traits..." << std::endl;
 
@@ -250,6 +266,7 @@ int main() {
         test_l1_distance();
         test_cosine_distance();
         test_hamming_distance();
+        test_hamming_distance_unaligned();
         test_metric_traits();
         test_simd_consistency();
 

@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <variant>
 
 // C++23 std::expected or fallback
 #ifdef HAS_CPP23_EXPECTED
@@ -29,64 +30,51 @@ private:
 
 template <typename T, typename E> class Expected {
 public:
-    explicit Expected(T value) : has_value_(true) { new (&storage_.value) T(std::move(value)); }
+    explicit Expected(T value) : storage_(std::in_place_index<0>, std::move(value)) {}
 
-    explicit Expected(Unexpected<E> error) : has_value_(false) {
-        new (&storage_.error) E(std::move(error.error()));
-    }
+    explicit Expected(Unexpected<E> error)
+        : storage_(std::in_place_index<1>, std::move(error.error())) {}
 
-    explicit Expected(E error) : has_value_(false) { new (&storage_.error) E(std::move(error)); }
+    explicit Expected(E error) : storage_(std::in_place_index<1>, std::move(error)) {}
 
-    ~Expected() {
-        if (has_value_) {
-            storage_.value.~T();
-        } else {
-            storage_.error.~E();
-        }
-    }
+    ~Expected() = default;
 
     Expected(const Expected&) = delete;
     Expected& operator=(const Expected&) = delete;
+    Expected(Expected&&) noexcept = default;
+    Expected& operator=(Expected&&) noexcept = default;
 
-    Expected(Expected&& other) noexcept : has_value_(other.has_value_) {
-        if (has_value_) {
-            new (&storage_.value) T(std::move(other.storage_.value));
-        } else {
-            new (&storage_.error) E(std::move(other.storage_.error));
-        }
-    }
-
-    bool has_value() const noexcept { return has_value_; }
-    explicit operator bool() const noexcept { return has_value_; }
+    bool has_value() const noexcept { return storage_.index() == 0; }
+    explicit operator bool() const noexcept { return has_value(); }
 
     T& value() & {
-        if (!has_value_)
+        if (!has_value())
             throw std::runtime_error("Expected: no value");
-        return storage_.value;
+        return std::get<0>(storage_);
     }
 
     const T& value() const& {
-        if (!has_value_)
+        if (!has_value())
             throw std::runtime_error("Expected: no value");
-        return storage_.value;
+        return std::get<0>(storage_);
     }
 
     T&& value() && {
-        if (!has_value_)
+        if (!has_value())
             throw std::runtime_error("Expected: no value");
-        return std::move(storage_.value);
+        return std::move(std::get<0>(storage_));
     }
 
     E& error() & {
-        if (has_value_)
+        if (has_value())
             throw std::runtime_error("Expected: has value");
-        return storage_.error;
+        return std::get<1>(storage_);
     }
 
     const E& error() const& {
-        if (has_value_)
+        if (has_value())
             throw std::runtime_error("Expected: has value");
-        return storage_.error;
+        return std::get<1>(storage_);
     }
 
     T& operator*() & { return value(); }
@@ -97,13 +85,7 @@ public:
     const T* operator->() const { return &value(); }
 
 private:
-    union Storage {
-        T value;
-        E error;
-        Storage() {}
-        ~Storage() {}
-    } storage_;
-    bool has_value_;
+    std::variant<T, E> storage_;
 };
 
 // Specialization for void

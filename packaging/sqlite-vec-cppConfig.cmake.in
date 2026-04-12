@@ -1,0 +1,31 @@
+include(CMakeFindDependencyMacro)
+
+find_dependency(SQLite3 3.38 REQUIRED)
+
+get_filename_component(_sqlite_vec_cpp_prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+
+set(_sqlite_vec_cpp_libdir "@LIBDIR@")
+if(NOT IS_ABSOLUTE "${_sqlite_vec_cpp_libdir}")
+  set(_sqlite_vec_cpp_libdir "${_sqlite_vec_cpp_prefix}/${_sqlite_vec_cpp_libdir}")
+endif()
+
+set(_sqlite_vec_cpp_includedir "@INCLUDEDIR@")
+if(NOT IS_ABSOLUTE "${_sqlite_vec_cpp_includedir}")
+  set(_sqlite_vec_cpp_includedir "${_sqlite_vec_cpp_prefix}/${_sqlite_vec_cpp_includedir}")
+endif()
+
+if(NOT TARGET sqlite-vec-cpp::sqlite-vec-cpp)
+  add_library(sqlite-vec-cpp::sqlite-vec-cpp STATIC IMPORTED)
+  set_target_properties(sqlite-vec-cpp::sqlite-vec-cpp PROPERTIES
+    IMPORTED_LOCATION "${_sqlite_vec_cpp_libdir}/${CMAKE_STATIC_LIBRARY_PREFIX}sqlite-vec-cpp${CMAKE_STATIC_LIBRARY_SUFFIX}"
+    INTERFACE_COMPILE_DEFINITIONS SQLITE_VEC_CPP_ENABLED
+    INTERFACE_INCLUDE_DIRECTORIES "${_sqlite_vec_cpp_includedir}"
+    INTERFACE_LINK_LIBRARIES "SQLite::SQLite3"
+  )
+endif()
+
+set(sqlite_vec_cpp_VERSION "@VERSION@")
+
+unset(_sqlite_vec_cpp_libdir)
+unset(_sqlite_vec_cpp_includedir)
+unset(_sqlite_vec_cpp_prefix)

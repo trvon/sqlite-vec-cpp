@@ -127,7 +127,7 @@ inline float inner_product_float_avx(std::span<const float> a, std::span<const f
     for (std::size_t i = 0; i < a.size(); i += 8) {
         __m256 a_vec = _mm256_loadu_ps(&a[i]);
         __m256 b_vec = _mm256_loadu_ps(&b[i]);
-        sum_vec = _mm256_fmadd_ps(a_vec, b_vec, sum_vec);
+        sum_vec = simd::avx_fmadd_ps(a_vec, b_vec, sum_vec);
     }
 
     // Horizontal sum - extract and add lanes

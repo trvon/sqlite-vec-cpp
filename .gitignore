@@ -40,3 +40,27 @@
 # debug information files
 *.dwo
 coverage
+
+# Build directories
+build/
+builddir/
+_build/
+cmake-build-*/
+
+# Meson / CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Testing/
+install_manifest*.txt
+
+# Conan generated files
+conan.lock
+conanbuild.*
+conanrun.*
+conan_meson_*.ini
+
+# Python cache
+__pycache__/
+*.pyc

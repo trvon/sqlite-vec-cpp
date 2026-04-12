@@ -9,6 +9,14 @@
 
 namespace sqlite_vec_cpp::distances::simd {
 
+inline __m256 avx_fmadd_ps(__m256 a, __m256 b, __m256 c) {
+#ifdef SQLITE_VEC_ENABLE_FMA
+    return _mm256_fmadd_ps(a, b, c);
+#else
+    return _mm256_add_ps(_mm256_mul_ps(a, b), c);
+#endif
+}
+
 /// AVX-optimized L2 (Euclidean) distance for float vectors
 /// Requires: AVX support, size % 16 == 0, size >= 16
 inline float l2_distance_float_avx(std::span<const float> a, std::span<const float> b) {
@@ -74,9 +82,9 @@ inline float cosine_distance_float_avx(std::span<const float> a, std::span<const
         __m256 v2 = _mm256_loadu_ps(&b[i]);
 
         // Accumulate dot product and magnitudes
-        dot_sum = _mm256_fmadd_ps(v1, v2, dot_sum);
-        a_sum = _mm256_fmadd_ps(v1, v1, a_sum);
-        b_sum = _mm256_fmadd_ps(v2, v2, b_sum);
+        dot_sum = avx_fmadd_ps(v1, v2, dot_sum);
+        a_sum = avx_fmadd_ps(v1, v1, a_sum);
+        b_sum = avx_fmadd_ps(v2, v2, b_sum);
 
         i += 8;
     }

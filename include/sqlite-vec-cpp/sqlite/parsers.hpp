@@ -22,6 +22,7 @@ constexpr bool is_json_space(char c) noexcept {
 /// Format: "[1.0, 2.5, 3.14, ...]"
 template <typename T> Result<std::vector<T>> parse_json_array(std::string_view json_str) {
     std::vector<T> result;
+    bool saw_closing_bracket = false;
 
     // Skip leading whitespace
     std::size_t i = 0;
@@ -55,13 +56,14 @@ template <typename T> Result<std::vector<T>> parse_json_array(std::string_view j
 
         // Check for end of array
         if (json_str[i] == ']') {
+            ++i;
+            saw_closing_bracket = true;
             break;
         }
 
         // Parse number
         T value{};
         const char* start = &json_str[i];
-        const char* end = start + (json_str.size() - i);
 
         if constexpr (std::is_floating_point_v<T>) {
             // Use strtod for floating point
@@ -77,6 +79,7 @@ template <typename T> Result<std::vector<T>> parse_json_array(std::string_view j
             i += (endptr - start);
         } else {
             // Use from_chars for integers (C++17)
+            const char* end = start + (json_str.size() - i);
             auto [ptr, ec] = std::from_chars(start, end, value);
 
             if (ec != std::errc{}) {
@@ -103,6 +106,19 @@ template <typename T> Result<std::vector<T>> parse_json_array(std::string_view j
                     "Expected ',' or ']' in JSON array at position " + std::to_string(i)));
             }
         }
+    }
+
+    if (!saw_closing_bracket) {
+        return err<std::vector<T>>(Error::invalid_argument("JSON array must end with ']'"));
+    }
+
+    while (i < json_str.size() && is_json_space(json_str[i])) {
+        ++i;
+    }
+
+    if (i != json_str.size()) {
+        return err<std::vector<T>>(
+            Error::invalid_argument("Unexpected trailing characters after JSON array"));
     }
 
     if (result.empty()) {

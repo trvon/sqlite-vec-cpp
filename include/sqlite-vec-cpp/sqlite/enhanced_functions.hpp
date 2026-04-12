@@ -27,12 +27,15 @@ inline void vec_dot_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     int subtype_a = val_a.subtype();
     int subtype_b = val_b.subtype();
 
-    if (subtype_a != subtype_b) {
+    VectorElementType elem_type_a = get_element_type_from_subtype(subtype_a);
+    VectorElementType elem_type_b = get_element_type_from_subtype(subtype_b);
+
+    if (elem_type_a != elem_type_b) {
         context.result_error("Vector element types must match");
         return;
     }
 
-    VectorElementType elem_type = get_element_type_from_subtype(subtype_a);
+    VectorElementType elem_type = elem_type_a;
 
     if (elem_type == VectorElementType::Float32) {
         auto vec_a = parse_vector_from_value<float>(val_a);
