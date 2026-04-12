@@ -267,6 +267,7 @@ install_headers(
     'include/sqlite-vec-cpp/index/hnsw_persistence.hpp',
     'include/sqlite-vec-cpp/index/hnsw_quantized.hpp',
     'include/sqlite-vec-cpp/index/hnsw_threading.hpp',
+    'include/sqlite-vec-cpp/index/quantization_snapshot.hpp',
   ],
   subdir: 'sqlite-vec-cpp/index',
 )

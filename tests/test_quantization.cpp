@@ -702,6 +702,128 @@ void test_two_stage_stale_detection() {
     std::cout << "  PASS: stale detection works for insert and delete" << std::endl;
 }
 
+void test_stale_isolate_deleted() {
+    std::cout << "Testing stale detection with isolate_deleted..." << std::endl;
+
+    std::mt19937 rng(99);
+    const size_t dim = 32;
+    const size_t corpus_size = 50;
+
+    HNSWIndex<float, L2Metric<float>> index;
+    for (size_t i = 0; i < corpus_size; ++i) {
+        auto vec = generate_vector(dim, rng);
+        index.insert_single_threaded(i, std::span<const float>(vec));
+    }
+
+    HNSWQuantizedSearch<float, L2Metric<float>>::Config qconfig;
+    qconfig.quantization = QuantizationType::LVQ8;
+    HNSWQuantizedSearch<float, L2Metric<float>> qsearch(index, qconfig);
+    qsearch.build_quantization();
+    assert(!qsearch.is_stale());
+
+    // Soft-delete some nodes
+    index.remove(0);
+    index.remove(1);
+    assert(qsearch.is_stale());
+
+    // Rebuild to get fresh
+    qsearch.build_quantization();
+    assert(!qsearch.is_stale());
+
+    // isolate_deleted rewrites graph edges -> must bump generation
+    index.isolate_deleted();
+    assert(qsearch.is_stale());
+
+    // Search still works (falls back to exact)
+    auto query = generate_vector(dim, rng);
+    auto results = qsearch.search(std::span<const float>(query), 5, 50);
+    assert(!results.empty());
+
+    std::cout << "  PASS: isolate_deleted bumps generation" << std::endl;
+}
+
+void test_stale_restore_and_clear() {
+    std::cout << "Testing stale detection with restore/clear_deletions..." << std::endl;
+
+    std::mt19937 rng(77);
+    const size_t dim = 32;
+    const size_t corpus_size = 50;
+
+    HNSWIndex<float, L2Metric<float>> index;
+    for (size_t i = 0; i < corpus_size; ++i) {
+        auto vec = generate_vector(dim, rng);
+        index.insert_single_threaded(i, std::span<const float>(vec));
+    }
+
+    HNSWQuantizedSearch<float, L2Metric<float>>::Config qconfig;
+    qconfig.quantization = QuantizationType::LVQ4;
+    HNSWQuantizedSearch<float, L2Metric<float>> qsearch(index, qconfig);
+
+    // Delete, rebuild, then restore -> stale
+    index.remove(5);
+    qsearch.build_quantization();
+    assert(!qsearch.is_stale());
+
+    bool restored = index.restore(5);
+    assert(restored);
+    assert(qsearch.is_stale());
+
+    // Rebuild, then clear_deletions on empty set -> should NOT bump (no-op)
+    qsearch.build_quantization();
+    assert(!qsearch.is_stale());
+    index.clear_deletions(); // nothing to clear
+    assert(!qsearch.is_stale()); // generation unchanged
+
+    // Delete, rebuild, then clear_deletions with actual deletions -> stale
+    index.remove(10);
+    index.remove(11);
+    qsearch.build_quantization();
+    assert(!qsearch.is_stale());
+    index.clear_deletions();
+    assert(qsearch.is_stale());
+
+    std::cout << "  PASS: restore/clear_deletions bump generation correctly" << std::endl;
+}
+
+void test_snapshot_rebuild_consistency() {
+    std::cout << "Testing snapshot-based rebuild consistency..." << std::endl;
+
+    std::mt19937 rng(55);
+    const size_t dim = 64;
+    const size_t corpus_size = 100;
+
+    HNSWIndex<float, L2Metric<float>> index;
+    for (size_t i = 0; i < corpus_size; ++i) {
+        auto vec = generate_vector(dim, rng);
+        index.insert_single_threaded(i, std::span<const float>(vec));
+    }
+
+    // Build LVQ-8, search, get results
+    HNSWQuantizedSearch<float, L2Metric<float>>::Config qconfig;
+    qconfig.quantization = QuantizationType::LVQ8;
+    qconfig.rerank_factor = 2;
+    HNSWQuantizedSearch<float, L2Metric<float>> qsearch(index, qconfig);
+    qsearch.build_quantization();
+
+    auto query = generate_vector(dim, rng);
+    auto results1 = qsearch.search(std::span<const float>(query), 10, 100);
+    assert(results1.size() == 10);
+
+    // Rebuild and search again -> same results (deterministic)
+    qsearch.build_quantization();
+    auto results2 = qsearch.search(std::span<const float>(query), 10, 100);
+    assert(results2.size() == 10);
+
+    // Same IDs in same order
+    for (size_t i = 0; i < results1.size(); ++i) {
+        assert(results1[i].first == results2[i].first);
+        float dist_diff = std::abs(results1[i].second - results2[i].second);
+        assert(dist_diff < 1e-5f);
+    }
+
+    std::cout << "  PASS: snapshot rebuild produces identical results" << std::endl;
+}
+
 // ========== Main ==========
 
 int main() {
@@ -736,6 +858,9 @@ int main() {
     test_two_stage_empty_index();
     test_two_stage_none_fallback();
     test_two_stage_stale_detection();
+    test_stale_isolate_deleted();
+    test_stale_restore_and_clear();
+    test_snapshot_rebuild_consistency();
     std::cout << std::endl;
 
     std::cout << "=== All quantization tests passed ===" << std::endl;

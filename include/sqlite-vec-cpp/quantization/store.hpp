@@ -17,6 +17,7 @@
 #include <variant>
 #include <vector>
 
+#include "../index/quantization_snapshot.hpp"
 #include "lvq.hpp"
 #include "rabitq.hpp"
 
@@ -70,6 +71,30 @@ struct LVQ8Store {
             std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
             scales[node.dense_id] = code.scale;
             offsets[node.dense_id] = code.offset;
+        }
+    }
+
+    /// Build from a locked quantization snapshot (preferred — no live graph iteration)
+    void build(const index::QuantizationSnapshot& snap) {
+        if (snap.entries.empty())
+            return;
+
+        dim = snap.dim;
+        size_t max_dense_id = 0;
+        for (const auto& e : snap.entries)
+            max_dense_id = std::max(max_dense_id, e.dense_id);
+
+        count = max_dense_id + 1;
+        codes.resize(count * dim, 0);
+        scales.resize(count, 0.0f);
+        offsets.resize(count, 0.0f);
+
+        for (const auto& e : snap.entries) {
+            auto code = LVQ8::encode(std::span<const float>(e.vector));
+            size_t offset = e.dense_id * dim;
+            std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
+            scales[e.dense_id] = code.scale;
+            offsets[e.dense_id] = code.offset;
         }
     }
 
@@ -239,6 +264,31 @@ struct LVQ4Store {
             std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
             scales[node.dense_id] = code.scale;
             offsets[node.dense_id] = code.offset;
+        }
+    }
+
+    /// Build from a locked quantization snapshot (preferred — no live graph iteration)
+    void build(const index::QuantizationSnapshot& snap) {
+        if (snap.entries.empty())
+            return;
+
+        dim = snap.dim;
+        bytes_per_vec = (dim + 1) / 2;
+        size_t max_dense_id = 0;
+        for (const auto& e : snap.entries)
+            max_dense_id = std::max(max_dense_id, e.dense_id);
+
+        count = max_dense_id + 1;
+        codes.resize(count * bytes_per_vec, 0);
+        scales.resize(count, 0.0f);
+        offsets.resize(count, 0.0f);
+
+        for (const auto& e : snap.entries) {
+            auto code = LVQ4::encode(std::span<const float>(e.vector));
+            size_t offset = e.dense_id * bytes_per_vec;
+            std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
+            scales[e.dense_id] = code.scale;
+            offsets[e.dense_id] = code.offset;
         }
     }
 
@@ -463,6 +513,46 @@ struct RaBitQStore {
                 }
             }
             norms[did] = std::sqrt(norm_sq);
+        }
+    }
+
+    /// Build from a locked quantization snapshot (preferred — no live graph iteration)
+    void build(const index::QuantizationSnapshot& snap) {
+        if (snap.entries.empty())
+            return;
+
+        dim = snap.dim;
+        size_t max_dense_id = 0;
+        for (const auto& e : snap.entries)
+            max_dense_id = std::max(max_dense_id, e.dense_id);
+
+        // Compute centroid
+        centroid.assign(dim, 0.0f);
+        for (const auto& e : snap.entries) {
+            for (size_t i = 0; i < dim; ++i)
+                centroid[i] += e.vector[i];
+        }
+        float inv_n = 1.0f / static_cast<float>(snap.entries.size());
+        for (size_t i = 0; i < dim; ++i)
+            centroid[i] *= inv_n;
+
+        // Encode all vectors
+        bytes_per_vec = (dim + 7) / 8;
+        count = max_dense_id + 1;
+        bits.resize(count * bytes_per_vec, 0);
+        norms.resize(count, 0.0f);
+
+        for (const auto& e : snap.entries) {
+            size_t bit_offset = e.dense_id * bytes_per_vec;
+            float norm_sq = 0.0f;
+            for (size_t i = 0; i < dim; ++i) {
+                float centered = e.vector[i] - centroid[i];
+                norm_sq += e.vector[i] * e.vector[i];
+                if (centered >= 0.0f) {
+                    bits[bit_offset + i / 8] |= (1u << (i % 8));
+                }
+            }
+            norms[e.dense_id] = std::sqrt(norm_sq);
         }
     }
 

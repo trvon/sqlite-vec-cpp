@@ -73,21 +73,25 @@ public:
         if (base_index_.empty())
             return;
 
+        // Capture a consistent snapshot under the index read lock.
+        // Stores build from the snapshot, never iterating the live graph.
+        auto snap = base_index_.snapshot_for_quantization();
+
         switch (config_.quantization) {
         case QuantizationType::LVQ8:
-            lvq8_store_.build(base_index_);
+            lvq8_store_.build(snap);
             break;
         case QuantizationType::LVQ4:
-            lvq4_store_.build(base_index_);
+            lvq4_store_.build(snap);
             break;
         case QuantizationType::RaBitQ:
-            rabitq_store_.build(base_index_);
+            rabitq_store_.build(snap);
             break;
         case QuantizationType::None:
             break;
         }
 
-        quantization_generation_ = base_index_.mutation_generation();
+        quantization_generation_ = snap.generation;
     }
 
     /// Two-stage search: quantized traversal + FP32 reranking

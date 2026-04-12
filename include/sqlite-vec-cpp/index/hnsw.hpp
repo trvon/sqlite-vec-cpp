@@ -18,6 +18,7 @@
 #include "../distances/inner_product.hpp"
 #include "hnsw_node.hpp"
 #include "hnsw_threading.hpp"
+#include "quantization_snapshot.hpp"
 
 // Prefetch hints for vector data during graph traversal
 // Define HNSW_DISABLE_PREFETCH to disable prefetching (for benchmarking)
@@ -42,12 +43,16 @@
 
 namespace sqlite_vec_cpp::index {
 
+// Forward declaration for friend access
+template <concepts::VectorElement, typename> class HNSWQuantizedSearch;
+
 /// Hierarchical Navigable Small World (HNSW) index for approximate nearest neighbor search
 /// Provides 100-1000x speedup over brute-force for large corpora (>100K vectors)
 ///
 /// @tparam StorageT Storage type for vectors (float or float16_t)
 /// @tparam MetricT Distance metric type (must work with float spans)
 template <concepts::VectorElement StorageT, typename MetricT> class HNSWIndex {
+    friend class HNSWQuantizedSearch<StorageT, MetricT>;
 public:
     /// Configuration parameters for HNSW index
     /// Tuned for high recall on large corpora (10K+ vectors) with high-dimensional embeddings
@@ -226,6 +231,9 @@ public:
                 return;
             }
             it->second.dense_id = next_dense_id_++;
+            // Bump generation while holding write lock so snapshot readers
+            // see a consistent (node-visible, generation-bumped) state.
+            mutation_generation_.fetch_add(1, std::memory_order_release);
 
             // First node becomes entry point
             if (nodes_.size() == 1) {
@@ -309,8 +317,6 @@ public:
                 current = candidates[0].first;
             }
         }
-
-        mutation_generation_.fetch_add(1, std::memory_order_release);
     }
 
     /// Single-threaded insert — no locking, no edge copies, fastest path for bulk builds
@@ -791,84 +797,6 @@ public:
         return search(query, k, ef);
     }
 
-    // ========== Quantized Two-Stage Search ==========
-
-    /// Two-stage search: quantized distances for graph traversal, exact FP32 for reranking.
-    ///
-    /// This runs inside the HNSW internals with full access to the visited pool,
-    /// prefetching, and lock-free neighbor access — unlike external wrappers that
-    /// reimplement beam search with hash map lookups.
-    ///
-    /// @tparam ApproxDistFn Callable: float(std::span<const float> query, size_t dense_id)
-    ///         Returns approximate distance for a node given its dense_id.
-    /// @tparam PrefetchFn Callable: void(size_t dense_id) — prefetch quantized data
-    /// @param query Query vector (float32)
-    /// @param k Number of results to return
-    /// @param ef_search Beam width for quantized traversal
-    /// @param rerank_factor Multiplier: collect ef_search * rerank_factor candidates,
-    ///        then rerank the top ef_search with exact distance
-    /// @param approx_dist Approximate distance function (quantized)
-    /// @param prefetch_fn Prefetch function for quantized codes
-    /// @param filter Optional filter function
-    /// @return Vector of (id, exact_distance) pairs, sorted by distance
-    template <typename ApproxDistFn, typename PrefetchFn>
-    std::vector<std::pair<size_t, float>>
-    search_quantized_rerank(std::span<const float> query, size_t k, size_t ef_search,
-                            size_t rerank_factor, ApproxDistFn&& approx_dist,
-                            PrefetchFn&& prefetch_fn,
-                            const FilterFn& filter = nullptr) const {
-        if (nodes_.empty())
-            return {};
-
-        std::vector<float> norm_query;
-        std::span<const float> effective_query = query;
-        if (config_.normalize_vectors) {
-            norm_query = normalize_vector(query);
-            effective_query = std::span<const float>(norm_query);
-        }
-
-        size_t expanded_ef = ef_search * rerank_factor;
-        expanded_ef = std::max(expanded_ef, k);
-
-        std::shared_lock lock(nodes_mutex_);
-        std::shared_lock deleted_lock(deleted_mutex_);
-
-        const FilterFn* filter_ptr = filter ? &filter : nullptr;
-
-        // Stage 1: Greedy descent through upper layers (cheap, use FP32)
-        size_t current = entry_point_id_.load(std::memory_order_acquire);
-        for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > 0; --lc) {
-            current = greedy_search_layer_shared<true>(effective_query, current, lc, filter_ptr);
-        }
-
-        // Stage 2: Beam search at layer 0 using quantized distances
-        auto approx_candidates = beam_search_layer_quantized(
-            effective_query, current, expanded_ef, 0, filter_ptr, approx_dist, prefetch_fn);
-
-        // Stage 3: Rerank with exact FP32 distances
-        std::vector<std::pair<size_t, float>> reranked;
-        reranked.reserve(approx_candidates.size());
-
-        for (const auto& [id, approx_d] : approx_candidates) {
-            const auto* node = try_get_node(id);
-            if (!node)
-                continue;
-            float exact_dist = distance_query_node(effective_query, *node);
-            if (exact_dist >= 0.0f) {
-                reranked.emplace_back(id, exact_dist);
-            }
-        }
-
-        std::sort(reranked.begin(), reranked.end(),
-                  [](const auto& a, const auto& b) { return a.second < b.second; });
-
-        if (reranked.size() > k) {
-            reranked.resize(k);
-        }
-
-        return reranked;
-    }
-
     // ========== Graph Quality Metrics ==========
 
     /// Statistics about the HNSW graph structure
@@ -1012,6 +940,29 @@ public:
         return mutation_generation_.load(std::memory_order_acquire);
     }
 
+    /// Capture a point-in-time snapshot of all vectors for quantization.
+    /// Holds the read lock for the duration of the copy, so the returned
+    /// snapshot is guaranteed consistent with the captured generation.
+    [[nodiscard]] QuantizationSnapshot snapshot_for_quantization() const {
+        std::shared_lock lock(nodes_mutex_);
+        QuantizationSnapshot snap;
+        snap.generation = mutation_generation_.load(std::memory_order_acquire);
+        snap.entries.reserve(nodes_.size());
+        for (const auto& [id, node] : nodes_) {
+            if (snap.dim == 0)
+                snap.dim = node.vector.size();
+            QuantizationSnapshot::Entry entry;
+            entry.dense_id = node.dense_id;
+            if constexpr (std::same_as<StorageT, float>) {
+                entry.vector.assign(node.vector.begin(), node.vector.end());
+            } else {
+                entry.vector = to_float_vector(node.as_span());
+            }
+            snap.entries.push_back(std::move(entry));
+        }
+        return snap;
+    }
+
     /// Check if compaction is recommended
     /// @param threshold Fraction of deleted nodes (default 0.2 = 20%)
     /// @return true if deleted_count > threshold * size
@@ -1071,6 +1022,7 @@ public:
                               [this](size_t neighbor) { return is_deleted_unlocked(neighbor); });
             }
         }
+        mutation_generation_.fetch_add(1, std::memory_order_release);
     }
 
     /// Restore a soft-deleted node (undo delete)
@@ -1081,13 +1033,19 @@ public:
         if (nodes_.count(id) == 0)
             return false;
         std::unique_lock deleted_lock(deleted_mutex_);
-        return deleted_ids_.erase(id) > 0;
+        bool erased = deleted_ids_.erase(id) > 0;
+        if (erased)
+            mutation_generation_.fetch_add(1, std::memory_order_release);
+        return erased;
     }
 
     /// Clear all deletion markers (does not rebuild graph)
     void clear_deletions() {
         std::unique_lock deleted_lock(deleted_mutex_);
-        deleted_ids_.clear();
+        if (!deleted_ids_.empty()) {
+            deleted_ids_.clear();
+            mutation_generation_.fetch_add(1, std::memory_order_release);
+        }
     }
 
     /// Convert storage vector to float32 (no-op for float, converts for fp16)
@@ -1928,6 +1886,67 @@ private:
         return beam_search_layer_locked(query, entry_point, ef, layer, filter);
     }
 
+    // ========== Quantized Two-Stage Search (private, friend-accessible) ==========
+
+    /// Two-stage search: quantized distances for graph traversal, exact FP32 for reranking.
+    /// Only available for L2-family metrics. Called by HNSWQuantizedSearch.
+    template <typename ApproxDistFn, typename PrefetchFn>
+    requires(concepts::traits::is_l2_family_v<MetricT>)
+    std::vector<std::pair<size_t, float>>
+    search_quantized_rerank(std::span<const float> query, size_t k, size_t ef_search,
+                            size_t rerank_factor, ApproxDistFn&& approx_dist,
+                            PrefetchFn&& prefetch_fn,
+                            const FilterFn& filter = nullptr) const {
+        if (nodes_.empty())
+            return {};
+
+        std::vector<float> norm_query;
+        std::span<const float> effective_query = query;
+        if (config_.normalize_vectors) {
+            norm_query = normalize_vector(query);
+            effective_query = std::span<const float>(norm_query);
+        }
+
+        size_t expanded_ef = ef_search * rerank_factor;
+        expanded_ef = std::max(expanded_ef, k);
+
+        std::shared_lock lock(nodes_mutex_);
+        std::shared_lock deleted_lock(deleted_mutex_);
+
+        const FilterFn* filter_ptr = filter ? &filter : nullptr;
+
+        // Stage 1: Greedy descent through upper layers (cheap, use FP32)
+        size_t current = entry_point_id_.load(std::memory_order_acquire);
+        for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > 0; --lc) {
+            current = greedy_search_layer_shared<true>(effective_query, current, lc, filter_ptr);
+        }
+
+        // Stage 2: Beam search at layer 0 using quantized distances
+        auto approx_candidates = beam_search_layer_quantized(
+            effective_query, current, expanded_ef, 0, filter_ptr, approx_dist, prefetch_fn);
+
+        // Stage 3: Rerank with exact FP32 distances
+        std::vector<std::pair<size_t, float>> reranked;
+        reranked.reserve(approx_candidates.size());
+
+        for (const auto& [id, approx_d] : approx_candidates) {
+            const auto* node = try_get_node(id);
+            if (!node)
+                continue;
+            float exact_dist = distance_query_node(effective_query, *node);
+            reranked.emplace_back(id, exact_dist);
+        }
+
+        std::sort(reranked.begin(), reranked.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        if (reranked.size() > k) {
+            reranked.resize(k);
+        }
+
+        return reranked;
+    }
+
     /// Beam search using a user-supplied approximate distance function.
     /// Runs inside the HNSW internals with visited pool, prefetching, and
     /// read-mostly unlocked neighbor access — the same hot path as standard search.
@@ -1935,6 +1954,7 @@ private:
     /// @tparam ApproxDistFn float(std::span<const float> query, size_t dense_id)
     /// @tparam PrefetchFn void(size_t dense_id)
     template <typename ApproxDistFn, typename PrefetchFn>
+    requires(concepts::traits::is_l2_family_v<MetricT>)
     std::vector<std::pair<size_t, float>>
     beam_search_layer_quantized(std::span<const float> query, size_t entry_point, size_t ef,
                                 size_t layer, const FilterFn* filter,
