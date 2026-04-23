@@ -135,6 +135,32 @@ void test_small_graph_search() {
     std::cout << "  ✓ Small graph search passed" << std::endl;
 }
 
+void test_small_graph_phss_rerank() {
+    std::cout << "Testing PHSS rerank on small graph..." << std::endl;
+
+    HNSWIndex<float, L2Metric<float>> index;
+    std::vector<std::vector<float>> vectors = {
+        {0.0f, 0.0f}, {0.1f, 0.0f}, {0.0f, 0.1f}, {1.0f, 1.0f}, {1.1f, 1.0f}, {1.0f, 1.1f},
+    };
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        index.insert(i, std::span{vectors[i]});
+    }
+
+    std::vector<float> query = {0.05f, 0.05f};
+    typename HNSWIndex<float, L2Metric<float>>::PhssRerankConfig cfg;
+    cfg.enabled = true;
+    cfg.candidates = 6;
+    cfg.min_candidates = 4;
+
+    auto results = index.search_phss_rerank(std::span{query}, 3, 10, cfg);
+    assert(results.size() == 3);
+    assert(results[0].first == 0 || results[0].first == 1 || results[0].first == 2);
+    assert(results[1].first == 0 || results[1].first == 1 || results[1].first == 2);
+    assert(results[2].first == 0 || results[2].first == 1 || results[2].first == 2);
+
+    std::cout << "  ✓ Small graph PHSS rerank passed" << std::endl;
+}
+
 void test_recall_quality() {
     std::cout << "Testing recall quality (10K vectors)..." << std::endl;
 
@@ -1333,6 +1359,7 @@ int main() {
     test_node_creation();
     test_layer_assignment();
     test_small_graph_search();
+    test_small_graph_phss_rerank();
     test_recall_quality();
     test_insertion_order_independence();
     test_edge_pruning();

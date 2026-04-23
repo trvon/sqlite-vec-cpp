@@ -118,3 +118,14 @@ vec0_ann_benchmark_exe = executable(
   install: false
 )
 message('  ./vec0_ann_benchmark (warm vec0 ANN vs exact SQL full scan)')
+
+profile_vec0_query_exe = executable(
+  'profile_vec0_query',
+  'profile_vec0_query.cpp',
+  include_directories: include_directories('../include'),
+  sources: ['../src/sqlite_vec_c_api.cpp'],
+  dependencies: [sqlite3_dep],
+  cpp_args: cpp_args_list,
+  install: false
+)
+message('  ./profile_vec0_query (cold/hot vec0 ANN profiling with SQLite statement timings)')

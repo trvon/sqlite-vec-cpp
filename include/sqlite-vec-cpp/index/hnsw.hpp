@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -118,6 +119,28 @@ public:
 
             return cfg;
         }
+    };
+
+    /// Candidate-set PHSS rerank over ANN results.
+    ///
+    /// This is intentionally post-search rather than inside beam traversal:
+    /// we first fetch a small ANN candidate set, then build a local similarity
+    /// graph and diffuse query mass over that graph. The default criterion uses
+    /// a cheap LargestGap approximation over the pairwise similarity
+    /// distribution, which keeps the hot path practical for SQLite workloads.
+    struct PhssRerankConfig {
+        enum class Mode : std::uint8_t {
+            LargestGapApprox,
+        };
+
+        bool enabled = false;
+        size_t candidates = 64;
+        size_t min_candidates = 16;
+        float blend_alpha = 0.8f;
+        float attention_scale = 8.0f;
+        size_t steps = 2;
+        float self_weight = 0.5f;
+        Mode mode = Mode::LargestGapApprox;
     };
 
     /// Alias for node type
@@ -487,11 +510,181 @@ public:
         return search_read_mostly_with_filter(query, k, ef_search, nullptr);
     }
 
+    std::vector<std::pair<size_t, float>> search_phss_rerank(std::span<const float> query, size_t k,
+                                                             size_t ef_search,
+                                                             const PhssRerankConfig& cfg) const {
+        return search_phss_rerank_with_filter(query, k, ef_search, cfg, nullptr);
+    }
+
     /// Read-mostly search with pre-filtering.
     std::vector<std::pair<size_t, float>>
     search_read_mostly_with_filter(std::span<const float> query, size_t k, size_t ef_search,
                                    const FilterFn& filter) const {
         return search_with_filter_impl<true>(query, k, ef_search, filter);
+    }
+
+    std::vector<std::pair<size_t, float>>
+    search_phss_rerank_with_filter(std::span<const float> query, size_t k, size_t ef_search,
+                                   const PhssRerankConfig& cfg, const FilterFn& filter) const {
+        if (!cfg.enabled) {
+            return search_read_mostly_with_filter(query, k, ef_search, filter);
+        }
+
+        const size_t candidate_k = std::max(k, cfg.candidates);
+        auto approx_candidates =
+            search_read_mostly_with_filter(query, candidate_k, ef_search, filter);
+        if (approx_candidates.size() <= k) {
+            return approx_candidates;
+        }
+        if (approx_candidates.size() < cfg.min_candidates) {
+            approx_candidates.resize(k);
+            return approx_candidates;
+        }
+
+        const size_t n = approx_candidates.size();
+        auto tri_index = [n](size_t i, size_t j) {
+            // Dense upper-triangular packing for i < j.
+            return i * (2 * n - i - 1) / 2 + (j - i - 1);
+        };
+
+        std::vector<float> query_signal(n, 0.0f);
+        float max_query_logit = -std::numeric_limits<float>::infinity();
+        for (size_t i = 0; i < n; ++i) {
+            query_signal[i] = 1.0f / (1.0f + std::max(0.0f, approx_candidates[i].second));
+            max_query_logit = std::max(max_query_logit, cfg.attention_scale * query_signal[i]);
+        }
+
+        std::vector<float> mass(n, 0.0f);
+        float mass_sum = 0.0f;
+        for (size_t i = 0; i < n; ++i) {
+            mass[i] = std::exp(cfg.attention_scale * query_signal[i] - max_query_logit);
+            mass_sum += mass[i];
+        }
+        if (mass_sum <= 0.0f) {
+            approx_candidates.resize(k);
+            return approx_candidates;
+        }
+        for (float& x : mass)
+            x /= mass_sum;
+
+        std::vector<const NodeType*> candidate_nodes;
+        candidate_nodes.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            candidate_nodes.push_back(try_get_node(approx_candidates[i].first));
+        }
+
+        const size_t tri_count = n * (n - 1) / 2;
+        std::vector<float> sims_tri(tri_count, 0.0f);
+        std::vector<float> sims_sorted;
+        sims_sorted.reserve(tri_count);
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                float sim = 0.0f;
+                const auto* ni = candidate_nodes[i];
+                const auto* nj = candidate_nodes[j];
+                if (ni && nj) {
+                    const float d = distance_nodes(*ni, *nj);
+                    sim = 1.0f / (1.0f + std::max(0.0f, d));
+                }
+                sims_tri[tri_index(i, j)] = sim;
+                sims_sorted.push_back(sim);
+            }
+        }
+
+        float scale = 0.0f;
+        if (!sims_sorted.empty()) {
+            std::sort(sims_sorted.begin(), sims_sorted.end());
+            if (sims_sorted.size() == 1) {
+                scale = sims_sorted[0];
+            } else {
+                float max_gap = -1.0f;
+                size_t best_idx = 0;
+                for (size_t i = 0; i + 1 < sims_sorted.size(); ++i) {
+                    const float gap = sims_sorted[i + 1] - sims_sorted[i];
+                    if (gap > max_gap) {
+                        max_gap = gap;
+                        best_idx = i;
+                    }
+                }
+                scale = (sims_sorted[best_idx] + sims_sorted[best_idx + 1]) * 0.5f;
+            }
+        }
+        if (scale <= 0.0f) {
+            approx_candidates.resize(k);
+            return approx_candidates;
+        }
+
+        std::vector<std::vector<std::pair<size_t, float>>> adj(n);
+        for (size_t i = 0; i < n; ++i) {
+            float row_max = -std::numeric_limits<float>::infinity();
+            for (size_t j = 0; j < n; ++j) {
+                if (i == j)
+                    continue;
+                const float sim = (i < j) ? sims_tri[tri_index(i, j)] : sims_tri[tri_index(j, i)];
+                if (sim >= scale) {
+                    row_max = std::max(row_max, cfg.attention_scale * sim);
+                    adj[i].push_back({j, sim});
+                }
+            }
+            if (adj[i].empty())
+                continue;
+            float row_sum = 0.0f;
+            for (auto& [j, sim] : adj[i]) {
+                sim = std::exp(cfg.attention_scale * sim - row_max);
+                row_sum += sim;
+            }
+            if (row_sum > 0.0f) {
+                for (auto& [j, sim] : adj[i])
+                    sim /= row_sum;
+            }
+        }
+
+        std::vector<float> next_mass(n, 0.0f);
+        for (size_t step = 0; step < cfg.steps; ++step) {
+            std::fill(next_mass.begin(), next_mass.end(), 0.0f);
+            for (size_t i = 0; i < n; ++i) {
+                next_mass[i] += cfg.self_weight * mass[i];
+                if (adj[i].empty())
+                    continue;
+                const float carry = (1.0f - cfg.self_weight) * mass[i];
+                for (const auto& [j, w] : adj[i])
+                    next_mass[j] += carry * w;
+            }
+            mass.swap(next_mass);
+        }
+
+        auto zscore = [](std::vector<float>& v) {
+            if (v.empty())
+                return;
+            double mean = 0.0;
+            for (float x : v)
+                mean += x;
+            mean /= static_cast<double>(v.size());
+            double var = 0.0;
+            for (float x : v)
+                var += (x - mean) * (x - mean);
+            const float sd =
+                static_cast<float>(std::sqrt(var / static_cast<double>(v.size())) + 1e-12);
+            for (float& x : v)
+                x = static_cast<float>((x - mean) / sd);
+        };
+
+        std::vector<float> query_z(n, 0.0f);
+        for (size_t i = 0; i < n; ++i)
+            query_z[i] = -approx_candidates[i].second;
+        zscore(query_z);
+        zscore(mass);
+
+        std::vector<std::pair<size_t, float>> reranked;
+        reranked.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            const float score = cfg.blend_alpha * query_z[i] + (1.0f - cfg.blend_alpha) * mass[i];
+            reranked.emplace_back(approx_candidates[i].first, -score);
+        }
+        std::sort(reranked.begin(), reranked.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+        reranked.resize(k);
+        return reranked;
     }
 
     /// Batch search for multiple queries in parallel

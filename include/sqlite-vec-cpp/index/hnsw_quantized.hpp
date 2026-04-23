@@ -164,6 +164,39 @@ public:
         return 0;
     }
 
+    [[nodiscard]] uint64_t quantization_generation() const { return quantization_generation_; }
+
+    [[nodiscard]] const quantization::LVQ8Store& lvq8_store() const { return lvq8_store_; }
+
+    [[nodiscard]] const quantization::LVQ4Store& lvq4_store() const { return lvq4_store_; }
+
+    [[nodiscard]] const quantization::RaBitQStore& rabitq_store() const { return rabitq_store_; }
+
+    void clear_quantization() {
+        lvq8_store_ = {};
+        lvq4_store_ = {};
+        rabitq_store_ = {};
+        quantization_generation_ = 0;
+    }
+
+    void import_quantization(quantization::LVQ8Store store, uint64_t generation) {
+        clear_quantization();
+        lvq8_store_ = std::move(store);
+        quantization_generation_ = generation;
+    }
+
+    void import_quantization(quantization::LVQ4Store store, uint64_t generation) {
+        clear_quantization();
+        lvq4_store_ = std::move(store);
+        quantization_generation_ = generation;
+    }
+
+    void import_quantization(quantization::RaBitQStore store, uint64_t generation) {
+        clear_quantization();
+        rabitq_store_ = std::move(store);
+        quantization_generation_ = generation;
+    }
+
     /// Access the underlying base index
     BaseIndex& base_index() { return base_index_; }
     const BaseIndex& base_index() const { return base_index_; }

@@ -1131,6 +1131,36 @@ void test_vec0_ann_hidden_query() {
     std::cout << "  ✓ vec0 explicit hidden query works" << std::endl;
 }
 
+void test_vec0_ann_phss_hidden_query() {
+    std::cout << "Testing vec0 hidden PHSS rerank query..." << std::endl;
+
+    SQLiteDB db;
+    sqlite3_vec_init(db.get(), nullptr, nullptr);
+
+    db.exec("CREATE VIRTUAL TABLE t USING vec0(embedding float[2])");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (1, '[0,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (2, '[0.1,0]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (3, '[0,0.1]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (4, '[1,1]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (5, '[1.1,1]')");
+    db.exec("INSERT INTO t(rowid, embedding) VALUES (6, '[1,1.1]')");
+
+    const std::string sql = "SELECT rowid, distance FROM t "
+                            "WHERE query = vec_f32('[0.05,0.05]') AND k = 3 AND ef_search = 16 "
+                            "AND phss = 1 AND phss_candidates = 6 ORDER BY distance";
+
+    std::string plan = query_explain_plan(db.get(), sql);
+    assert(plan.find("ann") != std::string::npos);
+
+    auto rows = query_row_distances(db.get(), sql);
+    assert(rows.size() == 3);
+    assert(rows[0].rowid == 1 || rows[0].rowid == 2 || rows[0].rowid == 3);
+    assert(rows[1].rowid == 1 || rows[1].rowid == 2 || rows[1].rowid == 3);
+    assert(rows[2].rowid == 1 || rows[2].rowid == 2 || rows[2].rowid == 3);
+
+    std::cout << "  ✓ vec0 hidden PHSS query works" << std::endl;
+}
+
 void test_vec0_ann_insert_visibility() {
     std::cout << "Testing vec0 ANN insert visibility..." << std::endl;
 
@@ -1685,6 +1715,7 @@ int main() {
     run_test("vec0_dimension_validation", test_vec0_dimension_validation);
     run_test("vec0_ann_match_query", test_vec0_ann_match_query);
     run_test("vec0_ann_hidden_query", test_vec0_ann_hidden_query);
+    run_test("vec0_ann_phss_hidden_query", test_vec0_ann_phss_hidden_query);
     run_test("vec0_ann_insert_visibility", test_vec0_ann_insert_visibility);
     run_test("vec0_ann_match_respects_rowid_filter", test_vec0_ann_match_respects_rowid_filter);
     run_test("vec0_ann_hidden_query_respects_rowid_filter",
