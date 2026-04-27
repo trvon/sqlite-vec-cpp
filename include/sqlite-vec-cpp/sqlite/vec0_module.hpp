@@ -11,6 +11,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #include "../distances/l2.hpp"
@@ -188,6 +189,16 @@ inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* ta
             Error::sqlite_error("Failed to scan vec0 vectors", rc));
     }
 
+    const bool use_parallel_build = row_count >= 2048 && std::thread::hardware_concurrency() > 1;
+    std::vector<size_t> parallel_ids;
+    std::vector<std::vector<float>> parallel_vectors;
+    std::vector<std::span<const float>> parallel_spans;
+    if (use_parallel_build) {
+        parallel_ids.reserve(row_count);
+        parallel_vectors.reserve(row_count);
+        parallel_spans.reserve(row_count);
+    }
+
     while ((rc = sqlite3_step(scan_stmt)) == SQLITE_ROW) {
         std::int64_t rowid = sqlite3_column_int64(scan_stmt, 0);
         const void* blob = sqlite3_column_blob(scan_stmt, 1);
@@ -204,9 +215,14 @@ inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* ta
                 "vec0 stored vector size mismatch for rowid " + std::to_string(rowid)));
         }
 
-        std::vector<float> vec(table->dimensions);
-        std::memcpy(vec.data(), blob, static_cast<size_t>(bytes));
-        ann_index->insert_single_threaded(static_cast<size_t>(rowid), std::span<const float>(vec));
+        const auto* values = static_cast<const float*>(blob);
+        if (use_parallel_build) {
+            parallel_ids.push_back(static_cast<size_t>(rowid));
+            parallel_vectors.emplace_back(values, values + table->dimensions);
+        } else {
+            ann_index->insert_single_threaded(static_cast<size_t>(rowid),
+                                              std::span<const float>(values, table->dimensions));
+        }
     }
 
     if (rc != SQLITE_DONE) {
@@ -216,6 +232,13 @@ inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* ta
     }
 
     sqlite3_finalize(scan_stmt);
+    if (use_parallel_build) {
+        for (const auto& vector : parallel_vectors) {
+            parallel_spans.emplace_back(std::span<const float>(vector));
+        }
+        ann_index->build_parallel(std::span<const size_t>(parallel_ids),
+                                  std::span<const std::span<const float>>(parallel_spans), 0);
+    }
     table->ann_index = ann_index;
     table->ann_ready = true;
     return Result<std::shared_ptr<Vec0AnnIndex>>(ann_index);
