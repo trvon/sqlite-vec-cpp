@@ -20,6 +20,67 @@ namespace sqlite_vec_cpp::distances {
 
 /// L2 (Euclidean) distance metric - generic fallback implementation
 template <concepts::VectorElement T>
+float l2_squared_distance_fallback(std::span<const T> a, std::span<const T> b) {
+    assert(a.size() == b.size() && "Vector dimensions must match");
+
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const float diff = static_cast<float>(a[i]) - static_cast<float>(b[i]);
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+template <concepts::FloatingPointElement T>
+float l2_squared_distance_float(std::span<const T> a, std::span<const T> b) {
+    assert(a.size() == b.size());
+
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const float diff = static_cast<float>(a[i] - b[i]);
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+template <concepts::IntegerElement T>
+float l2_squared_distance_int(std::span<const T> a, std::span<const T> b) {
+    assert(a.size() == b.size());
+
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const float diff = static_cast<float>(a[i]) - static_cast<float>(b[i]);
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+template <concepts::VectorElement T>
+float l2_squared_distance(std::span<const T> a, std::span<const T> b) {
+    assert(a.size() == b.size() && "Vector dimensions must match");
+
+    if constexpr (std::is_same_v<T, float>) {
+#ifdef SQLITE_VEC_ENABLE_AVX
+        if (a.size() >= 16 && a.size() % 16 == 0) {
+            return simd::l2_squared_distance_float_avx(a, b);
+        }
+#endif
+#ifdef SQLITE_VEC_ENABLE_NEON
+        if (a.size() > 16) {
+            return simd::l2_squared_distance_float_neon(a, b);
+        }
+#endif
+        return l2_squared_distance_float(a, b);
+    } else if constexpr (std::is_same_v<T, std::int8_t>) {
+        return l2_squared_distance_int(a, b);
+    } else if constexpr (concepts::IntegerElement<T>) {
+        return l2_squared_distance_int(a, b);
+    } else {
+        return l2_squared_distance_fallback(a, b);
+    }
+}
+
+template <concepts::VectorElement T>
 float l2_distance_fallback(std::span<const T> a, std::span<const T> b) {
     assert(a.size() == b.size() && "Vector dimensions must match");
 

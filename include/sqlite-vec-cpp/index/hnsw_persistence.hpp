@@ -1,14 +1,39 @@
 #pragma once
 
 #include <sqlite3.h>
+#include <array>
+#include <bit>
 #include <cstring>
+#include <limits>
+#include <span>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_set>
 #include "hnsw.hpp"
 #include "hnsw_node.hpp"
 
 namespace sqlite_vec_cpp::index {
+
+namespace detail {
+
+template <typename T>
+[[nodiscard]] std::span<const std::uint8_t> as_uint8_bytes(std::span<const T> values) noexcept {
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "HNSW persistence only supports trivially-copyable vector elements");
+    auto bytes = std::as_bytes(values);
+    return {static_cast<const std::uint8_t*>(static_cast<const void*>(bytes.data())), bytes.size()};
+}
+
+[[nodiscard]] inline bool checked_mul_size(size_t lhs, size_t rhs, size_t& out) noexcept {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        return false;
+    }
+    out = lhs * rhs;
+    return true;
+}
+
+} // namespace detail
 
 /// HNSW Index Persistence Layer
 /// Provides serialization/deserialization to SQLite shadow tables
@@ -24,7 +49,7 @@ std::vector<uint8_t> serialize_hnsw_config(const typename HNSWIndex<T, Metric>::
     blob.reserve(64);
 
     // Version marker (for future compatibility)
-    constexpr uint32_t version = 2;
+    constexpr uint32_t version = 3;
     auto write_u32 = [&](uint32_t val) {
         for (int i = 0; i < 4; ++i) {
             blob.push_back((val >> (i * 8)) & 0xFF);
@@ -35,11 +60,7 @@ std::vector<uint8_t> serialize_hnsw_config(const typename HNSWIndex<T, Metric>::
             blob.push_back((val >> (i * 8)) & 0xFF);
         }
     };
-    auto write_f32 = [&](float val) {
-        uint32_t bits;
-        std::memcpy(&bits, &val, sizeof(float));
-        write_u32(bits);
-    };
+    auto write_f32 = [&](float val) { write_u32(std::bit_cast<uint32_t>(val)); };
 
     write_u32(version);
     write_u64(config.M);
@@ -48,6 +69,7 @@ std::vector<uint8_t> serialize_hnsw_config(const typename HNSWIndex<T, Metric>::
     write_u64(config.ef_construction);
     write_f32(config.ml_factor);
     write_u32(config.clamp_negative_distances ? 1U : 0U);
+    write_u32(config.random_seed);
 
     return blob;
 }
@@ -58,6 +80,7 @@ typename HNSWIndex<T, Metric>::Config deserialize_hnsw_config(const void* blob, 
     // Config blob v1: version(4) + M(8) + M_max(8) + M_max_0(8) + ef_construction(8) + ml_factor(4)
     // = 40 bytes
     // Config blob v2: v1 + clamp_negative_distances(4) = 44 bytes
+    // Config blob v3: v2 + random_seed(4) = 48 bytes
     if (size < 40) {
         throw std::runtime_error("Invalid HNSW config blob: too small");
     }
@@ -81,13 +104,11 @@ typename HNSWIndex<T, Metric>::Config deserialize_hnsw_config(const void* blob, 
     };
     auto read_f32 = [&]() -> float {
         uint32_t bits = read_u32();
-        float val;
-        std::memcpy(&val, &bits, sizeof(float));
-        return val;
+        return std::bit_cast<float>(bits);
     };
 
     uint32_t version = read_u32();
-    if (version != 1 && version != 2) {
+    if (version != 1 && version != 2 && version != 3) {
         throw std::runtime_error("Unsupported HNSW config version");
     }
 
@@ -104,6 +125,12 @@ typename HNSWIndex<T, Metric>::Config deserialize_hnsw_config(const void* blob, 
         config.clamp_negative_distances = (read_u32() != 0);
     } else {
         config.clamp_negative_distances = true;
+    }
+    if (version >= 3) {
+        if (size < 48) {
+            throw std::runtime_error("Invalid HNSW config blob: missing random seed");
+        }
+        config.random_seed = read_u32();
     }
 
     return config;
@@ -173,9 +200,8 @@ template <typename T> std::vector<uint8_t> serialize_hnsw_node(const HNSWNode<T>
     write_u64(node.vector.size());
 
     // Write vector data (as bytes, type-specific)
-    const uint8_t* vec_bytes = reinterpret_cast<const uint8_t*>(node.vector.data());
-    size_t vec_bytes_size = node.vector.size() * sizeof(T);
-    blob.insert(blob.end(), vec_bytes, vec_bytes + vec_bytes_size);
+    const auto vec_bytes = detail::as_uint8_bytes(std::span<const T>(node.vector));
+    blob.insert(blob.end(), vec_bytes.begin(), vec_bytes.end());
 
     // Write number of layers
     write_u64(node.edges.size());
@@ -213,12 +239,14 @@ template <typename T> HNSWNode<T> deserialize_hnsw_node(const void* blob, size_t
     size_t dim = read_u64();
 
     // Read vector data
-    if (offset + dim * sizeof(T) > size) {
+    size_t vec_bytes_size = 0;
+    if (!detail::checked_mul_size(dim, sizeof(T), vec_bytes_size) || offset > size ||
+        vec_bytes_size > size - offset) {
         throw std::runtime_error("HNSW node vector data truncated");
     }
     std::vector<T> vector(dim);
-    std::memcpy(vector.data(), data + offset, dim * sizeof(T));
-    offset += dim * sizeof(T);
+    std::memcpy(vector.data(), data + offset, vec_bytes_size);
+    offset += vec_bytes_size;
 
     // Read number of layers
     size_t num_layers = read_u64();
@@ -445,7 +473,16 @@ HNSWIndex<T, Metric> load_hnsw_index(sqlite3* db, const char* schema, const char
         throw std::runtime_error("HNSW entry point not found");
     }
 
-    const uint64_t* entry_data = static_cast<const uint64_t*>(sqlite3_column_blob(stmt, 0));
+    const void* entry_blob = sqlite3_column_blob(stmt, 0);
+    const int entry_size = sqlite3_column_bytes(stmt, 0);
+    if (!entry_blob || entry_size != static_cast<int>(sizeof(uint64_t) * 2)) {
+        sqlite3_finalize(stmt);
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("Invalid HNSW entry point blob");
+        throw std::runtime_error("Invalid HNSW entry point blob");
+    }
+    std::array<uint64_t, 2> entry_data{};
+    std::memcpy(entry_data.data(), entry_blob, sizeof(entry_data));
     size_t entry_point_id = entry_data[0];
     size_t entry_point_layer = entry_data[1];
     sqlite3_finalize(stmt);

@@ -126,11 +126,8 @@ inline void vec_scale_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv)
         std::transform(vec->begin(), vec->end(), result.begin(),
                        [scalar](float x) { return x * static_cast<float>(scalar); });
 
-        auto blob_data = std::as_bytes(std::span(result));
-        context.result_blob_with_subtype(
-            std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(blob_data.data()),
-                                          blob_data.size()),
-            static_cast<unsigned int>(VectorElementType::Float32));
+        context.result_blob_with_subtype(as_uint8_bytes(std::span<const float>(result)),
+                                         static_cast<unsigned int>(VectorElementType::Float32));
     } else {
         context.result_error("vec_scale only supports float32 vectors");
     }
@@ -322,11 +319,8 @@ inline void vec_clamp_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv)
             return std::clamp(static_cast<double>(x), min_d, max_d);
         });
 
-        auto blob_data = std::as_bytes(std::span(result));
-        context.result_blob_with_subtype(
-            std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(blob_data.data()),
-                                          blob_data.size()),
-            static_cast<unsigned int>(VectorElementType::Float32));
+        context.result_blob_with_subtype(as_uint8_bytes(std::span<const float>(result)),
+                                         static_cast<unsigned int>(VectorElementType::Float32));
     } else {
         context.result_error("vec_clamp only supports float32 vectors");
     }

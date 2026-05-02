@@ -30,13 +30,9 @@ inline void vec_f32_simple(sqlite3_context* ctx, int argc, sqlite3_value** argv)
         return;
     }
 
-    const auto& vec = result.value();
-    const void* data = vec.data();
-    std::size_t size = vec.size() * sizeof(float);
-
+    const auto& vec = *result;
     // Return WITHOUT subtype so vec0 xUpdate can access the blob
-    context.result_blob(
-        std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data), size));
+    context.result_blob(as_uint8_bytes(std::span<const float>(vec)));
 }
 
 /// SQLite function: vec_f32(json_or_blob) -> float32 vector blob
@@ -56,16 +52,12 @@ inline void vec_f32_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
         return;
     }
 
-    const auto& vec = result.value();
+    const auto& vec = *result;
 
-    // Create blob from vector data
-    const void* data = vec.data();
-    std::size_t size = vec.size() * sizeof(float);
     auto subtype = static_cast<unsigned int>(VectorElementType::Float32);
 
     // Use the wrapper method that correctly sets blob + subtype
-    context.result_blob_with_subtype(
-        std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data), size), subtype);
+    context.result_blob_with_subtype(as_uint8_bytes(std::span<const float>(vec)), subtype);
 }
 
 /// SQLite function: vec_int8(json_or_blob) -> int8 vector blob
@@ -85,13 +77,10 @@ inline void vec_int8_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
         return;
     }
 
-    const auto& vec = result.value();
-    const void* data = vec.data();
-    std::size_t size = vec.size() * sizeof(std::int8_t);
+    const auto& vec = *result;
     auto subtype = static_cast<unsigned int>(VectorElementType::Int8);
 
-    context.result_blob_with_subtype(
-        std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data), size), subtype);
+    context.result_blob_with_subtype(as_uint8_bytes(std::span<const std::int8_t>(vec)), subtype);
 }
 
 /// SQLite function: vec_bit(blob) -> bit vector blob
@@ -112,13 +101,10 @@ inline void vec_bit_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
         return;
     }
 
-    const auto& vec = result.value();
-    const void* data = vec.data();
-    std::size_t size = vec.size();
+    const auto& vec = *result;
     auto subtype = static_cast<unsigned int>(VectorElementType::Bit);
 
-    context.result_blob_with_subtype(
-        std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data), size), subtype);
+    context.result_blob_with_subtype(as_uint8_bytes(std::span<const std::uint8_t>(vec)), subtype);
 }
 
 /// SQLite function: vec_length(vector) -> integer
@@ -284,11 +270,8 @@ inline void vec_add_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
             result[i] = (*vec_a)[i] + (*vec_b)[i];
         }
 
-        auto blob_data = std::as_bytes(std::span(result));
-        context.result_blob_with_subtype(
-            std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(blob_data.data()),
-                                          blob_data.size()),
-            static_cast<unsigned int>(VectorElementType::Float32));
+        context.result_blob_with_subtype(as_uint8_bytes(std::span<const float>(result)),
+                                         static_cast<unsigned int>(VectorElementType::Float32));
     } else {
         context.result_error("vec_add only supports float32 vectors");
     }
@@ -338,11 +321,8 @@ inline void vec_sub_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
             result[i] = (*vec_a)[i] - (*vec_b)[i];
         }
 
-        auto blob_data = std::as_bytes(std::span(result));
-        context.result_blob_with_subtype(
-            std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(blob_data.data()),
-                                          blob_data.size()),
-            static_cast<unsigned int>(VectorElementType::Float32));
+        context.result_blob_with_subtype(as_uint8_bytes(std::span<const float>(result)),
+                                         static_cast<unsigned int>(VectorElementType::Float32));
     } else {
         context.result_error("vec_sub only supports float32 vectors");
     }
@@ -385,11 +365,8 @@ inline void vec_normalize_impl(sqlite3_context* ctx, int argc, sqlite3_value** a
             result[i] = (*vec)[i] / norm;
         }
 
-        auto blob_data = std::as_bytes(std::span(result));
-        context.result_blob_with_subtype(
-            std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(blob_data.data()),
-                                          blob_data.size()),
-            static_cast<unsigned int>(VectorElementType::Float32));
+        context.result_blob_with_subtype(as_uint8_bytes(std::span<const float>(result)),
+                                         static_cast<unsigned int>(VectorElementType::Float32));
     } else {
         context.result_error("vec_normalize only supports float32 vectors");
     }
@@ -448,11 +425,8 @@ inline void vec_slice_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv)
 
         std::vector<float> result(vec->begin() + start, vec->begin() + end);
 
-        auto blob_data = std::as_bytes(std::span(result));
-        context.result_blob_with_subtype(
-            std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(blob_data.data()),
-                                          blob_data.size()),
-            static_cast<unsigned int>(VectorElementType::Float32));
+        context.result_blob_with_subtype(as_uint8_bytes(std::span<const float>(result)),
+                                         static_cast<unsigned int>(VectorElementType::Float32));
     } else {
         context.result_error("vec_slice only supports float32 vectors");
     }

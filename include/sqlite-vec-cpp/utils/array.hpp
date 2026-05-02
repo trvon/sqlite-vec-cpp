@@ -1,8 +1,11 @@
 #pragma once
 
+#include <array>
+#include <bit>
 #include <cstring>
 #include <memory>
 #include <span>
+#include <type_traits>
 #include <vector>
 #include "../concepts/vector_element.hpp"
 #include "error.hpp"
@@ -53,10 +56,12 @@ public:
         if (element_size != sizeof(T)) {
             return err_void(Error{ErrorCode::InvalidArgument, "Element size mismatch"});
         }
+        static_assert(std::is_trivially_copyable_v<T>,
+                      "append_bytes requires trivially-copyable element types");
         try {
-            T element;
-            std::memcpy(&element, element_bytes, sizeof(T));
-            data_.push_back(element);
+            std::array<std::byte, sizeof(T)> bytes{};
+            std::memcpy(bytes.data(), element_bytes, bytes.size());
+            data_.push_back(std::bit_cast<T>(bytes));
             return ok();
         } catch (const std::bad_alloc&) {
             return err_void(Error{ErrorCode::MemoryAllocation, "Failed to append to array"});

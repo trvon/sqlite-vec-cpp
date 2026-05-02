@@ -17,9 +17,7 @@ inline __m256 avx_fmadd_ps(__m256 a, __m256 b, __m256 c) {
 #endif
 }
 
-/// AVX-optimized L2 (Euclidean) distance for float vectors
-/// Requires: AVX support, size % 16 == 0, size >= 16
-inline float l2_distance_float_avx(std::span<const float> a, std::span<const float> b) {
+inline float l2_squared_distance_float_avx(std::span<const float> a, std::span<const float> b) {
     const std::size_t size = a.size();
 
     // Process 16 floats at a time (two __m256 vectors)
@@ -58,7 +56,13 @@ inline float l2_distance_float_avx(std::span<const float> a, std::span<const flo
         ++i;
     }
 
-    return std::sqrt(scalar_sum);
+    return scalar_sum;
+}
+
+/// AVX-optimized L2 (Euclidean) distance for float vectors
+/// Requires: AVX support, size % 16 == 0, size >= 16
+inline float l2_distance_float_avx(std::span<const float> a, std::span<const float> b) {
+    return std::sqrt(l2_squared_distance_float_avx(a, b));
 }
 
 /// AVX-optimized L1 (Manhattan) distance for float vectors

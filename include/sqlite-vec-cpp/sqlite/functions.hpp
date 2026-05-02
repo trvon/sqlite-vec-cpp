@@ -21,6 +21,13 @@ enum class VectorElementType : int {
     Int8 = 223 + 2,
 };
 
+/// View a typed contiguous range as SQLite-compatible bytes without changing ownership.
+template <typename T>
+[[nodiscard]] std::span<const std::uint8_t> as_uint8_bytes(std::span<const T> values) noexcept {
+    auto bytes = std::as_bytes(values);
+    return {static_cast<const std::uint8_t*>(static_cast<const void*>(bytes.data())), bytes.size()};
+}
+
 /// Extract vector from sqlite3_value with type information
 /// Returns span to vector data and element type
 template <typename T> Result<VectorView<const T>> extract_vector_from_value(const Value& value) {
@@ -38,7 +45,13 @@ template <typename T> Result<VectorView<const T>> extract_vector_from_value(cons
             Error::invalid_argument("Blob size not aligned to element size"));
     }
 
-    const T* data = reinterpret_cast<const T*>(blob.data());
+    const auto address = reinterpret_cast<std::uintptr_t>(blob.data());
+    if (address % alignof(T) != 0) {
+        return err<VectorView<const T>>(
+            Error::invalid_argument("Blob data is not aligned for requested vector type"));
+    }
+
+    const T* data = static_cast<const T*>(static_cast<const void*>(blob.data()));
     std::size_t dimensions = blob.size() / sizeof(T);
 
     return Result<VectorView<const T>>(VectorView<const T>(data, dimensions));

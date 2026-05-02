@@ -17,6 +17,7 @@
 #include "../concepts/distance_metric.hpp"
 #include "../concepts/vector_element.hpp"
 #include "../distances/inner_product.hpp"
+#include "../distances/l2.hpp"
 #include "hnsw_node.hpp"
 #include "hnsw_threading.hpp"
 #include "quantization_snapshot.hpp"
@@ -85,6 +86,7 @@ public:
                    ///< computation uses inner product (1 - dot(a,b)) instead of full cosine.
                    ///< This gives ~3x speedup on NEON (4 FMA/iter vs 12 for full cosine).
                    ///< Only meaningful when metric is cosine; ignored for L2/IP metrics.
+        uint32_t random_seed = 42; ///< Deterministic layer-selection seed.
 
         /// Create config optimized for high recall on large corpora
         /// @param corpus_size Expected number of vectors
@@ -147,7 +149,7 @@ public:
     using NodeType = HNSWNode<StorageT>;
 
     /// Construct empty HNSW index
-    explicit HNSWIndex(Config config = {}) : config_(config) {}
+    explicit HNSWIndex(Config config = {}) : config_(config), rng_generator_(config.random_seed) {}
 
     /// Move constructor (required because std::shared_mutex is move-only)
     HNSWIndex(HNSWIndex&& other) noexcept
@@ -156,12 +158,13 @@ public:
           next_dense_id_(other.next_dense_id_.load(std::memory_order_relaxed)),
           entry_point_id_(other.entry_point_id_.load(std::memory_order_relaxed)),
           entry_point_layer_(other.entry_point_layer_.load(std::memory_order_relaxed)),
-          rng_generator_() {}
+          rng_generator_(config_.random_seed) {}
 
     /// Move assignment
     HNSWIndex& operator=(HNSWIndex&& other) noexcept {
         if (this != &other) {
             config_ = other.config_;
+            rng_generator_.reseed(config_.random_seed);
             nodes_ = std::move(other.nodes_);
             deleted_ids_ = std::move(other.deleted_ids_);
             next_dense_id_.store(other.next_dense_id_.load(std::memory_order_relaxed),
@@ -1382,6 +1385,7 @@ private:
         if (candidates.size() > k) {
             candidates.resize(k);
         }
+        convert_result_distances(candidates);
 
         return candidates;
     }
@@ -1396,7 +1400,7 @@ private:
         const auto* current_node = try_get_node(current);
         if (!current_node)
             return current;
-        float current_dist = distance_query_node(query, *current_node);
+        float current_dist = comparable_distance_query_node(query, *current_node);
 
         bool changed = true;
         while (changed) {
@@ -1419,7 +1423,7 @@ private:
                 const auto* neighbor_node = try_get_node(neighbor);
                 if (!neighbor_node)
                     continue;
-                float neighbor_dist = distance_query_node(query, *neighbor_node);
+                float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
                 if (neighbor_dist < kDistanceEpsilon || neighbor_dist >= current_dist)
                     continue;
                 current = neighbor;
@@ -1450,7 +1454,7 @@ private:
         if (!entry_node)
             return {};
 
-        float entry_dist = distance_query_node(query, *entry_node);
+        float entry_dist = comparable_distance_query_node(query, *entry_node);
         candidates.emplace(entry_dist, entry_point);
         size_t entry_dense = entry_node->dense_id;
         if (entry_dense == kInvalidDenseId)
@@ -1523,7 +1527,7 @@ private:
                     }
                 }
 
-                float neighbor_dist = distance_query_node(query, *neighbor_node);
+                float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
                 if (neighbor_dist < kDistanceEpsilon)
                     continue;
 
@@ -1611,7 +1615,7 @@ private:
             const auto* n = try_get_node(neighbor);
             if (!n)
                 continue;
-            neighbor_dists.emplace_back(neighbor, distance_nodes(node, *n));
+            neighbor_dists.emplace_back(neighbor, comparable_distance_nodes(node, *n));
         }
 
         std::sort(neighbor_dists.begin(), neighbor_dists.end(),
@@ -1631,7 +1635,7 @@ private:
                 const auto* nbr_node = try_get_node(neighbor_id);
                 if (!sel_node || !nbr_node)
                     continue;
-                float dist_to_selected = distance_nodes(*nbr_node, *sel_node);
+                float dist_to_selected = comparable_distance_nodes(*nbr_node, *sel_node);
                 if (dist_to_selected < dist_to_node) {
                     is_diverse = false;
                     break;
@@ -1683,7 +1687,7 @@ private:
         const auto* current_node = try_get_node(current);
         if (!current_node)
             return current;
-        float current_dist = distance_query_node(query, *current_node);
+        float current_dist = comparable_distance_query_node(query, *current_node);
 
         auto passes_filter = [&](size_t id) { return !is_deleted_unlocked(id); };
         size_t best_active = passes_filter(current) ? current : static_cast<size_t>(-1);
@@ -1713,7 +1717,7 @@ private:
                 if (!neighbor_node)
                     continue;
 
-                float neighbor_dist = distance_query_node(query, *neighbor_node);
+                float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
                 if (neighbor_dist < kDistanceEpsilon || neighbor_dist >= current_dist)
                     continue;
                 current = neighbor;
@@ -1749,7 +1753,7 @@ private:
         if (!entry_node)
             return {};
 
-        float entry_dist = distance_query_node(query, *entry_node);
+        float entry_dist = comparable_distance_query_node(query, *entry_node);
         candidates.emplace(entry_dist, entry_point);
         size_t entry_dense = entry_node->dense_id;
         if (entry_dense == kInvalidDenseId) {
@@ -1823,7 +1827,7 @@ private:
                     }
                 }
 
-                float neighbor_dist = distance_query_node(query, *neighbor_node);
+                float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
                 if (neighbor_dist < kDistanceEpsilon)
                     continue;
 
@@ -1876,10 +1880,16 @@ private:
             config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
 
         size_t current = entry_point;
-        float current_dist = distance(query, current);
+        const auto* initial_node = try_get_node(current);
+        if (!initial_node)
+            return current;
+        float current_dist = comparable_distance_query_node(query, *initial_node);
 
+        const bool check_deleted = !deleted_ids_.empty();
         auto passes_filter = [&](size_t id) {
-            return !is_deleted_unlocked(id) && (!filter || (*filter)(id));
+            if (check_deleted && is_deleted_unlocked(id))
+                return false;
+            return !filter || (*filter)(id);
         };
         size_t best_active = passes_filter(current) ? current : static_cast<size_t>(-1);
         float best_active_dist =
@@ -1907,7 +1917,10 @@ private:
                     prefetch_node(neighbors[i + 1]);
                 }
 
-                float neighbor_dist = distance(query, neighbor);
+                const auto* neighbor_node = try_get_node(neighbor);
+                if (!neighbor_node)
+                    continue;
+                float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
                 if (neighbor_dist < kDistanceEpsilon || neighbor_dist >= current_dist)
                     continue;
                 current = neighbor;
@@ -1947,14 +1960,18 @@ private:
     beam_search_layer_shared(std::span<const float> query, size_t entry_point, size_t ef,
                              size_t layer, const FilterFn* filter) const {
         auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
+        std::vector<std::pair<float, size_t>> top_storage;
+        top_storage.reserve(ef + 1);
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
                             decltype(cmp)>
-            top_candidates(cmp);
+            top_candidates(cmp, std::move(top_storage));
 
         auto cmp_min = [](const auto& a, const auto& b) { return a.first > b.first; };
+        std::vector<std::pair<float, size_t>> candidate_storage;
+        candidate_storage.reserve(ef + 1);
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
                             decltype(cmp_min)>
-            candidates(cmp_min);
+            candidates(cmp_min, std::move(candidate_storage));
 
         // Use thread-local visited tracker instead of allocating unordered_set
         // This avoids heap allocation per search call
@@ -1964,7 +1981,7 @@ private:
         if (!entry_node)
             return {};
 
-        float entry_dist = distance_query_node(query, *entry_node);
+        float entry_dist = comparable_distance_query_node(query, *entry_node);
         candidates.emplace(entry_dist, entry_point);
         size_t entry_dense = entry_node->dense_id;
         if (entry_dense == kInvalidDenseId) {
@@ -1972,8 +1989,11 @@ private:
         }
         visited.visit(entry_dense);
 
+        const bool check_deleted = !deleted_ids_.empty();
         auto passes_filter = [&](size_t id) {
-            return !is_deleted_unlocked(id) && (!filter || (*filter)(id));
+            if (check_deleted && is_deleted_unlocked(id))
+                return false;
+            return !filter || (*filter)(id);
         };
 
         // Note: entry_dist can be slightly negative due to floating-point error
@@ -2048,7 +2068,7 @@ private:
                     }
                 }
 
-                float neighbor_dist = distance_query_node(query, *neighbor_node);
+                float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
                 if (neighbor_dist < kDistanceEpsilon)
                     continue;
 
@@ -2525,6 +2545,35 @@ private:
         return config_.metric(a, b);
     }
 
+    float compute_comparable_distance(std::span<const float> a, std::span<const float> b) const {
+        if (config_.normalize_vectors) {
+            return distances::inner_product_distance(a, b);
+        }
+        if constexpr (std::same_as<StorageT, float> &&
+                      std::same_as<MetricT, distances::L2Metric<float>>) {
+            return distances::l2_squared_distance(a, b);
+        } else {
+            return config_.metric(a, b);
+        }
+    }
+
+    float output_distance(float distance) const {
+        if (!config_.normalize_vectors) {
+            if constexpr (std::same_as<StorageT, float> &&
+                          std::same_as<MetricT, distances::L2Metric<float>>) {
+                return std::sqrt(std::max(0.0f, distance));
+            }
+        }
+        return distance;
+    }
+
+    void convert_result_distances(std::vector<std::pair<size_t, float>>& results) const {
+        for (auto& [id, distance] : results) {
+            (void)id;
+            distance = output_distance(distance);
+        }
+    }
+
     /// Distance between two StorageT nodes
     float distance_nodes(const NodeType& n1, const NodeType& n2) const {
         if constexpr (std::same_as<StorageT, float>) {
@@ -2543,6 +2592,26 @@ private:
         } else {
             auto node_vec = node.as_float32();
             return compute_distance(query, std::span<const float>(node_vec));
+        }
+    }
+
+    float comparable_distance_nodes(const NodeType& n1, const NodeType& n2) const {
+        if constexpr (std::same_as<StorageT, float>) {
+            return compute_comparable_distance(n1.as_span(), n2.as_span());
+        } else {
+            auto f1 = n1.as_float32();
+            auto f2 = n2.as_float32();
+            return compute_comparable_distance(std::span<const float>(f1),
+                                               std::span<const float>(f2));
+        }
+    }
+
+    float comparable_distance_query_node(std::span<const float> query, const NodeType& node) const {
+        if constexpr (std::same_as<StorageT, float>) {
+            return compute_comparable_distance(query, node.as_span());
+        } else {
+            auto node_vec = node.as_float32();
+            return compute_comparable_distance(query, std::span<const float>(node_vec));
         }
     }
 

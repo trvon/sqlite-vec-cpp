@@ -24,13 +24,12 @@ template <concepts::VectorElement T, concepts::DistanceMetric<T> Metric>
 std::vector<float> batch_distance(std::span<const T> query,
                                   std::span<const std::span<const T>> database,
                                   const Metric& metric = Metric{}) {
-    std::vector<float> distances;
-    distances.reserve(database.size());
+    std::vector<float> distances(database.size());
 
-    // Process all database vectors against single query
-    // Query stays in registers/cache throughout iteration
-    for (const auto& db_vec : database) {
-        distances.push_back(metric(query, db_vec));
+    // Process all database vectors against single query. Query stays in registers/cache
+    // throughout iteration; writing by index avoids repeated size updates from push_back.
+    for (size_t i = 0; i < database.size(); ++i) {
+        distances[i] = metric(query, database[i]);
     }
 
     return distances;
@@ -51,14 +50,14 @@ std::vector<float> batch_distance_contiguous(std::span<const T> query, std::span
     assert(query.size() == dim && "Query dimension mismatch");
     assert(database.size() == num_vectors * dim && "Database size mismatch");
 
-    std::vector<float> distances;
-    distances.reserve(num_vectors);
+    std::vector<float> distances(num_vectors);
 
-    // Slice database into individual vectors and compute distances
+    // Slice database into individual vectors and compute distances. Pre-sizing avoids
+    // push_back bookkeeping in tight scan loops.
     for (size_t i = 0; i < num_vectors; ++i) {
         const size_t offset = i * dim;
         std::span<const T> db_vec = database.subspan(offset, dim);
-        distances.push_back(metric(query, db_vec));
+        distances[i] = metric(query, db_vec);
     }
 
     return distances;

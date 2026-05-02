@@ -2,10 +2,8 @@
 
 #include <atomic>
 #include <cstddef>
-#include <cstdlib>
 #include <functional>
 #include <random>
-#include <string>
 #include <thread>
 #include <vector>
 
@@ -53,27 +51,21 @@ class ThreadLocalRNG {
     std::uniform_real_distribution<float> dist_{0.0f, 1.0f};
     uint32_t seed_{42};
 
-    static uint32_t resolveSeed(uint32_t fallback) {
-        if (const char* env = std::getenv("YAMS_HNSW_RANDOM_SEED")) {
-            try {
-                const auto parsed = static_cast<unsigned long>(std::stoul(std::string(env)));
-                return static_cast<uint32_t>(parsed);
-            } catch (...) {
-            }
-        }
-        return fallback;
-    }
-
     void ensureSeeded() {
         auto& seeded = seededStorage();
         if (!seeded) {
-            rngStorage().seed(resolveSeed(seed_));
+            rngStorage().seed(seed_);
             seeded = true;
         }
     }
 
 public:
     explicit ThreadLocalRNG(uint32_t seed = 42) : seed_(seed) {}
+
+    void reseed(uint32_t seed) {
+        seed_ = seed;
+        seededStorage() = false;
+    }
 
     [[nodiscard]] float random() {
         ensureSeeded();

@@ -10,9 +10,7 @@
 
 namespace sqlite_vec_cpp::distances::simd {
 
-/// NEON-optimized L2 distance for float vectors
-/// Requires: NEON support, size > 16
-inline float l2_distance_float_neon(std::span<const float> a, std::span<const float> b) {
+inline float l2_squared_distance_float_neon(std::span<const float> a, std::span<const float> b) {
     const std::size_t size = a.size();
     const std::size_t qty16 = size >> 4;    // size / 16
     const std::size_t end_idx = qty16 << 4; // (size / 16) * 16
@@ -61,7 +59,13 @@ inline float l2_distance_float_neon(std::span<const float> a, std::span<const fl
         ++i;
     }
 
-    return std::sqrt(scalar_sum);
+    return scalar_sum;
+}
+
+/// NEON-optimized L2 distance for float vectors
+/// Requires: NEON support, size > 16
+inline float l2_distance_float_neon(std::span<const float> a, std::span<const float> b) {
+    return std::sqrt(l2_squared_distance_float_neon(a, b));
 }
 
 /// NEON-optimized L2 distance for int8 vectors
