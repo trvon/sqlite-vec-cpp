@@ -69,13 +69,21 @@ public:
     }
 #endif
 
-    /// Configuration parameters for HNSW index
-    /// Tuned for high recall on large corpora (10K+ vectors) with high-dimensional embeddings
+    /// Configuration parameters for HNSW index.
+    ///
+    /// Default M=16 follows the hnswlib reference implementation and is safe for
+    /// general-purpose use. For modern high-dimensional embeddings (384-1536d),
+    /// consider M=24 which provides significantly better recall (98.4% vs 92.9%
+    /// at 768d/10K) at ~2x build cost. See benchmarks/hnsw_m_sweep_benchmark.
+    ///
+    /// Research basis: Elliott & Clark (2024), "The Impacts of Data, Ordering,
+    /// and Intrinsic Dimensionality on Recall in HNSW" found that real embedding
+    /// vectors benefit from higher connectivity than SIFT1M-calibrated defaults.
     struct Config {
-        size_t M = 16;                ///< Connections per node per layer (16-48 typical)
+        size_t M = 16;                ///< Connections per node per layer (16-48 typical; 24 recommended for embeddings)
         size_t M_max = 32;            ///< Max connections for layers > 0 (usually 2*M)
         size_t M_max_0 = 64;          ///< Max connections at layer 0 (critical for recall, 2-4x M)
-        size_t ef_construction = 200; ///< Exploration factor during construction (100-500)
+        size_t ef_construction = 200; ///< Exploration factor during construction (100-500; 200 minimum recommended)
         float ml_factor = 1.0f / std::log(2.0f); ///< Layer selection multiplier (1/ln(2))
         MetricT metric{};                        ///< Distance metric (operates on float spans)
         bool clamp_negative_distances =
@@ -112,11 +120,12 @@ public:
                 cfg.M_max_0 = 48;
             }
 
-            // Higher ef_construction for larger corpora
+            // Higher ef_construction for larger corpora.
+            // Minimum of 200 provides baseline recall quality; 400 for large corpora.
             if (corpus_size >= 100000) {
                 cfg.ef_construction = 400;
             } else {
-                cfg.ef_construction = 100;
+                cfg.ef_construction = 200;
             }
 
             return cfg;

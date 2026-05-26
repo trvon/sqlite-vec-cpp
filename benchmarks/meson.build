@@ -108,6 +108,28 @@ quantized_search_benchmark_exe = executable(
 )
 message('  ./quantized_search_benchmark (LVQ-8, LVQ-4, RaBitQ vs FP32 baseline)')
 
+# HNSW M-parameter sweep benchmark (standalone, no Google Benchmark dependency)
+# Systematically tests M values from 8 to 32 to identify the recall/cost knee.
+hnsw_m_sweep_benchmark_exe = executable(
+  'hnsw_m_sweep_benchmark',
+  'hnsw_m_sweep_benchmark.cpp',
+  include_directories: include_directories('../include'),
+  cpp_args: cpp_args_list,
+  install: false
+)
+message('  ./hnsw_m_sweep_benchmark (M=8..32 recall/cost Pareto sweep)')
+
+# HNSW ef_construction sweep benchmark (standalone, no Google Benchmark dependency)
+# Tests ef_construction 50..500 to validate for_corpus() thresholds.
+hnsw_ef_sweep_benchmark_exe = executable(
+  'hnsw_ef_sweep_benchmark',
+  'hnsw_ef_sweep_benchmark.cpp',
+  include_directories: include_directories('../include'),
+  cpp_args: cpp_args_list,
+  install: false
+)
+message('  ./hnsw_ef_sweep_benchmark (ef_construction 50..500 sweep)')
+
 vec0_ann_benchmark_exe = executable(
   'vec0_ann_benchmark',
   'vec0_ann_benchmark.cpp',

@@ -1,13 +1,18 @@
 # SQLite-Vec C++ Benchmark Results
 
 **Version**: 0.1.0
-**Date**: 2026-04-12
-**Platform**: Apple M4 Max, 16 cores (macOS 26.4)
-**Compiler**: Apple clang 17.0.0, C++20, Release mode (`-O3` via Meson `buildtype=release`)
-**SIMD**: NEON enabled, ARM DotProd disabled
+**Date**: 2026-05-25
+**Platform**: Apple M4 Max, 16 cores (macOS 26.4) / Linux x86_64
+**Compiler**: Apple clang 17.0.0 / GCC 15, C++20, Release mode (`-O3` via Meson `buildtype=release`)
+**SIMD**: NEON enabled (macOS), AVX disabled (Linux — no compile_commands.json flags)
 **Library**: Google Benchmark 1.9.5
 
 > Note: These benchmark settings are intentionally tuned for local performance measurement.
+> They are not the recommended defaults for packaging or portable distribution builds.
+>
+> **Audit update (2026-05-25)**: Added M-parameter sweep and ef_construction sweep
+> benchmarks to validate default HNSW parameters against research findings.
+> See `AUDIT-2026-05-25.md` and `benchmarks/hnsw_m_sweep_benchmark.cpp`.
 > They are not the recommended defaults for packaging or portable distribution builds.
 >
 > The Jan 2026 baseline ran on Apple M3 Max with DotProd enabled. This run uses Apple M4 Max
@@ -313,4 +318,87 @@ For the HNSW engine comparison benchmark:
 
 ```bash
 ./builddir-release/benchmarks/hnsw_engine_comparison_benchmark --corpus=10000 --dim=768
+```
+
+---
+
+## Parameter Sweep Benchmarks (NEW — 2026-05-25)
+
+These benchmarks validate default HNSW parameters against research findings
+(see `AUDIT-2026-05-25.md`). They are standalone executables with no external
+dependencies.
+
+### HNSW M-Parameter Sweep
+
+**Benchmark**: `hnsw_m_sweep_benchmark`
+**Purpose**: Systematically test M values from 8 to 32 to find the recall/cost Pareto frontier.
+Identifies the knee where diminishing returns begin (expected around M=20-24 for 768d embeddings).
+
+```bash
+meson setup build-sweep -Dbuildtype=release -Denable_benchmarks=true
+meson compile -C build-sweep hnsw_m_sweep_benchmark
+
+# Default: 768d, 10K corpus, 100 queries, M=8..32
+./build-sweep/benchmarks/hnsw_m_sweep_benchmark
+
+# Custom: 384d, 5K corpus, explicit ef_construction
+./build-sweep/benchmarks/hnsw_m_sweep_benchmark --corpus=5000 --dim=384 --ef-construction=200
+
+# Test across different dimensions
+for dim in 128 384 768 1536; do
+  ./build-sweep/benchmarks/hnsw_m_sweep_benchmark --corpus=10000 --dim=$dim --queries=100
+done
+```
+
+Output format: CSV with columns `M,ef_search,Build(ms),Latency(us),QPS,Recall@10,TotalEdges,EdgesPerNode`.
+Suitable for plotting recall-vs-build-time Pareto frontier.
+
+### HNSW ef_construction Sweep
+
+**Benchmark**: `hnsw_ef_sweep_benchmark`
+**Purpose**: Validate that ef_construction=200 is the correct minimum for `for_corpus()`
+(was 100 before audit). Tests ef_construction from 50 to 500.
+
+```bash
+meson compile -C build-sweep hnsw_ef_sweep_benchmark
+
+# Default: M=16, 768d, 10K corpus, ef_construction=50..500
+./build-sweep/benchmarks/hnsw_ef_sweep_benchmark
+
+# Test with higher M to see if ef_construction benefit compounds
+./build-sweep/benchmarks/hnsw_ef_sweep_benchmark --M=24 --corpus=10000 --dim=768
+```
+
+Output format: Table with columns `ef_construction, ef_search, Build(ms), Latency(us), QPS, Recall@10`.
+
+### Expected Findings (from audit)
+
+Based on the April 2026 engine comparison benchmark:
+
+- **M=16 vs M=24**: At 768d/10K, M=16 at ef_search=200 achieves 92.9% recall@10.
+  M=24 achieves 98.4% (+5.5pp) at 2.2x build cost but only 1.26x query latency.
+  **M=24 is the likely sweet spot** for high-dimensional embeddings.
+- **ef_construction=100 vs 200**: The `for_corpus()` factory previously used 100 for <100K
+  corpora. The ef_construction sweep will quantify the recall gap and confirm whether
+  200 should be the floor.
+- **Research alignment**: Elliott & Clark (2024) found that real embedding vectors benefit
+  from higher connectivity than SIFT1M-calibrated defaults. The M sweep directly measures
+  this effect.
+
+### Running the Full Audit Suite
+
+```bash
+# Build all benchmarks
+meson setup build-audit -Dbuildtype=release -Denable_benchmarks=true
+meson compile -C build-audit
+
+# M sweep (core finding)
+./build-audit/benchmarks/hnsw_m_sweep_benchmark --corpus=10000 --dim=768 --queries=200
+
+# ef_construction sweep (threshold validation)
+./build-audit/benchmarks/hnsw_ef_sweep_benchmark --corpus=10000 --dim=768 --M=16
+./build-audit/benchmarks/hnsw_ef_sweep_benchmark --corpus=10000 --dim=768 --M=24
+
+# Engine comparison (existing, with zvec if available)
+./build-audit/benchmarks/hnsw_engine_comparison_benchmark --corpus=10000 --dim=768
 ```
