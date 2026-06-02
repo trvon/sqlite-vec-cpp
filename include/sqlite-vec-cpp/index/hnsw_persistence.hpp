@@ -364,8 +364,10 @@ int save_hnsw_index(sqlite3* db, const char* schema, const char* table,
         return rc;
     }
 
+    const auto deleted_ids = index.deleted_ids_snapshot();
+
     // Save deleted IDs if any
-    if (index.deleted_count() > 0) {
+    if (!deleted_ids.empty()) {
         std::ostringstream deleted_sql;
         deleted_sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
                     << "_hnsw_meta\" (key, value) VALUES ('deleted_ids', ?)";
@@ -376,7 +378,7 @@ int save_hnsw_index(sqlite3* db, const char* schema, const char* table,
             return rc;
         }
 
-        auto deleted_blob = serialize_deleted_ids(index.deleted_ids());
+        auto deleted_blob = serialize_deleted_ids(deleted_ids);
         sqlite3_bind_blob(stmt, 1, deleted_blob.data(), deleted_blob.size(), SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
@@ -398,8 +400,12 @@ int save_hnsw_index(sqlite3* db, const char* schema, const char* table,
         return rc;
     }
 
-    for (auto it = index.begin(); it != index.end(); ++it) {
-        const auto& [node_id, node] = *it;
+    bool nodeSaveFailed = false;
+    size_t failedNodeId = 0;
+    index.forEachPersistableNode([&](size_t node_id, const auto& node) {
+        if (nodeSaveFailed) {
+            return;
+        }
         auto node_blob = serialize_hnsw_node(node);
 
         sqlite3_reset(stmt);
@@ -408,12 +414,16 @@ int save_hnsw_index(sqlite3* db, const char* schema, const char* table,
 
         rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE) {
-            sqlite3_finalize(stmt);
-            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-            if (pzErr)
-                *pzErr = sqlite3_mprintf("Failed to save HNSW node %zu", node_id);
-            return rc;
+            nodeSaveFailed = true;
+            failedNodeId = node_id;
         }
+    });
+    if (nodeSaveFailed) {
+        sqlite3_finalize(stmt);
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("Failed to save HNSW node %zu", failedNodeId);
+        return rc;
     }
 
     sqlite3_finalize(stmt);
@@ -752,6 +762,8 @@ int save_hnsw_checkpoint(sqlite3* db, const char* schema, const char* table,
         return rc;
     }
 
+    const auto deleted_ids = index.deleted_ids_snapshot();
+
     // Save deleted IDs
     std::ostringstream deleted_sql;
     deleted_sql << "INSERT OR REPLACE INTO \"" << schema << "\".\"" << table
@@ -763,7 +775,7 @@ int save_hnsw_checkpoint(sqlite3* db, const char* schema, const char* table,
         return rc;
     }
 
-    auto deleted_blob = serialize_deleted_ids(index.deleted_ids());
+    auto deleted_blob = serialize_deleted_ids(deleted_ids);
     sqlite3_bind_blob(stmt, 1, deleted_blob.data(), deleted_blob.size(), SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);

@@ -18,6 +18,9 @@
 #include "../index/hnsw.hpp"
 #include "../utils/error.hpp"
 #include "parsers.hpp"
+#include "../index/hnsw_persistence.hpp"
+
+#include <unordered_map>
 #include "value.hpp"
 #include "vtab.hpp"
 
@@ -62,6 +65,37 @@ struct Vec0PhssRerankOptions {
     bool enabled = false;
     size_t candidates = kVec0DefaultPhssCandidates;
 };
+
+struct Vec0Table;
+
+// Per-db registry of vec0 tables so external code can persist/restore ANN indexes.
+inline std::unordered_map<std::string, Vec0Table*>& vec0_table_registry() {
+    static std::unordered_map<std::string, Vec0Table*> reg;
+    return reg;
+}
+inline std::mutex& vec0_registry_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline void vec0_registry_put(const std::string& key, Vec0Table* t) {
+    std::lock_guard<std::mutex> lk(vec0_registry_mutex());
+    vec0_table_registry()[key] = t;
+}
+inline void vec0_registry_remove(const std::string& key) {
+    std::lock_guard<std::mutex> lk(vec0_registry_mutex());
+    vec0_table_registry().erase(key);
+}
+template <typename Fn>
+inline auto vec0_with_table(sqlite3* /*db*/, const std::string& table_name, Fn&& fn)
+    -> decltype(fn(static_cast<Vec0Table*>(nullptr))) {
+    std::lock_guard<std::mutex> lk(vec0_registry_mutex());
+    auto& reg = vec0_table_registry();
+    auto it = reg.find(table_name);
+    if (it == reg.end()) {
+        return fn(nullptr);
+    }
+    return fn(it->second);
+}
 
 struct Vec0Table {
     sqlite3_vtab base{};
@@ -130,7 +164,7 @@ struct Vec0RowidFilter {
                 return false;
             }
         }
-        return !active || true;
+        return true;
     }
 };
 
@@ -189,7 +223,7 @@ inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* ta
             Error::sqlite_error("Failed to scan vec0 vectors", rc));
     }
 
-    const bool use_parallel_build = row_count >= 2048 && std::thread::hardware_concurrency() > 1;
+    const bool use_parallel_build = row_count >= 256 && std::thread::hardware_concurrency() > 1;
     std::vector<size_t> parallel_ids;
     std::vector<std::vector<float>> parallel_vectors;
     std::vector<std::span<const float>> parallel_spans;
@@ -242,6 +276,14 @@ inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* ta
     table->ann_index = ann_index;
     table->ann_ready = true;
     return Result<std::shared_ptr<Vec0AnnIndex>>(ann_index);
+}
+
+/// Restore a previously-built ANN index into a vec0 table (called after reopen).
+/// This avoids the O(n log n) HNSW build on every restart.
+inline void vec0_restore_ann_index(Vec0Table* table, std::shared_ptr<Vec0AnnIndex> index) {
+    std::lock_guard<std::mutex> lock(table->ann_mutex);
+    table->ann_index = std::move(index);
+    table->ann_ready = true;
 }
 
 inline Result<std::vector<float>> vec0_parse_query_vector(Vec0Table* table,
@@ -576,6 +618,7 @@ inline int vec0Create(sqlite3* db, void* pAux, int argc, const char* const* argv
     }
 
     *ppVTab = &table->base;
+    vec0_registry_put(table->table_name, table);
     return SQLITE_OK;
 }
 
@@ -583,12 +626,14 @@ inline int vec0Create(sqlite3* db, void* pAux, int argc, const char* const* argv
 inline int vec0Connect(sqlite3* db, void* pAux, int argc, const char* const* argv,
                        sqlite3_vtab** ppVTab, char** pzErr) {
     // For vec0, Connect behaves same as Create (shadow tables already exist)
-    return vec0Create(db, pAux, argc, argv, ppVTab, pzErr);
+    int rc = vec0Create(db, pAux, argc, argv, ppVTab, pzErr);
+    return rc;
 }
 
 // xDisconnect: Called when disconnecting from table
 inline int vec0Disconnect(sqlite3_vtab* pVTab) {
     auto* table = reinterpret_cast<Vec0Table*>(pVTab);
+    vec0_registry_remove(table->table_name);
     delete table;
     return SQLITE_OK;
 }
@@ -596,6 +641,7 @@ inline int vec0Disconnect(sqlite3_vtab* pVTab) {
 // xDestroy: Called when DROP TABLE is executed
 inline int vec0Destroy(sqlite3_vtab* pVTab) {
     auto* table = reinterpret_cast<Vec0Table*>(pVTab);
+    vec0_registry_remove(table->table_name);
 
     // Drop shadow tables
     std::ostringstream drop_meta;

@@ -187,4 +187,40 @@ inline Result<void> register_all_functions(sqlite3* db) {
     return Result<void>();
 }
 
+/// Register only the YAMS subset: vec0 module + l1/l2/cosine distances + vec_f32/f32_simple.
+inline Result<void> register_yams_minimal_functions(sqlite3* db) {
+    if (!db) {
+        return err<void>(Error::invalid_argument("database handle is null"));
+    }
+    constexpr int kScalarFlags = SQLITE_UTF8 | SQLITE_DETERMINISTIC;
+    constexpr int kVecReadFlags = SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_SUBTYPE;
+    constexpr int kVecResultFlags =
+        SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_SUBTYPE | SQLITE_RESULT_SUBTYPE;
+
+    auto vec0_result = register_vec0_module(db);
+    if (!vec0_result) return vec0_result;
+
+    int rc = sqlite3_create_function_v2(db, "vec_distance_l2", 2, kVecReadFlags, nullptr,
+                                        vec_distance_l2, nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) return err<void>(Error::sqlite_error("Failed to register vec_distance_l2", rc));
+
+    rc = sqlite3_create_function_v2(db, "vec_distance_l1", 2, kVecReadFlags, nullptr,
+                                    vec_distance_l1, nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) return err<void>(Error::sqlite_error("Failed to register vec_distance_l1", rc));
+
+    rc = sqlite3_create_function_v2(db, "vec_distance_cosine", 2, kVecReadFlags, nullptr,
+                                    vec_distance_cosine, nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) return err<void>(Error::sqlite_error("Failed to register vec_distance_cosine", rc));
+
+    rc = sqlite3_create_function_v2(db, "vec_f32", 1, kVecResultFlags, nullptr, vec_f32, nullptr,
+                                    nullptr, nullptr);
+    if (rc != SQLITE_OK) return err<void>(Error::sqlite_error("Failed to register vec_f32", rc));
+
+    rc = sqlite3_create_function_v2(db, "vec_f32_simple", 1, kScalarFlags, nullptr,
+                                    vec_f32_simple, nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) return err<void>(Error::sqlite_error("Failed to register vec_f32_simple", rc));
+
+    return Result<void>();
+}
+
 } // namespace sqlite_vec_cpp::sqlite

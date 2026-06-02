@@ -1124,10 +1124,6 @@ public:
         return stats;
     }
 
-    /// Iterator support for serialization
-    auto begin() const { return nodes_.begin(); }
-    auto end() const { return nodes_.end(); }
-
     /// Get node by ID (for serialization)
     const NodeType* get_node(size_t id) const { return try_get_node(id); }
 
@@ -1166,8 +1162,19 @@ public:
         return nodes_.size() - deleted_ids_.size();
     }
 
-    /// Get the set of deleted IDs (for serialization)
-    [[nodiscard]] const std::unordered_set<size_t>& deleted_ids() const { return deleted_ids_; }
+    /// Copy the soft-deleted ID set under the deleted-node lock.
+    [[nodiscard]] std::unordered_set<size_t> deleted_ids_snapshot() const {
+        std::shared_lock deleted_lock(deleted_mutex_);
+        return deleted_ids_;
+    }
+
+    /// Visit every persistable node while holding the nodes read lock.
+    template <typename Fn> void forEachPersistableNode(Fn&& fn) const {
+        std::shared_lock nodes_lock(nodes_mutex_);
+        for (const auto& [node_id, node] : nodes_) {
+            fn(node_id, node);
+        }
+    }
 
     /// Monotonically increasing counter, bumped on every insert/delete.
     /// Used by HNSWQuantizedSearch to detect stale quantization snapshots.
