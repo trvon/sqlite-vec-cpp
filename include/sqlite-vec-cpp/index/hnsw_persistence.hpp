@@ -613,16 +613,13 @@ int save_hnsw_nodes_incremental(sqlite3* db, const char* schema, const char* tab
         return rc;
     }
 
-    for (size_t node_id : nodes_to_save) {
-        const typename HNSWIndex<T, Metric>::NodeType* node = index.get_node(node_id);
-        if (!node) {
-            continue;
-        }
+    const auto node_snapshot = index.snapshotPersistableNodes(nodes_to_save);
 
-        auto node_blob = serialize_hnsw_node(*node);
+    for (const auto& node : node_snapshot) {
+        auto node_blob = serialize_hnsw_node(node);
 
         sqlite3_reset(stmt);
-        sqlite3_bind_int64(stmt, 1, node_id);
+        sqlite3_bind_int64(stmt, 1, node.id);
         sqlite3_bind_blob(stmt, 2, node_blob.data(), node_blob.size(), SQLITE_TRANSIENT);
 
         rc = sqlite3_step(stmt);
@@ -630,7 +627,7 @@ int save_hnsw_nodes_incremental(sqlite3* db, const char* schema, const char* tab
             sqlite3_finalize(stmt);
             sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
             if (pzErr)
-                *pzErr = sqlite3_mprintf("Failed to save HNSW node %zu", node_id);
+                *pzErr = sqlite3_mprintf("Failed to save HNSW node %zu", node.id);
             return rc;
         }
     }

@@ -77,20 +77,29 @@ inline std::mutex& vec0_registry_mutex() {
     static std::mutex m;
     return m;
 }
-inline void vec0_registry_put(const std::string& key, Vec0Table* t) {
-    std::lock_guard<std::mutex> lk(vec0_registry_mutex());
-    vec0_table_registry()[key] = t;
+inline std::string vec0_registry_key(sqlite3* db, std::string_view schema_name,
+                                     std::string_view table_name) {
+    std::ostringstream key;
+    key << static_cast<const void*>(db) << '|' << schema_name << '|' << table_name;
+    return key.str();
 }
-inline void vec0_registry_remove(const std::string& key) {
+inline void vec0_registry_put(sqlite3* db, std::string_view schema_name,
+                              std::string_view table_name, Vec0Table* t) {
     std::lock_guard<std::mutex> lk(vec0_registry_mutex());
-    vec0_table_registry().erase(key);
+    vec0_table_registry()[vec0_registry_key(db, schema_name, table_name)] = t;
+}
+inline void vec0_registry_remove(sqlite3* db, std::string_view schema_name,
+                                 std::string_view table_name) {
+    std::lock_guard<std::mutex> lk(vec0_registry_mutex());
+    vec0_table_registry().erase(vec0_registry_key(db, schema_name, table_name));
 }
 template <typename Fn>
-inline auto vec0_with_table(sqlite3* /*db*/, const std::string& table_name, Fn&& fn)
+inline auto vec0_with_table(sqlite3* db, std::string_view schema_name,
+                            std::string_view table_name, Fn&& fn)
     -> decltype(fn(static_cast<Vec0Table*>(nullptr))) {
     std::lock_guard<std::mutex> lk(vec0_registry_mutex());
     auto& reg = vec0_table_registry();
-    auto it = reg.find(table_name);
+    auto it = reg.find(vec0_registry_key(db, schema_name, table_name));
     if (it == reg.end()) {
         return fn(nullptr);
     }
@@ -618,7 +627,7 @@ inline int vec0Create(sqlite3* db, void* pAux, int argc, const char* const* argv
     }
 
     *ppVTab = &table->base;
-    vec0_registry_put(table->table_name, table);
+    vec0_registry_put(table->db, table->schema_name, table->table_name, table);
     return SQLITE_OK;
 }
 
@@ -633,7 +642,7 @@ inline int vec0Connect(sqlite3* db, void* pAux, int argc, const char* const* arg
 // xDisconnect: Called when disconnecting from table
 inline int vec0Disconnect(sqlite3_vtab* pVTab) {
     auto* table = reinterpret_cast<Vec0Table*>(pVTab);
-    vec0_registry_remove(table->table_name);
+    vec0_registry_remove(table->db, table->schema_name, table->table_name);
     delete table;
     return SQLITE_OK;
 }
@@ -641,7 +650,7 @@ inline int vec0Disconnect(sqlite3_vtab* pVTab) {
 // xDestroy: Called when DROP TABLE is executed
 inline int vec0Destroy(sqlite3_vtab* pVTab) {
     auto* table = reinterpret_cast<Vec0Table*>(pVTab);
-    vec0_registry_remove(table->table_name);
+    vec0_registry_remove(table->db, table->schema_name, table->table_name);
 
     // Drop shadow tables
     std::ostringstream drop_meta;

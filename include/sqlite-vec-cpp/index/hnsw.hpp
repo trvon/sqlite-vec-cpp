@@ -1176,6 +1176,22 @@ public:
         }
     }
 
+    /// Copy a selected set of nodes under the nodes read lock.
+    [[nodiscard]] std::vector<NodeType>
+    snapshotPersistableNodes(std::span<const size_t> node_ids) const {
+        std::shared_lock nodes_lock(nodes_mutex_);
+        std::vector<NodeType> snapshot;
+        snapshot.reserve(node_ids.size());
+        for (size_t node_id : node_ids) {
+            auto it = nodes_.find(node_id);
+            if (it == nodes_.end()) {
+                continue;
+            }
+            snapshot.push_back(it->second);
+        }
+        return snapshot;
+    }
+
     /// Monotonically increasing counter, bumped on every insert/delete.
     /// Used by HNSWQuantizedSearch to detect stale quantization snapshots.
     [[nodiscard]] uint64_t mutation_generation() const {
