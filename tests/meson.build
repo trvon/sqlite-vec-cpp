@@ -75,7 +75,10 @@ test_tls_linkage = executable(
 # Detect if sanitizers are enabled (TSAN/ASAN add significant overhead)
 # Meson doesn't expose b_sanitize directly, so we check compiler args
 is_sanitized = get_option('b_sanitize') != 'none'
-hnsw_timeout = is_sanitized ? 900 : 300
+# Headroom matters: the TSAN suite has been observed at ~690s and the
+# coverage/Windows suites at ~200s when healthy, so the old 900/300 limits
+# left almost no margin on slow shared runners.
+hnsw_timeout = is_sanitized ? 1500 : 600
 
 test('Concepts and VectorView', test_concepts)
 test('Distance Metrics', test_distances)

@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <random>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
 
@@ -32,6 +34,39 @@ public:
     }
 
     void unlock() { flag_.clear(std::memory_order_release); }
+};
+
+/// Shared mutex with writer priority.
+/// glibc's pthread rwlock prefers readers by default, so sustained shared-lock
+/// traffic (e.g. search threads in a tight loop) starves unique-lock waiters
+/// (insert/remove) indefinitely on Linux. New readers back off while a writer
+/// is waiting, bounding writer wait to the in-flight reader critical sections.
+/// Satisfies the SharedMutex named requirements (drop-in for std::shared_mutex).
+class WriterPrioritySharedMutex {
+    std::shared_mutex mutex_;
+    std::atomic<uint32_t> writers_waiting_{0};
+
+public:
+    void lock() {
+        writers_waiting_.fetch_add(1, std::memory_order_acquire);
+        mutex_.lock();
+        writers_waiting_.fetch_sub(1, std::memory_order_release);
+    }
+
+    bool try_lock() { return mutex_.try_lock(); }
+
+    void unlock() { mutex_.unlock(); }
+
+    void lock_shared() {
+        while (writers_waiting_.load(std::memory_order_acquire) != 0) {
+            std::this_thread::yield();
+        }
+        mutex_.lock_shared();
+    }
+
+    bool try_lock_shared() { return mutex_.try_lock_shared(); }
+
+    void unlock_shared() { mutex_.unlock_shared(); }
 };
 
 /// Thread-local random number generator for parallel operations

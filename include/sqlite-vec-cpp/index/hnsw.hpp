@@ -1341,9 +1341,11 @@ private:
 
     Config config_;
 
-    // Thread-safe graph storage
-    mutable std::shared_mutex nodes_mutex_;
-    mutable std::shared_mutex deleted_mutex_;
+    // Thread-safe graph storage. Writer-priority mutexes: searches hold the
+    // shared lock for the full traversal, so a fair-to-readers rwlock (glibc
+    // default) would starve insert/remove under sustained search load.
+    mutable WriterPrioritySharedMutex nodes_mutex_;
+    mutable WriterPrioritySharedMutex deleted_mutex_;
     std::unordered_map<size_t, NodeType> nodes_;
     std::unordered_set<size_t> deleted_ids_;
     std::atomic<uint64_t> mutation_generation_{
