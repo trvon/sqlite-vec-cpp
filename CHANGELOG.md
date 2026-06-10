@@ -5,6 +5,53 @@ All notable changes to sqlite-vec-cpp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-06-09
+
+### Fixed
+- **Correctness audit (Phase A)**:
+  - HNSW persistence: cap `num_layers` (`kMaxHnswLayers = 64`) and per-layer
+    neighbor counts during node deserialization — corrupt shadow-table blobs
+    previously triggered unbounded allocations (OOM). Deleted-ids blobs now
+    validate their count against the blob size before `reserve`.
+  - `load_hnsw_index`: validate node-id consistency between the shadow-table
+    rowid and the serialized blob, reject a missing entry point, and prune
+    dangling neighbor edges referencing nodes absent from the shadow table.
+  - `get_hnsw_checkpoint_info`: bounds-check the entry-point meta blob before
+    dereferencing (previously an unchecked cast + read).
+  - vec0: `dimensions * sizeof(float)` size checks now use `size_t` arithmetic
+    (previously truncated through `int`); `CREATE VIRTUAL TABLE` rejects
+    dimensions outside `[1, 65536]` and embedding column names containing `"`.
+  - vec0 xFilter: ANN plans without an explicit `k` constraint no longer
+    dereference a disengaged `std::optional` (use `kVec0DefaultK`).
+  - HNSW greedy descent: NaN distances no longer "improve" the current
+    candidate — NaN/Inf vectors previously caused an infinite traversal loop
+    on insert and search (found by the new adversarial test).
+  - HNSW concurrent search: `nodes_.empty()` was read before acquiring
+    `nodes_mutex_` in `search_with_filter_impl` / `search_quantized_rerank` /
+    `search_batch_with_filter` — a data race against concurrent `insert()`
+    (found by the new TSan concurrency stress test).
+  - `insert_single_threaded`: debug-build guard asserts on concurrent callers.
+
+### Added
+- **True RaBitQ quantization** (arXiv:2405.12497), replacing the previous
+  sign-quantization heuristic: seeded FWHT-based random rotation, the paper's
+  unbiased inner-product estimator with per-vector correction factors, and
+  4-bit scalar quantization of the rotated query so distance estimation stays
+  popcount-only (5 popcounts per candidate). Recall@10 on 10K Gaussian
+  vectors (3x rerank, ef=100): 76.6% → 94.9% at 128d, and at 768d RaBitQ now
+  dominates the LVQ latency/recall/memory frontier (99.6% @ ef=200/3x, ~2.9x
+  less memory than LVQ-4, faster than FP32 traversal). See BENCHMARKS.md.
+- **Hardening tests**: deterministic persistence fuzzing (truncations, byte
+  flips, hostile length splices), adversarial vector tests (NaN/Inf/zero/
+  denormal through distances, HNSW, LVQ/RaBitQ), vec0 overflow/validation
+  tests, and a concurrent insert+search stress test (TSan-clean).
+- **hnsw_churn_benchmark**: recall/latency under sustained insert+delete
+  churn per delete policy (soft / isolate_deleted / compact). Verdict: soft
+  deletion exceeds fresh-built recall through 50% corpus turnover, so
+  MN-RU-style repair-on-delete (arXiv:2407.07871) was evaluated and rejected
+  — it only addresses degradation introduced by isolate_deleted(). See
+  BENCHMARKS.md.
+
 ## [0.1.0] - 2025-11-02
 
 ### Added

@@ -266,15 +266,27 @@ void test_rabitq_encode() {
     std::vector<float> centroid = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     RaBitQ encoder(centroid);
 
-    // A vector with known sign pattern
     std::vector<float> vec = {1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f};
     auto code = encoder.encode(std::span<const float>(vec));
 
-    assert(code.byte_size() == 1); // 8 dims -> 1 byte
-    // bits: dim 0 = +1 (bit 0 set), dim 1 = -1 (bit 1 clear), etc.
-    // expected: 0b01010101 = 0x55
-    assert(code.bits[0] == 0x55);
+    assert(code.byte_size() == 1); // 8 dims -> 1 byte (padded)
     assert(approx_equal(code.norm, std::sqrt(8.0f), 0.01f));
+    assert(approx_equal(code.dist_to_centroid, std::sqrt(8.0f), 0.01f));
+    assert(code.ip_quant > 0.0f);
+    assert(code.ip_quant <= 1.0f + 0.001f);
+
+    // Deterministic: same input + seed -> identical code
+    auto code2 = encoder.encode(std::span<const float>(vec));
+    assert(code.bits == code2.bits);
+    assert(approx_equal(code.ip_quant, code2.ip_quant, 1e-6f));
+
+    // Self-distance estimate should be near zero
+    float self_dist = encoder.l2_distance(std::span<const float>(vec), code);
+    assert(self_dist < 0.6f);
+
+    // Identical estimates from prepared query state
+    auto qs = encoder.prepare_query(std::span<const float>(vec));
+    assert(approx_equal(encoder.estimate_l2_distance(qs, code), self_dist, 1e-5f));
 
     std::cout << "  PASS: RaBitQ encoding correct" << std::endl;
 }

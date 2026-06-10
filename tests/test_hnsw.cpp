@@ -2,12 +2,14 @@
 // Unit tests for HNSW index
 
 #include <sqlite3.h>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <iostream>
 #include <numeric>
 #include <random>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include <sqlite-vec-cpp/distances/cosine.hpp>
@@ -1353,6 +1355,89 @@ void test_inner_product_distance_correctness() {
     std::cout << "  ✓ Inner product distance correctness passed" << std::endl;
 }
 
+// Test 27: Concurrent insert + search stress
+// Writers use insert() (locked path) while readers run search_read_mostly().
+// Property: no crash, no deadlock, all returned ids valid. Run under
+// -Db_sanitize=thread for race detection.
+void test_concurrent_insert_search_stress() {
+    std::cout << "Test 27: concurrent insert + search stress..." << std::endl;
+
+    constexpr size_t dim = 32;
+    constexpr size_t seed_count = 200;
+    constexpr size_t insert_count = 400;
+    constexpr size_t writer_threads = 2;
+    constexpr size_t reader_threads = 4;
+
+    std::mt19937 rng(7777);
+    HNSWIndex<float, L2Metric<float>> index;
+
+    std::vector<std::vector<float>> seed_vectors;
+    for (size_t i = 0; i < seed_count; ++i) {
+        seed_vectors.push_back(generate_vector(dim, rng));
+        index.insert(i, std::span{seed_vectors[i]});
+    }
+
+    std::vector<std::vector<float>> insert_vectors;
+    for (size_t i = 0; i < insert_count; ++i) {
+        insert_vectors.push_back(generate_vector(dim, rng));
+    }
+    std::vector<std::vector<float>> queries;
+    for (size_t i = 0; i < 32; ++i) {
+        queries.push_back(generate_vector(dim, rng));
+    }
+
+    const size_t max_id = seed_count + insert_count;
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> searches_done{0};
+    std::atomic<bool> failure{false};
+
+    std::vector<std::thread> threads;
+    for (size_t w = 0; w < writer_threads; ++w) {
+        threads.emplace_back([&, w] {
+            const size_t per_writer = insert_count / writer_threads;
+            for (size_t i = 0; i < per_writer; ++i) {
+                const size_t idx = w * per_writer + i;
+                index.insert(seed_count + idx, std::span{insert_vectors[idx]});
+            }
+        });
+    }
+    for (size_t r = 0; r < reader_threads; ++r) {
+        threads.emplace_back([&, r] {
+            size_t qi = r;
+            while (!stop.load(std::memory_order_acquire)) {
+                const auto& q = queries[qi % queries.size()];
+                auto results = index.search_read_mostly(std::span{q}, 10, 64);
+                for (const auto& [id, dist] : results) {
+                    if (id >= max_id || !std::isfinite(dist)) {
+                        failure.store(true, std::memory_order_release);
+                        return;
+                    }
+                }
+                ++qi;
+                searches_done.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (size_t w = 0; w < writer_threads; ++w) {
+        threads[w].join();
+    }
+    stop.store(true, std::memory_order_release);
+    for (size_t r = 0; r < reader_threads; ++r) {
+        threads[writer_threads + r].join();
+    }
+
+    assert(!failure.load());
+    assert(index.size() == max_id);
+    assert(searches_done.load() > 0);
+
+    auto final_results = index.search_read_mostly(std::span{queries[0]}, 10, 100);
+    assert(final_results.size() == 10);
+
+    std::cout << "  ✓ " << searches_done.load() << " concurrent searches over "
+              << insert_count << " concurrent inserts, all results valid" << std::endl;
+}
+
 int main() {
     std::cout << "Running HNSW tests...\n" << std::endl;
 
@@ -1391,6 +1476,8 @@ int main() {
     test_normalized_storage_invariant();
     test_normalized_fp16_storage_invariant();
     test_inner_product_distance_correctness();
+
+    test_concurrent_insert_search_stress();
 
     std::cout << "\nAll HNSW tests passed!" << std::endl;
     return 0;

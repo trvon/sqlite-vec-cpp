@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -388,6 +389,9 @@ public:
     /// WARNING: NOT thread-safe. Use only when no concurrent readers or writers exist.
     /// For concurrent workloads, use insert() instead.
     void insert_single_threaded(size_t id, std::span<const StorageT> vector) {
+#ifndef NDEBUG
+        SingleThreadGuard single_thread_guard(single_thread_guard_flag_);
+#endif
         // Convert to float32 if needed
         alignas(32) float stack_buffer[1536];
         std::span<const float> vector_f32;
@@ -722,7 +726,7 @@ public:
     std::vector<std::vector<std::pair<size_t, float>>>
     search_batch_with_filter(std::span<const std::span<const float>> queries, size_t k,
                              size_t ef_search, FilterFn filter, size_t num_threads = 0) const {
-        if (queries.empty() || nodes_.empty()) {
+        if (queries.empty()) {
             return std::vector<std::vector<std::pair<size_t, float>>>(queries.size());
         }
 
@@ -1322,6 +1326,19 @@ public:
 private:
     static constexpr size_t kInvalidDenseId = std::numeric_limits<size_t>::max();
 
+#ifndef NDEBUG
+    struct SingleThreadGuard {
+        std::atomic<bool>& flag;
+        explicit SingleThreadGuard(std::atomic<bool>& f) : flag(f) {
+            const bool already_active = flag.exchange(true, std::memory_order_acquire);
+            assert(!already_active && "insert_single_threaded called concurrently");
+            (void)already_active;
+        }
+        ~SingleThreadGuard() { flag.store(false, std::memory_order_release); }
+    };
+    mutable std::atomic<bool> single_thread_guard_flag_{false};
+#endif
+
     Config config_;
 
     // Thread-safe graph storage
@@ -1388,9 +1405,6 @@ private:
     std::vector<std::pair<size_t, float>> search_with_filter_impl(std::span<const float> query,
                                                                   size_t k, size_t ef_search,
                                                                   const FilterFn& filter) const {
-        if (nodes_.empty())
-            return {};
-
         std::vector<float> norm_query;
         std::span<const float> effective_query = query;
         if (config_.normalize_vectors) {
@@ -1402,6 +1416,9 @@ private:
 
         std::shared_lock lock(nodes_mutex_);
         std::shared_lock deleted_lock(deleted_mutex_);
+
+        if (nodes_.empty())
+            return {};
 
         const FilterFn* filter_ptr = filter ? &filter : nullptr;
 
@@ -1456,7 +1473,7 @@ private:
                 if (!neighbor_node)
                     continue;
                 float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
-                if (neighbor_dist < kDistanceEpsilon || neighbor_dist >= current_dist)
+                if (!(neighbor_dist >= kDistanceEpsilon && neighbor_dist < current_dist))
                     continue;
                 current = neighbor;
                 current_dist = neighbor_dist;
@@ -1750,7 +1767,7 @@ private:
                     continue;
 
                 float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
-                if (neighbor_dist < kDistanceEpsilon || neighbor_dist >= current_dist)
+                if (!(neighbor_dist >= kDistanceEpsilon && neighbor_dist < current_dist))
                     continue;
                 current = neighbor;
                 current_dist = neighbor_dist;
@@ -1953,7 +1970,7 @@ private:
                 if (!neighbor_node)
                     continue;
                 float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
-                if (neighbor_dist < kDistanceEpsilon || neighbor_dist >= current_dist)
+                if (!(neighbor_dist >= kDistanceEpsilon && neighbor_dist < current_dist))
                     continue;
                 current = neighbor;
                 current_dist = neighbor_dist;
@@ -2176,9 +2193,6 @@ private:
     search_quantized_rerank(std::span<const float> query, size_t k, size_t ef_search,
                             size_t rerank_factor, ApproxDistFn&& approx_dist,
                             PrefetchFn&& prefetch_fn, const FilterFn& filter = nullptr) const {
-        if (nodes_.empty())
-            return {};
-
         std::vector<float> norm_query;
         std::span<const float> effective_query = query;
         if (config_.normalize_vectors) {
@@ -2191,6 +2205,9 @@ private:
 
         std::shared_lock lock(nodes_mutex_);
         std::shared_lock deleted_lock(deleted_mutex_);
+
+        if (nodes_.empty())
+            return {};
 
         const FilterFn* filter_ptr = filter ? &filter : nullptr;
 

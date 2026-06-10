@@ -106,6 +106,8 @@ inline auto vec0_with_table(sqlite3* db, std::string_view schema_name,
     return fn(it->second);
 }
 
+inline constexpr size_t kMaxVec0Dimensions = 65536;
+
 struct Vec0Table {
     sqlite3_vtab base{};
     sqlite3* db = nullptr;
@@ -251,8 +253,8 @@ inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* ta
             continue;
         }
 
-        const int expected_bytes = static_cast<int>(table->dimensions * sizeof(float));
-        if (bytes != expected_bytes) {
+        const size_t expected_bytes = table->dimensions * sizeof(float);
+        if (static_cast<size_t>(bytes) != expected_bytes) {
             sqlite3_finalize(scan_stmt);
             return err<std::shared_ptr<Vec0AnnIndex>>(Error::invalid_argument(
                 "vec0 stored vector size mismatch for rowid " + std::to_string(rowid)));
@@ -391,7 +393,8 @@ vec0_run_exact_query(Vec0Table* table, const Value& query_value, std::optional<s
 
         const void* blob = sqlite3_column_blob(stmt, 1);
         int bytes = sqlite3_column_bytes(stmt, 1);
-        if (!blob || bytes != static_cast<int>(table->dimensions * sizeof(float))) {
+        if (!blob || bytes <= 0 ||
+            static_cast<size_t>(bytes) != table->dimensions * sizeof(float)) {
             sqlite3_finalize(stmt);
             return err<std::vector<std::pair<int64_t, float>>>(Error::invalid_argument(
                 "vec0 exact query encountered stored vector size mismatch for rowid " +
@@ -593,6 +596,16 @@ inline int vec0Create(sqlite3* db, void* pAux, int argc, const char* const* argv
     std::string embedding_col;
     size_t dims;
     parse_vec0_schema(argc, argv, embedding_col, dims);
+
+    if (dims == 0 || dims > kMaxVec0Dimensions) {
+        *pzErr = sqlite3_mprintf("vec0: dimensions must be in [1, %zu], got %zu",
+                                 kMaxVec0Dimensions, dims);
+        return SQLITE_ERROR;
+    }
+    if (embedding_col.empty() || embedding_col.find('"') != std::string::npos) {
+        *pzErr = sqlite3_mprintf("vec0: invalid embedding column name");
+        return SQLITE_ERROR;
+    }
 
     auto* table = new Vec0Table();
     table->db = db;
@@ -944,8 +957,8 @@ inline int vec0Filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char* idxS
 
         const bool ann_plan = (idxNum & (kVec0PlanAnnMatch | kVec0PlanAnnHiddenQuery)) != 0;
         auto buffered_results =
-            ann_plan ? vec0_run_ann_query(table, query_value, *k, ef_search, rowid_filter.value(),
-                                          phss_options)
+            ann_plan ? vec0_run_ann_query(table, query_value, k.value_or(kVec0DefaultK), ef_search,
+                                          rowid_filter.value(), phss_options)
                      : vec0_run_exact_query(table, query_value, k, rowid_filter.value());
         if (!buffered_results) {
             cursor->eof = true;

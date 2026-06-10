@@ -35,6 +35,8 @@ template <typename T>
 
 } // namespace detail
 
+inline constexpr size_t kMaxHnswLayers = 64;
+
 /// HNSW Index Persistence Layer
 /// Provides serialization/deserialization to SQLite shadow tables
 ///
@@ -172,6 +174,9 @@ inline std::unordered_set<size_t> deserialize_deleted_ids(const void* blob, size
     };
 
     uint64_t count = read_u64();
+    if (count > (size - offset) / 8) {
+        throw std::runtime_error("Deleted IDs blob truncated");
+    }
     std::unordered_set<size_t> deleted_ids;
     deleted_ids.reserve(count);
 
@@ -250,6 +255,9 @@ template <typename T> HNSWNode<T> deserialize_hnsw_node(const void* blob, size_t
 
     // Read number of layers
     size_t num_layers = read_u64();
+    if (num_layers > kMaxHnswLayers || num_layers > (size - offset) / 8) {
+        throw std::runtime_error("HNSW node layer count invalid");
+    }
 
     // Create node with placeholder layer count
     HNSWNode<T> node(node_id, std::span<const T>{vector}, num_layers > 0 ? num_layers - 1 : 0);
@@ -257,6 +265,9 @@ template <typename T> HNSWNode<T> deserialize_hnsw_node(const void* blob, size_t
     // Read edges for each layer
     for (size_t layer = 0; layer < num_layers; ++layer) {
         size_t num_neighbors = read_u64();
+        if (num_neighbors > (size - offset) / 8) {
+            throw std::runtime_error("HNSW node neighbor count invalid");
+        }
         for (size_t i = 0; i < num_neighbors; ++i) {
             size_t neighbor_id = read_u64();
             // Edges are already allocated, so directly populate
@@ -516,6 +527,12 @@ HNSWIndex<T, Metric> load_hnsw_index(sqlite3* db, const char* schema, const char
         int node_size = sqlite3_column_bytes(stmt, 1);
 
         HNSWNode<T> node = deserialize_hnsw_node<T>(node_blob, node_size);
+        if (node.id != node_id) {
+            sqlite3_finalize(stmt);
+            if (pzErr)
+                *pzErr = sqlite3_mprintf("HNSW node id mismatch for rowid %zu", node_id);
+            throw std::runtime_error("HNSW node id mismatch");
+        }
         nodes.emplace(node_id, std::move(node));
     }
 
@@ -525,6 +542,19 @@ HNSWIndex<T, Metric> load_hnsw_index(sqlite3* db, const char* schema, const char
         if (pzErr)
             *pzErr = sqlite3_mprintf("Failed to iterate HNSW nodes");
         throw std::runtime_error("Failed to iterate HNSW nodes");
+    }
+
+    if (!nodes.empty() && nodes.find(entry_point_id) == nodes.end()) {
+        if (pzErr)
+            *pzErr = sqlite3_mprintf("HNSW entry point %zu missing from nodes", entry_point_id);
+        throw std::runtime_error("HNSW entry point missing from nodes");
+    }
+
+    for (auto& [id, node] : nodes) {
+        for (auto& layer : node.edges) {
+            std::erase_if(layer,
+                          [&](size_t neighbor_id) { return nodes.find(neighbor_id) == nodes.end(); });
+        }
     }
 
     // Try to load deleted IDs (optional - may not exist in old saved indexes)
@@ -804,9 +834,14 @@ std::tuple<size_t, size_t, size_t> get_hnsw_checkpoint_info(sqlite3* db, const c
     if (rc == SQLITE_OK) {
         rc = sqlite3_step(stmt);
         if (rc == SQLITE_ROW) {
-            const uint64_t* entry_data = static_cast<const uint64_t*>(sqlite3_column_blob(stmt, 0));
-            entry_point_id = entry_data[0];
-            entry_point_layer = entry_data[1];
+            const void* entry_blob = sqlite3_column_blob(stmt, 0);
+            const int entry_size = sqlite3_column_bytes(stmt, 0);
+            if (entry_blob && entry_size == static_cast<int>(sizeof(uint64_t) * 2)) {
+                std::array<uint64_t, 2> entry_data{};
+                std::memcpy(entry_data.data(), entry_blob, sizeof(entry_data));
+                entry_point_id = entry_data[0];
+                entry_point_layer = entry_data[1];
+            }
         }
         sqlite3_finalize(stmt);
     }

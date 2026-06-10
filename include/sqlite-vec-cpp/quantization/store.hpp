@@ -13,6 +13,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <variant>
 #include <vector>
@@ -369,17 +370,23 @@ private:
 #endif
 };
 
-/// Flat storage for RaBitQ codes indexed by dense_id
+/// Flat storage for RaBitQ codes indexed by dense_id.
+/// Implements true RaBitQ (arXiv:2405.12497): rotated unit residuals are
+/// binarized; per-vector residual norms and correction factors drive an
+/// unbiased inner-product estimator. Query-side uses 4-bit scalar
+/// quantization of the rotated query so estimation is pure popcounts.
 struct RaBitQStore {
     /// Packed binary codes: bits[dense_id * bytes_per_vec .. ]
     std::vector<uint8_t> bits;
-    /// Per-vector norms
-    std::vector<float> norms;
+    /// Per-vector distance to centroid: ||v - c||
+    std::vector<float> dist_to_centroid;
+    /// Per-vector correction factor <x_bar, o_rot>
+    std::vector<float> ip_quant;
     /// Dataset centroid
     std::vector<float> centroid;
-    /// Bytes per vector
+    /// Bytes per vector (padded_dim / 8)
     size_t bytes_per_vec = 0;
-    /// Dimensionality
+    /// Dimensionality (unpadded)
     size_t dim = 0;
     /// Number of vectors stored
     size_t count = 0;
@@ -390,11 +397,14 @@ struct RaBitQStore {
             return;
 
         dim = snap.dim;
+        rotation_ = std::make_shared<FastRotation>(dim, kRaBitQDefaultSeed);
+        const size_t padded = rotation_->padded_dim();
+        bytes_per_vec = padded / 8;
+
         size_t max_dense_id = 0;
         for (const auto& e : snap.entries)
             max_dense_id = std::max(max_dense_id, e.dense_id);
 
-        // Compute centroid
         centroid.assign(dim, 0.0f);
         for (const auto& e : snap.entries) {
             for (size_t i = 0; i < dim; ++i)
@@ -404,46 +414,107 @@ struct RaBitQStore {
         for (size_t i = 0; i < dim; ++i)
             centroid[i] *= inv_n;
 
-        // Encode all vectors
-        bytes_per_vec = (dim + 7) / 8;
         count = max_dense_id + 1;
-        bits.resize(count * bytes_per_vec, 0);
-        norms.resize(count, 0.0f);
+        bits.assign(count * bytes_per_vec, 0);
+        dist_to_centroid.assign(count, 0.0f);
+        ip_quant.assign(count, 1.0f);
 
+        std::vector<float> residual(dim);
+        std::vector<float> rotated(padded);
         for (const auto& e : snap.entries) {
-            size_t bit_offset = e.dense_id * bytes_per_vec;
-            float norm_sq = 0.0f;
+            float dist_sq = 0.0f;
             for (size_t i = 0; i < dim; ++i) {
-                float centered = e.vector[i] - centroid[i];
-                norm_sq += e.vector[i] * e.vector[i];
-                if (centered >= 0.0f) {
-                    bits[bit_offset + i / 8] |= (1u << (i % 8));
+                residual[i] = e.vector[i] - centroid[i];
+                dist_sq += residual[i] * residual[i];
+            }
+            const float dist = std::sqrt(dist_sq);
+            dist_to_centroid[e.dense_id] = dist;
+            if (dist <= kRaBitQEpsilon) {
+                dist_to_centroid[e.dense_id] = 0.0f;
+                continue;
+            }
+
+            const float inv_dist = 1.0f / dist;
+            for (size_t i = 0; i < dim; ++i)
+                residual[i] *= inv_dist;
+
+            rotation_->apply(std::span<const float>(residual), std::span<float>(rotated));
+
+            uint8_t* code_ptr = bits.data() + e.dense_id * bytes_per_vec;
+            float abs_sum = 0.0f;
+            for (size_t i = 0; i < padded; ++i) {
+                abs_sum += std::abs(rotated[i]);
+                if (rotated[i] >= 0.0f) {
+                    code_ptr[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
                 }
             }
-            norms[e.dense_id] = std::sqrt(norm_sq);
+            ip_quant[e.dense_id] =
+                std::max(abs_sum * rotation_->inv_sqrt_padded(), kRaBitQEpsilon);
         }
     }
 
     /// Precomputed query state for fast distance estimation
     struct QueryState {
-        std::vector<uint8_t> bits;
-        float norm;
+        std::vector<uint8_t> planes; ///< 4 bit-planes of the quantized rotated query
+        size_t plane_bytes = 0;
+        float dist_to_centroid = 0.0f;
+        float vl = 0.0f;
+        float delta = 0.0f;
+        float sum_q = 0.0f;
     };
 
     /// Prepare query for fast estimation
     [[nodiscard]] QueryState prepare_query(std::span<const float> query) const {
         QueryState state;
-        state.bits.resize(bytes_per_vec, 0);
-        float norm_sq = 0.0f;
+        if (!rotation_)
+            return state;
+        const size_t padded = rotation_->padded_dim();
+        state.plane_bytes = padded / 8;
+        state.planes.assign(4 * state.plane_bytes, 0);
 
+        float dist_sq = 0.0f;
+        std::vector<float> residual(dim);
         for (size_t i = 0; i < dim; ++i) {
-            float centered = query[i] - centroid[i];
-            norm_sq += query[i] * query[i];
-            if (centered >= 0.0f) {
-                state.bits[i / 8] |= (1u << (i % 8));
+            residual[i] = query[i] - centroid[i];
+            dist_sq += residual[i] * residual[i];
+        }
+        state.dist_to_centroid = std::sqrt(dist_sq);
+        if (state.dist_to_centroid <= kRaBitQEpsilon) {
+            state.dist_to_centroid = 0.0f;
+            return state;
+        }
+
+        const float inv_dist = 1.0f / state.dist_to_centroid;
+        for (size_t i = 0; i < dim; ++i)
+            residual[i] *= inv_dist;
+
+        std::vector<float> rotated(padded);
+        rotation_->apply(std::span<const float>(residual), std::span<float>(rotated));
+
+        float vl = rotated[0];
+        float vr = rotated[0];
+        for (size_t i = 1; i < padded; ++i) {
+            vl = std::min(vl, rotated[i]);
+            vr = std::max(vr, rotated[i]);
+        }
+        state.vl = vl;
+        state.delta = (vr - vl) / 15.0f;
+
+        const float inv_delta = state.delta > 0.0f ? 1.0f / state.delta : 0.0f;
+        uint64_t sum_u = 0;
+        for (size_t i = 0; i < padded; ++i) {
+            const float scaled = (rotated[i] - vl) * inv_delta;
+            const int u = std::clamp(static_cast<int>(scaled + 0.5f), 0, 15);
+            sum_u += static_cast<uint64_t>(u);
+            for (size_t j = 0; j < 4; ++j) {
+                if ((u >> j) & 1) {
+                    state.planes[j * state.plane_bytes + i / 8] |=
+                        static_cast<uint8_t>(1u << (i % 8));
+                }
             }
         }
-        state.norm = std::sqrt(norm_sq);
+        state.sum_q =
+            static_cast<float>(padded) * vl + state.delta * static_cast<float>(sum_u);
         return state;
     }
 
@@ -451,15 +522,29 @@ struct RaBitQStore {
     [[nodiscard]] float l2_distance(const QueryState& qs, size_t dense_id) const {
         assert(dense_id < count);
 
+        const float qd = qs.dist_to_centroid;
+        const float cd = dist_to_centroid[dense_id];
+        if (qd <= 0.0f || cd <= 0.0f) {
+            return std::sqrt(std::max(0.0f, qd * qd + cd * cd));
+        }
+
         const uint8_t* code_ptr = bits.data() + dense_id * bytes_per_vec;
-        uint32_t hamming = hamming_distance_impl(qs.bits.data(), code_ptr, bytes_per_vec);
+        const size_t nb = qs.plane_bytes;
 
-        float binary_ip = static_cast<float>(dim) - 2.0f * static_cast<float>(hamming);
-        float norm_factor =
-            (dim > 0) ? (qs.norm * norms[dense_id] / static_cast<float>(dim)) : 0.0f;
-        float ip_estimate = norm_factor * binary_ip;
-        float dist_sq = qs.norm * qs.norm + norms[dense_id] * norms[dense_id] - 2.0f * ip_estimate;
+        const uint32_t pc = detail::popcount_bytes(code_ptr, nb);
+        uint64_t su = 0;
+        for (size_t j = 0; j < 4; ++j) {
+            su += static_cast<uint64_t>(1u << j) *
+                  detail::and_popcount_bytes(code_ptr, qs.planes.data() + j * nb, nb);
+        }
 
+        const float sum_selected =
+            qs.vl * static_cast<float>(pc) + qs.delta * static_cast<float>(su);
+        const float ip_xq =
+            (2.0f * sum_selected - qs.sum_q) * rotation_->inv_sqrt_padded();
+        const float est = std::clamp(ip_xq / ip_quant[dense_id], -1.0f, 1.0f);
+
+        const float dist_sq = qd * qd + cd * cd - 2.0f * qd * cd * est;
         return std::sqrt(std::max(0.0f, dist_sq));
     }
 
@@ -475,81 +560,13 @@ struct RaBitQStore {
 
     /// Memory usage in bytes
     [[nodiscard]] size_t memory_bytes() const {
-        return bits.size() + norms.size() * sizeof(float) + centroid.size() * sizeof(float);
+        return bits.size() + dist_to_centroid.size() * sizeof(float) +
+               ip_quant.size() * sizeof(float) + centroid.size() * sizeof(float) +
+               (rotation_ ? rotation_->memory_bytes() : 0);
     }
 
 private:
-    static uint32_t hamming_distance_impl(const uint8_t* a, const uint8_t* b, size_t num_bytes) {
-#ifdef SQLITE_VEC_ENABLE_NEON
-        if (num_bytes >= 16)
-            return hamming_neon(a, b, num_bytes);
-#endif
-        return hamming_scalar(a, b, num_bytes);
-    }
-
-    static uint32_t hamming_scalar(const uint8_t* a, const uint8_t* b, size_t num_bytes) {
-        static constexpr uint8_t popcount_table[256] = {
-            0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3,
-            4, 4, 5, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4,
-            4, 5, 4, 5, 5, 6, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4,
-            5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5,
-            4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2,
-            3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5,
-            5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4,
-            5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 3, 4, 4, 5, 4, 5, 5, 6,
-            4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8};
-        uint32_t count = 0;
-        for (size_t i = 0; i < num_bytes; ++i)
-            count += popcount_table[a[i] ^ b[i]];
-        return count;
-    }
-
-#ifdef SQLITE_VEC_ENABLE_NEON
-    static uint32_t hamming_neon(const uint8_t* a, const uint8_t* b, size_t num_bytes) {
-        uint32_t total = 0;
-        size_t i = 0;
-        const size_t end16 = (num_bytes / 16) * 16;
-        uint8x16_t acc = vdupq_n_u8(0);
-        size_t iter_count = 0;
-
-        while (i < end16) {
-            uint8x16_t va = vld1q_u8(a + i);
-            uint8x16_t vb = vld1q_u8(b + i);
-            acc = vaddq_u8(acc, vcntq_u8(veorq_u8(va, vb)));
-            i += 16;
-            if (++iter_count == 31) {
-                uint16x8_t s16 = vpaddlq_u8(acc);
-                uint32x4_t s32 = vpaddlq_u16(s16);
-                uint64x2_t s64 = vpaddlq_u32(s32);
-                total += vgetq_lane_u64(s64, 0) + vgetq_lane_u64(s64, 1);
-                acc = vdupq_n_u8(0);
-                iter_count = 0;
-            }
-        }
-
-        uint16x8_t s16 = vpaddlq_u8(acc);
-        uint32x4_t s32 = vpaddlq_u16(s16);
-        uint64x2_t s64 = vpaddlq_u32(s32);
-        total += vgetq_lane_u64(s64, 0) + vgetq_lane_u64(s64, 1);
-
-        while (i < num_bytes) {
-            static constexpr uint8_t pt[256] = {
-                0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3,
-                3, 4, 3, 4, 4, 5, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4,
-                3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4,
-                4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5,
-                3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 1, 2,
-                2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5,
-                4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5,
-                5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-                3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5,
-                5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8};
-            total += pt[a[i] ^ b[i]];
-            ++i;
-        }
-        return total;
-    }
-#endif
+    std::shared_ptr<FastRotation> rotation_;
 };
 
 } // namespace sqlite_vec_cpp::quantization

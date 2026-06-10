@@ -151,3 +151,12 @@ profile_vec0_query_exe = executable(
   install: false
 )
 message('  ./profile_vec0_query (cold/hot vec0 ANN profiling with SQLite statement timings)')
+
+hnsw_churn_benchmark_exe = executable(
+  'hnsw_churn_benchmark',
+  'hnsw_churn_benchmark.cpp',
+  include_directories: include_directories('../include'),
+  cpp_args: cpp_args_list,
+  install: false
+)
+message('  ./hnsw_churn_benchmark (recall/latency under insert+delete churn per delete policy)')

@@ -93,3 +93,34 @@ test_quantization = executable(
   cpp_args: test_cpp_args + ['-DSQLITE_VEC_CPP_TESTING'],
 )
 test('Quantization (LVQ + RaBitQ + Two-Stage HNSW)', test_quantization, timeout: hnsw_timeout)
+
+test_persistence_fuzz = executable(
+  'test_persistence_fuzz',
+  'test_persistence_fuzz.cpp',
+  include_directories: inc_dirs,
+  dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args,
+)
+test('Persistence Fuzz (Corrupt Blobs)', test_persistence_fuzz, timeout: 120)
+
+test_adversarial_vectors = executable(
+  'test_adversarial_vectors',
+  'test_adversarial_vectors.cpp',
+  include_directories: inc_dirs,
+  dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args,
+)
+test('Adversarial Vectors (NaN/Inf/Zero)', test_adversarial_vectors, timeout: 120)
+
+test_overflow = executable(
+  'test_overflow',
+  'test_overflow.cpp',
+  include_directories: inc_dirs,
+  sources: [
+    'test_overflow.cpp',
+    '../src/sqlite_vec_c_api.cpp',
+  ],
+  dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args + ['-DSQLITE_VEC_CPP_ENABLED'],
+)
+test('vec0 Overflow & Validation', test_overflow, timeout: 120)
