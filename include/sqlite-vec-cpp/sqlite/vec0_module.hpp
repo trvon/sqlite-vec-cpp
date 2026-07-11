@@ -327,40 +327,27 @@ vec0_run_ann_query(Vec0Table* table, const Value& query_value, size_t k, size_t 
 
     std::vector<std::pair<int64_t, float>> results;
 
+    typename Vec0AnnIndex::FilterFn filter;
     if (rowid_filter.active) {
-        results.reserve(rowid_filter.allowed_rowids.size());
-        for (int64_t rowid : rowid_filter.allowed_rowids) {
-            const auto* node = ann_index.value()->get_node(static_cast<size_t>(rowid));
-            if (!node || node->vector.empty()) {
-                continue;
-            }
+        filter = [&rowid_filter](size_t rowid) {
+            return rowid_filter.matches(static_cast<int64_t>(rowid));
+        };
+    }
 
-            float dist = distances::l2_distance(std::span<const float>(parsed_query.value()),
-                                                std::span<const float>(node->vector));
-            results.emplace_back(rowid, dist);
-        }
-
-        std::sort(results.begin(), results.end(),
-                  [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
-        if (results.size() > k) {
-            results.resize(k);
-        }
+    std::vector<std::pair<size_t, float>> raw_results;
+    if (phss_options.enabled) {
+        typename Vec0AnnIndex::PhssRerankConfig cfg;
+        cfg.enabled = true;
+        cfg.candidates = std::max(k, phss_options.candidates);
+        raw_results = ann_index.value()->search_phss_rerank_with_filter(
+            std::span<const float>(parsed_query.value()), k, ef_search, cfg, filter);
     } else {
-        std::vector<std::pair<size_t, float>> raw_results;
-        if (phss_options.enabled) {
-            typename Vec0AnnIndex::PhssRerankConfig cfg;
-            cfg.enabled = true;
-            cfg.candidates = std::max(k, phss_options.candidates);
-            raw_results = ann_index.value()->search_phss_rerank(
-                std::span<const float>(parsed_query.value()), k, ef_search, cfg);
-        } else {
-            raw_results = ann_index.value()->search_read_mostly(
-                std::span<const float>(parsed_query.value()), k, ef_search);
-        }
-        results.reserve(raw_results.size());
-        for (const auto& [id, dist] : raw_results) {
-            results.emplace_back(static_cast<int64_t>(id), dist);
-        }
+        raw_results = ann_index.value()->search_read_mostly_with_filter(
+            std::span<const float>(parsed_query.value()), k, ef_search, filter);
+    }
+    results.reserve(raw_results.size());
+    for (const auto& [id, dist] : raw_results) {
+        results.emplace_back(static_cast<int64_t>(id), dist);
     }
 
     return Result<std::vector<std::pair<int64_t, float>>>(std::move(results));
