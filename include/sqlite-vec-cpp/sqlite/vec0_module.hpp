@@ -328,10 +328,25 @@ vec0_run_ann_query(Vec0Table* table, const Value& query_value, size_t k, size_t 
     std::vector<std::pair<int64_t, float>> results;
 
     typename Vec0AnnIndex::FilterFn filter;
+    std::vector<size_t> route_entry_points;
     if (rowid_filter.active) {
         filter = [&rowid_filter](size_t rowid) {
             return rowid_filter.matches(static_cast<int64_t>(rowid));
         };
+        if (!rowid_filter.allowed_rowids.empty()) {
+            std::vector<int64_t> ordered_rowids(rowid_filter.allowed_rowids.begin(),
+                                                rowid_filter.allowed_rowids.end());
+            std::sort(ordered_rowids.begin(), ordered_rowids.end());
+            constexpr size_t kMaxRouteEntryPoints = 4;
+            const size_t entry_count = std::min(kMaxRouteEntryPoints, ordered_rowids.size());
+            route_entry_points.reserve(entry_count);
+            for (size_t i = 0; i < entry_count; ++i) {
+                const size_t index = entry_count == 1
+                                         ? 0
+                                         : i * (ordered_rowids.size() - 1) / (entry_count - 1);
+                route_entry_points.push_back(static_cast<size_t>(ordered_rowids[index]));
+            }
+        }
     }
 
     std::vector<std::pair<size_t, float>> raw_results;
@@ -340,10 +355,15 @@ vec0_run_ann_query(Vec0Table* table, const Value& query_value, size_t k, size_t 
         cfg.enabled = true;
         cfg.candidates = std::max(k, phss_options.candidates);
         raw_results = ann_index.value()->search_phss_rerank_with_filter(
-            std::span<const float>(parsed_query.value()), k, ef_search, cfg, filter);
+            std::span<const float>(parsed_query.value()), k, ef_search, cfg, filter,
+            route_entry_points);
     } else {
-        raw_results = ann_index.value()->search_read_mostly_with_filter(
-            std::span<const float>(parsed_query.value()), k, ef_search, filter);
+        raw_results = route_entry_points.empty()
+                          ? ann_index.value()->search_read_mostly_with_filter(
+                                std::span<const float>(parsed_query.value()), k, ef_search, filter)
+                          : ann_index.value()->search_read_mostly_with_filter_from_entries(
+                                std::span<const float>(parsed_query.value()), k, ef_search, filter,
+                                route_entry_points);
     }
     results.reserve(raw_results.size());
     for (const auto& [id, dist] : raw_results) {

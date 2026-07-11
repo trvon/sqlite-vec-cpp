@@ -979,6 +979,52 @@ void test_read_mostly_filter_parity() {
     std::cout << "  ✓ Read-mostly filter parity passed" << std::endl;
 }
 
+// A selective result filter must not turn the ANN beam into a corpus scan. Disallowed nodes remain
+// traversable, but the unfiltered exploration frontier still owns the ef_search bound.
+void test_selective_filter_respects_beam_budget() {
+    std::cout << "Test 21c2: Selective filter respects beam budget..." << std::endl;
+
+    constexpr size_t num_vectors = 512;
+    constexpr size_t dim = 32;
+    constexpr size_t ef_search = 16;
+
+    std::mt19937 rng(321);
+    HNSWIndex<float, L2Metric<float>> index;
+    for (size_t i = 0; i < num_vectors; ++i) {
+        auto vec = generate_vector(dim, rng);
+        index.insert(i, std::span{vec});
+    }
+
+    auto query = generate_vector(dim, rng);
+    size_t baseline_filter_calls = 0;
+    HNSWIndex<float, L2Metric<float>>::FilterFn baseline_filter = [&](size_t) {
+        ++baseline_filter_calls;
+        return true;
+    };
+    (void)index.search_read_mostly_with_filter(std::span{query}, 1, ef_search, baseline_filter);
+
+    size_t filter_calls = 0;
+    HNSWIndex<float, L2Metric<float>>::FilterFn filter = [&](size_t node_id) {
+        ++filter_calls;
+        return node_id == 17;
+    };
+
+    const std::array<size_t, 1> route_entries{17};
+    const auto routed = index.search_read_mostly_with_filter_from_entries(
+        std::span{query}, 1, ef_search, filter, std::span{route_entries});
+
+    std::cout << "  Filter calls: baseline=" << baseline_filter_calls
+              << " selective=" << filter_calls << std::endl;
+    if (routed.size() != 1 || routed.front().first != route_entries.front()) {
+        throw std::runtime_error("route entry was not admitted to filtered ANN results");
+    }
+    if (filter_calls > baseline_filter_calls + num_vectors / 16) {
+        throw std::runtime_error("selective filter exceeded the ANN beam budget");
+    }
+    std::cout << "  ✓ Selective filter stayed bounded (filter calls=" << filter_calls << ")"
+              << std::endl;
+}
+
 // Test 21d: Read-mostly deleted-node search matches safe search
 void test_read_mostly_deleted_parity() {
     std::cout << "Test 21d: Read-mostly deleted-node parity..." << std::endl;
@@ -1466,6 +1512,7 @@ int main() {
     test_config_for_corpus();
     test_read_mostly_search_parity();
     test_read_mostly_filter_parity();
+    test_selective_filter_respects_beam_budget();
     test_read_mostly_deleted_parity();
 
     // Normalization regression tests

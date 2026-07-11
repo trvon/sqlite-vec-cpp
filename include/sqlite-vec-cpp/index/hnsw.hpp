@@ -539,16 +539,31 @@ public:
         return search_with_filter_impl<true>(query, k, ef_search, filter);
     }
 
+    /// Read-mostly filtered search seeded from route-specific entry points. Entry points
+    /// participate in the same bounded beam; they do not increase ef_search.
+    std::vector<std::pair<size_t, float>> search_read_mostly_with_filter_from_entries(
+        std::span<const float> query, size_t k, size_t ef_search, const FilterFn& filter,
+        std::span<const size_t> entry_points) const {
+        return search_with_filter_impl<true>(query, k, ef_search, filter, entry_points);
+    }
+
     std::vector<std::pair<size_t, float>>
     search_phss_rerank_with_filter(std::span<const float> query, size_t k, size_t ef_search,
-                                   const PhssRerankConfig& cfg, const FilterFn& filter) const {
+                                   const PhssRerankConfig& cfg, const FilterFn& filter,
+                                   std::span<const size_t> entry_points = {}) const {
         if (!cfg.enabled) {
-            return search_read_mostly_with_filter(query, k, ef_search, filter);
+            return entry_points.empty()
+                       ? search_read_mostly_with_filter(query, k, ef_search, filter)
+                       : search_read_mostly_with_filter_from_entries(query, k, ef_search, filter,
+                                                                    entry_points);
         }
 
         const size_t candidate_k = std::max(k, cfg.candidates);
-        auto approx_candidates =
-            search_read_mostly_with_filter(query, candidate_k, ef_search, filter);
+        auto approx_candidates = entry_points.empty()
+                                     ? search_read_mostly_with_filter(query, candidate_k, ef_search,
+                                                                    filter)
+                                     : search_read_mostly_with_filter_from_entries(
+                                           query, candidate_k, ef_search, filter, entry_points);
         if (approx_candidates.size() <= k) {
             return approx_candidates;
         }
@@ -1406,7 +1421,9 @@ private:
     template <bool ReadMostly>
     std::vector<std::pair<size_t, float>> search_with_filter_impl(std::span<const float> query,
                                                                   size_t k, size_t ef_search,
-                                                                  const FilterFn& filter) const {
+                                                                  const FilterFn& filter,
+                                                                  std::span<const size_t>
+                                                                      preferred_entries = {}) const {
         std::vector<float> norm_query;
         std::span<const float> effective_query = query;
         if (config_.normalize_vectors) {
@@ -1425,13 +1442,19 @@ private:
         const FilterFn* filter_ptr = filter ? &filter : nullptr;
 
         size_t current = entry_point_id_.load(std::memory_order_acquire);
-        for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > 0; --lc) {
-            current =
-                greedy_search_layer_shared<ReadMostly>(effective_query, current, lc, filter_ptr);
+        std::span<const size_t> additional_entries;
+        if (!preferred_entries.empty()) {
+            current = preferred_entries.front();
+            additional_entries = preferred_entries.subspan(1);
+        } else {
+            for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > 0; --lc) {
+                current = greedy_search_layer_shared<ReadMostly>(effective_query, current, lc,
+                                                                 filter_ptr);
+            }
         }
 
         auto candidates = beam_search_layer_shared<ReadMostly>(effective_query, current, ef_search,
-                                                               0, filter_ptr);
+                                                               0, filter_ptr, additional_entries);
 
         if (candidates.size() > k) {
             candidates.resize(k);
@@ -2009,13 +2032,20 @@ private:
     template <bool ReadMostly>
     std::vector<std::pair<size_t, float>>
     beam_search_layer_shared(std::span<const float> query, size_t entry_point, size_t ef,
-                             size_t layer, const FilterFn* filter) const {
+                             size_t layer, const FilterFn* filter,
+                             std::span<const size_t> additional_entry_points = {}) const {
         auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
         std::vector<std::pair<float, size_t>> top_storage;
         top_storage.reserve(ef + 1);
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
                             decltype(cmp)>
             top_candidates(cmp, std::move(top_storage));
+
+        std::vector<std::pair<float, size_t>> exploration_storage;
+        exploration_storage.reserve(ef + 1);
+        std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
+                            decltype(cmp)>
+            exploration_bound(cmp, std::move(exploration_storage));
 
         auto cmp_min = [](const auto& a, const auto& b) { return a.first > b.first; };
         std::vector<std::pair<float, size_t>> candidate_storage;
@@ -2027,18 +2057,6 @@ private:
         // Use thread-local visited tracker instead of allocating unordered_set
         // This avoids heap allocation per search call
         auto& visited = ThreadLocalVisitedPool::get(nodes_.size() + 1);
-
-        const auto* entry_node = try_get_node(entry_point);
-        if (!entry_node)
-            return {};
-
-        float entry_dist = comparable_distance_query_node(query, *entry_node);
-        candidates.emplace(entry_dist, entry_point);
-        size_t entry_dense = entry_node->dense_id;
-        if (entry_dense == kInvalidDenseId) {
-            return {};
-        }
-        visited.visit(entry_dense);
 
         const bool check_deleted = !deleted_ids_.empty();
         auto passes_filter = [&](size_t id) {
@@ -2052,10 +2070,36 @@ private:
         // We allow small negative values to avoid missing exact matches.
         const float kDistanceEpsilon =
             config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
-        if (passes_filter(entry_point) && entry_dist >= kDistanceEpsilon) {
-            float entry_score =
-                config_.clamp_negative_distances ? std::max(0.0f, entry_dist) : entry_dist;
-            top_candidates.emplace(entry_score, entry_point);
+        const auto add_entry_point = [&](size_t id) {
+            const auto* node = try_get_node(id);
+            if (!node || node->dense_id == kInvalidDenseId || visited.is_visited(node->dense_id)) {
+                return;
+            }
+            const float distance = comparable_distance_query_node(query, *node);
+            if (distance < kDistanceEpsilon) {
+                return;
+            }
+            const float score =
+                config_.clamp_negative_distances ? std::max(0.0f, distance) : distance;
+            visited.visit(node->dense_id);
+            candidates.emplace(score, id);
+            exploration_bound.emplace(score, id);
+            if (exploration_bound.size() > ef) {
+                exploration_bound.pop();
+            }
+            if (passes_filter(id)) {
+                top_candidates.emplace(score, id);
+                if (top_candidates.size() > ef) {
+                    top_candidates.pop();
+                }
+            }
+        };
+        add_entry_point(entry_point);
+        for (const auto id : additional_entry_points) {
+            add_entry_point(id);
+        }
+        if (candidates.empty()) {
+            return {};
         }
 
         while (!candidates.empty()) {
@@ -2066,8 +2110,8 @@ private:
             if (!current_node)
                 continue;
 
-            if (!top_candidates.empty() && current_dist > top_candidates.top().first &&
-                top_candidates.size() >= ef) {
+            if (!exploration_bound.empty() && current_dist > exploration_bound.top().first &&
+                exploration_bound.size() >= ef) {
                 break;
             }
 
@@ -2123,14 +2167,18 @@ private:
                 if (neighbor_dist < kDistanceEpsilon)
                     continue;
 
-                bool should_explore = top_candidates.empty() || top_candidates.size() < ef ||
-                                      neighbor_dist < top_candidates.top().first;
+                bool should_explore = exploration_bound.size() < ef ||
+                                      neighbor_dist < exploration_bound.top().first;
 
                 if (should_explore) {
                     float candidate_score = config_.clamp_negative_distances
                                                 ? std::max(0.0f, neighbor_dist)
                                                 : neighbor_dist;
                     candidates.emplace(candidate_score, neighbor);
+                    exploration_bound.emplace(candidate_score, neighbor);
+                    if (exploration_bound.size() > ef) {
+                        exploration_bound.pop();
+                    }
                 }
 
                 if (passes_filter(neighbor)) {
@@ -2261,6 +2309,9 @@ private:
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
                             decltype(cmp)>
             top_candidates(cmp);
+        std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
+                            decltype(cmp)>
+            exploration_bound(cmp);
 
         auto cmp_min = [](const auto& a, const auto& b) { return a.first > b.first; };
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
@@ -2288,10 +2339,13 @@ private:
         const float kDistanceEpsilon =
             config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
 
-        if (passes_filter(entry_point) && entry_dist >= kDistanceEpsilon) {
+        if (entry_dist >= kDistanceEpsilon) {
             float score =
                 config_.clamp_negative_distances ? std::max(0.0f, entry_dist) : entry_dist;
-            top_candidates.emplace(score, entry_point);
+            exploration_bound.emplace(score, entry_point);
+            if (passes_filter(entry_point)) {
+                top_candidates.emplace(score, entry_point);
+            }
         }
 
         while (!candidates.empty()) {
@@ -2302,8 +2356,8 @@ private:
             if (!current_node)
                 continue;
 
-            if (!top_candidates.empty() && current_dist > top_candidates.top().first &&
-                top_candidates.size() >= ef) {
+            if (!exploration_bound.empty() && current_dist > exploration_bound.top().first &&
+                exploration_bound.size() >= ef) {
                 break;
             }
 
@@ -2356,13 +2410,17 @@ private:
                 if (neighbor_dist < kDistanceEpsilon)
                     continue;
 
-                bool should_explore = top_candidates.empty() || top_candidates.size() < ef ||
-                                      neighbor_dist < top_candidates.top().first;
+                bool should_explore = exploration_bound.size() < ef ||
+                                      neighbor_dist < exploration_bound.top().first;
 
                 if (should_explore) {
                     float score = config_.clamp_negative_distances ? std::max(0.0f, neighbor_dist)
                                                                    : neighbor_dist;
                     candidates.emplace(score, neighbor);
+                    exploration_bound.emplace(score, neighbor);
+                    if (exploration_bound.size() > ef) {
+                        exploration_bound.pop();
+                    }
                 }
 
                 if (passes_filter(neighbor)) {
