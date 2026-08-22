@@ -398,60 +398,58 @@ public:
     void reset() { value_.store(0, std::memory_order_relaxed); }
 };
 
-/// Reusable visited set tracker using version-based reset pattern
-/// Avoids expensive unordered_set allocation on every search
-/// Uses a version counter to "reset" without clearing - O(1) reset vs O(n) clear
+/// Reusable thread-confined visited set tracker using a version-based reset pattern.
+/// Avoids expensive unordered_set allocation on every search and resets in O(1).
+/// ThreadLocalVisitedPool owns one tracker per thread, so atomics would add hot-path
+/// synchronization without protecting any shared state.
 class VisitedTracker {
-    std::vector<size_t> visited_version_;    // Version when node was last visited
-    std::atomic<size_t> current_version_{1}; // Current search version (never 0)
-    std::atomic<size_t> capacity_{0};
+    std::vector<size_t> visited_version_; // Version when node was last visited
+    size_t current_version_{1};           // Current search version (never 0)
+    size_t capacity_{0};
 
 public:
     explicit VisitedTracker(size_t initial_capacity = 1024) { resize(initial_capacity); }
 
     /// Ensure capacity for node IDs up to max_id
     void resize(size_t new_capacity) {
-        if (new_capacity > capacity_.load(std::memory_order_relaxed)) {
+        if (new_capacity > capacity_) {
             // Grow by at least 2x to reduce reallocations
-            new_capacity = std::max(new_capacity, capacity_.load(std::memory_order_relaxed) * 2);
+            new_capacity = std::max(new_capacity, capacity_ * 2);
             visited_version_.resize(new_capacity, 0);
-            capacity_.store(new_capacity, std::memory_order_relaxed);
+            capacity_ = new_capacity;
         }
     }
 
     /// Reset for new search - O(1) by incrementing version
     void reset() {
-        size_t next_version = current_version_.fetch_add(1, std::memory_order_relaxed) + 1;
-        // Handle version overflow (unlikely but possible after 2^64 searches)
+        const size_t next_version = ++current_version_;
+        // Handle version overflow when size_t wraps.
         if (next_version == 0) {
             // Reset all versions and start fresh
             std::fill(visited_version_.begin(), visited_version_.end(), 0);
-            current_version_.store(1, std::memory_order_relaxed);
+            current_version_ = 1;
         }
     }
 
     /// Check if node was visited in current search
     [[nodiscard]] bool is_visited(size_t node_id) const {
-        if (node_id >= capacity_.load(std::memory_order_relaxed))
-            return false;
-        return visited_version_[node_id] == current_version_.load(std::memory_order_relaxed);
+        return node_id < capacity_ && visited_version_[node_id] == current_version_;
     }
 
     /// Mark node as visited, returns true if first visit
     bool visit(size_t node_id) {
-        if (node_id >= capacity_.load(std::memory_order_relaxed)) {
+        if (node_id >= capacity_) {
             // Shouldn't happen if properly sized, but handle gracefully
             resize(node_id + 1);
         }
-        const auto current_version = current_version_.load(std::memory_order_relaxed);
-        if (visited_version_[node_id] == current_version) {
+        if (visited_version_[node_id] == current_version_) {
             return false; // Already visited
         }
-        visited_version_[node_id] = current_version;
+        visited_version_[node_id] = current_version_;
         return true; // First visit
     }
 
-    [[nodiscard]] size_t capacity() const { return capacity_.load(std::memory_order_relaxed); }
+    [[nodiscard]] size_t capacity() const { return capacity_; }
 };
 
 /// Thread-local visited tracker pool
