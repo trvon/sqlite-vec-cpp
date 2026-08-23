@@ -712,6 +712,9 @@ void test_parallel_build() {
     index.build_parallel(std::span{ids}, std::span{spans}, 1);
 
     assert(index.size() == num_vectors);
+    if (index.flat_lookup_size() != num_vectors) {
+        throw std::runtime_error("dense parallel build did not create flat lookup");
+    }
 
     // Test search still works
     auto query = generate_vector(dim, rng);
@@ -719,6 +722,37 @@ void test_parallel_build() {
     assert(results.size() == 10);
 
     std::cout << "  ✓ Parallel build passed (built " << num_vectors << " vectors)" << std::endl;
+}
+
+void test_parallel_build_sparse_ids_avoids_flat_lookup() {
+    std::cout << "Test 16c: Sparse IDs avoid flat lookup..." << std::endl;
+
+    constexpr size_t num_vectors = 20;
+    constexpr size_t dim = 8;
+    std::mt19937 rng(43);
+    HNSWIndex<float, L2Metric<float>> index;
+    std::vector<std::vector<float>> vectors;
+    std::vector<std::span<const float>> spans;
+    std::vector<size_t> ids;
+    vectors.reserve(num_vectors);
+    spans.reserve(num_vectors);
+    ids.reserve(num_vectors);
+    for (size_t i = 0; i < num_vectors; ++i) {
+        vectors.push_back(generate_vector(dim, rng));
+        spans.emplace_back(vectors.back());
+        ids.push_back(i * 1'000'000 + 1);
+    }
+
+    index.build_parallel(std::span{ids}, std::span{spans}, 1);
+    assert(index.size() == num_vectors);
+    if (index.flat_lookup_size() != 0) {
+        throw std::runtime_error("sparse parallel build allocated flat lookup");
+    }
+    assert(index.get_node(ids.back()) != nullptr);
+
+    auto results = index.search(std::span{vectors.front()}, 5, 20);
+    assert(results.size() == 5);
+    std::cout << "  ✓ Sparse IDs use bounded hash lookup" << std::endl;
 }
 
 // Test 17: fp16 storage
@@ -1505,6 +1539,7 @@ int main() {
     test_clear_deletions();
     test_build_parallel_validation();
     test_parallel_build();
+    test_parallel_build_sparse_ids_avoids_flat_lookup();
     test_fp16_storage();
     test_fp16_accuracy();
     test_graph_stats();

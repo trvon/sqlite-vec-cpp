@@ -166,6 +166,7 @@ public:
         : config_(other.config_), nodes_mutex_(), nodes_(std::move(other.nodes_)),
           deleted_ids_(std::move(other.deleted_ids_)),
           next_dense_id_(other.next_dense_id_.load(std::memory_order_relaxed)),
+          flat_lookup_(std::move(other.flat_lookup_)),
           entry_point_id_(other.entry_point_id_.load(std::memory_order_relaxed)),
           entry_point_layer_(other.entry_point_layer_.load(std::memory_order_relaxed)),
           rng_generator_(config_.random_seed) {}
@@ -177,6 +178,7 @@ public:
             rng_generator_.reseed(config_.random_seed);
             nodes_ = std::move(other.nodes_);
             deleted_ids_ = std::move(other.deleted_ids_);
+            flat_lookup_ = std::move(other.flat_lookup_);
             next_dense_id_.store(other.next_dense_id_.load(std::memory_order_relaxed),
                                  std::memory_order_relaxed);
             entry_point_id_.store(other.entry_point_id_.load(std::memory_order_relaxed),
@@ -201,6 +203,7 @@ public:
         index.entry_point_layer_.store(entry_point_layer, std::memory_order_relaxed);
         index.nodes_ = std::move(nodes);
         index.rebuild_dense_ids_unlocked();
+        index.rebuild_flat_lookup_if_dense_unlocked();
         return index;
     }
 
@@ -215,6 +218,7 @@ public:
         index.nodes_ = std::move(nodes);
         index.deleted_ids_ = std::move(deleted_ids);
         index.rebuild_dense_ids_unlocked();
+        index.rebuild_flat_lookup_if_dense_unlocked();
         return index;
     }
 
@@ -280,6 +284,9 @@ public:
                 return;
             }
             it->second.dense_id = next_dense_id_++;
+            if (id < flat_lookup_.size()) {
+                flat_lookup_[id] = &it->second;
+            }
             // Bump generation while holding write lock so snapshot readers
             // see a consistent (node-visible, generation-bumped) state.
             mutation_generation_.fetch_add(1, std::memory_order_release);
@@ -854,6 +861,7 @@ public:
             pool.parallel_for(ids_span.size(), [&](size_t /*thread*/, size_t i) {
                 insert(ids_span[i], vectors_span[i]);
             });
+            rebuild_flat_lookup_if_dense_unlocked();
             return;
         }
 
@@ -994,10 +1002,15 @@ public:
                 break;
             }
         }
+        rebuild_flat_lookup_if_dense_unlocked();
     }
 
     /// Get number of vectors in index
     size_t size() const { return nodes_.size(); }
+
+    /// Number of pointer slots retained for dense-ID lookup. Multiply by
+    /// sizeof(NodeType*) to obtain the lookup table's payload bytes.
+    [[nodiscard]] size_t flat_lookup_size() const noexcept { return flat_lookup_.size(); }
 
     /// Get maximum layer in index
     size_t max_layer() const { return entry_point_layer_; }
@@ -1393,6 +1406,33 @@ private:
             node.dense_id = dense_id++;
         }
         next_dense_id_.store(dense_id, std::memory_order_relaxed);
+    }
+
+    void rebuild_flat_lookup_if_dense_unlocked() {
+        flat_lookup_.clear();
+        if (nodes_.empty()) {
+            return;
+        }
+
+        const auto max_id = std::max_element(nodes_.begin(), nodes_.end(), [](const auto& lhs,
+                                                                             const auto& rhs) {
+                                return lhs.first < rhs.first;
+                            })->first;
+        constexpr size_t kDensityRatio = 4;
+        constexpr size_t kLookupSlack = 1024;
+        const size_t max_size = std::numeric_limits<size_t>::max();
+        const size_t dense_limit =
+            nodes_.size() > (max_size - kLookupSlack) / kDensityRatio
+                ? max_size
+                : nodes_.size() * kDensityRatio + kLookupSlack;
+        if (max_id > dense_limit || max_id == max_size) {
+            return;
+        }
+
+        flat_lookup_.resize(max_id + 1, nullptr);
+        for (auto& [id, node] : nodes_) {
+            flat_lookup_[id] = &node;
+        }
     }
 
     bool is_deleted_unlocked(size_t id) const { return deleted_ids_.contains(id); }
@@ -2585,7 +2625,7 @@ private:
     /// Try to get node by ID (returns nullptr if not found, safe for concurrent access).
     /// Uses flat lookup table when populated (O(1)), falls back to hash map.
     const NodeType* try_get_node(size_t id) const {
-        if (id < flat_lookup_.size()) {
+        if (id < flat_lookup_.size() && flat_lookup_[id] != nullptr) {
             return flat_lookup_[id];
         }
         auto it = nodes_.find(id);
@@ -2594,7 +2634,7 @@ private:
 
     /// Mutable overload of try_get_node.
     NodeType* try_get_node(size_t id) {
-        if (id < flat_lookup_.size()) {
+        if (id < flat_lookup_.size() && flat_lookup_[id] != nullptr) {
             return flat_lookup_[id];
         }
         auto it = nodes_.find(id);
