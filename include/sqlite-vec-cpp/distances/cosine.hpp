@@ -16,6 +16,8 @@
 #include "../simd/neon.hpp"
 #endif
 
+#include "../simd/x86_dispatch.hpp"
+
 namespace sqlite_vec_cpp::distances {
 
 /// Cosine distance = 1 - cosine_similarity
@@ -112,6 +114,19 @@ float cosine_distance(std::span<const T> a, std::span<const T> b) {
         // NEON: require minimum 16 elements for efficient unrolled loop
         if (a.size() >= 16) {
             return simd::cosine_distance_float_neon(a, b);
+        }
+#endif
+#ifdef SQLITE_VEC_X86_RUNTIME_DISPATCH
+        if (a.size() >= 8 && x86::cpu_has_avx2_fma()) {
+            float dot = 0.0f;
+            float a_mag = 0.0f;
+            float b_mag = 0.0f;
+            x86::cosine_terms_avx2(a.data(), b.data(), a.size(), dot, a_mag, b_mag);
+            const float denom = std::sqrt(a_mag) * std::sqrt(b_mag);
+            if (denom < 1e-8f) {
+                return 1.0f;
+            }
+            return 1.0f - (dot / denom);
         }
 #endif
         return cosine_distance_float(a, b);

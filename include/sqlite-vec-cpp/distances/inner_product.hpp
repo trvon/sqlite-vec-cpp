@@ -16,6 +16,8 @@
 #include "../simd/neon.hpp"
 #endif
 
+#include "../simd/x86_dispatch.hpp"
+
 namespace sqlite_vec_cpp::distances {
 
 /// Inner product (dot product) distance = 1 - dot(a, b) for normalized vectors
@@ -160,6 +162,11 @@ float inner_product_distance(std::span<const T> a, std::span<const T> b) {
         // NEON: 4×4 unrolled, require minimum 16 elements for efficient loop
         if (a.size() >= 16) {
             return simd::inner_product_float_neon(a, b);
+        }
+#endif
+#ifdef SQLITE_VEC_X86_RUNTIME_DISPATCH
+        if (a.size() >= 8 && x86::cpu_has_avx2_fma()) {
+            return 1.0f - x86::dot_avx2(a.data(), b.data(), a.size());
         }
 #endif
         return inner_product_distance_float(a, b);

@@ -16,6 +16,8 @@
 #include "../simd/neon.hpp"
 #endif
 
+#include "../simd/x86_dispatch.hpp"
+
 namespace sqlite_vec_cpp::distances {
 
 /// L2 (Euclidean) distance metric - generic fallback implementation
@@ -137,6 +139,11 @@ template <concepts::VectorElement T> float l2_distance(std::span<const T> a, std
         // NEON: require minimum size
         if (a.size() > 16) {
             return simd::l2_distance_float_neon(a, b);
+        }
+#endif
+#ifdef SQLITE_VEC_X86_RUNTIME_DISPATCH
+        if (a.size() >= 8 && x86::cpu_has_avx2_fma()) {
+            return std::sqrt(x86::l2_squared_avx2(a.data(), b.data(), a.size()));
         }
 #endif
         return l2_distance_float(a, b);
