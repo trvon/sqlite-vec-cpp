@@ -433,7 +433,8 @@ int save_hnsw_index(sqlite3* db, const char* schema, const char* table,
         sqlite3_finalize(stmt);
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
         if (pzErr)
-            *pzErr = sqlite3_mprintf("Failed to save HNSW node %zu", failedNodeId);
+            *pzErr = sqlite3_mprintf("Failed to save HNSW node %llu",
+                                     static_cast<unsigned long long>(failedNodeId));
         return rc;
     }
 
@@ -530,7 +531,8 @@ HNSWIndex<T, Metric> load_hnsw_index(sqlite3* db, const char* schema, const char
         if (node.id != node_id) {
             sqlite3_finalize(stmt);
             if (pzErr)
-                *pzErr = sqlite3_mprintf("HNSW node id mismatch for rowid %zu", node_id);
+                *pzErr = sqlite3_mprintf("HNSW node id mismatch for rowid %llu",
+                                         static_cast<unsigned long long>(node_id));
             throw std::runtime_error("HNSW node id mismatch");
         }
         nodes.emplace(node_id, std::move(node));
@@ -546,14 +548,15 @@ HNSWIndex<T, Metric> load_hnsw_index(sqlite3* db, const char* schema, const char
 
     if (!nodes.empty() && nodes.find(entry_point_id) == nodes.end()) {
         if (pzErr)
-            *pzErr = sqlite3_mprintf("HNSW entry point %zu missing from nodes", entry_point_id);
+            *pzErr = sqlite3_mprintf("HNSW entry point %llu missing from nodes",
+                                     static_cast<unsigned long long>(entry_point_id));
         throw std::runtime_error("HNSW entry point missing from nodes");
     }
 
     for (auto& [id, node] : nodes) {
         for (auto& layer : node.edges) {
-            std::erase_if(layer,
-                          [&](size_t neighbor_id) { return nodes.find(neighbor_id) == nodes.end(); });
+            std::erase_if(
+                layer, [&](size_t neighbor_id) { return nodes.find(neighbor_id) == nodes.end(); });
         }
     }
 
@@ -606,7 +609,8 @@ int save_hnsw_node_incremental(sqlite3* db, const char* schema, const char* tabl
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE && pzErr) {
-        *pzErr = sqlite3_mprintf("Failed to save HNSW node %zu", node.id);
+        *pzErr = sqlite3_mprintf("Failed to save HNSW node %llu",
+                                 static_cast<unsigned long long>(node.id));
     }
 
     return rc;
@@ -657,7 +661,8 @@ int save_hnsw_nodes_incremental(sqlite3* db, const char* schema, const char* tab
             sqlite3_finalize(stmt);
             sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
             if (pzErr)
-                *pzErr = sqlite3_mprintf("Failed to save HNSW node %zu", node.id);
+                *pzErr = sqlite3_mprintf("Failed to save HNSW node %llu",
+                                         static_cast<unsigned long long>(node.id));
             return rc;
         }
     }
