@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <random>
 #include <vector>
 #include <sqlite-vec-cpp/distances/cosine.hpp>
 #include <sqlite-vec-cpp/distances/inner_product.hpp>
@@ -273,17 +274,17 @@ void test_int8_neon_consistency() {
     }
 
     // Cosine: dispatch (NEON) vs scalar
-    float cosine_dispatch = cosine_distance(std::span<const std::int8_t>(a),
-                                            std::span<const std::int8_t>(b));
-    float cosine_scalar = cosine_distance_int(std::span<const std::int8_t>(a),
-                                              std::span<const std::int8_t>(b));
+    float cosine_dispatch =
+        cosine_distance(std::span<const std::int8_t>(a), std::span<const std::int8_t>(b));
+    float cosine_scalar =
+        cosine_distance_int(std::span<const std::int8_t>(a), std::span<const std::int8_t>(b));
     assert(approx_equal(cosine_dispatch, cosine_scalar, 1e-4f));
     assert(!std::isnan(cosine_dispatch));
     assert(cosine_dispatch >= 0.0f && cosine_dispatch <= 2.0f);
 
     // Inner product: dispatch (NEON) vs scalar
-    float ip_dispatch = inner_product_distance(std::span<const std::int8_t>(a),
-                                               std::span<const std::int8_t>(b));
+    float ip_dispatch =
+        inner_product_distance(std::span<const std::int8_t>(a), std::span<const std::int8_t>(b));
     float ip_scalar = inner_product_distance_int(std::span<const std::int8_t>(a),
                                                  std::span<const std::int8_t>(b));
     assert(approx_equal(ip_dispatch, ip_scalar, 1e-4f));
@@ -297,16 +298,16 @@ void test_int8_neon_consistency() {
             vb[i] = static_cast<std::int8_t>((i * 9 + 17) % 255 - 127);
         }
 
-        float cos_d = cosine_distance(std::span<const std::int8_t>(va),
-                                       std::span<const std::int8_t>(vb));
-        float cos_s = cosine_distance_int(std::span<const std::int8_t>(va),
-                                           std::span<const std::int8_t>(vb));
+        float cos_d =
+            cosine_distance(std::span<const std::int8_t>(va), std::span<const std::int8_t>(vb));
+        float cos_s =
+            cosine_distance_int(std::span<const std::int8_t>(va), std::span<const std::int8_t>(vb));
         assert(approx_equal(cos_d, cos_s, 1e-4f));
 
         float ip_d = inner_product_distance(std::span<const std::int8_t>(va),
-                                             std::span<const std::int8_t>(vb));
+                                            std::span<const std::int8_t>(vb));
         float ip_s = inner_product_distance_int(std::span<const std::int8_t>(va),
-                                                 std::span<const std::int8_t>(vb));
+                                                std::span<const std::int8_t>(vb));
         assert(approx_equal(ip_d, ip_s, 1e-4f));
     }
 
@@ -314,6 +315,43 @@ void test_int8_neon_consistency() {
 #else
     std::cout << "  (skipped: NEON not enabled)" << std::endl;
 #endif
+}
+
+// Float dispatch (NEON, compile-time AVX, or x86 runtime AVX2) must agree with the scalar
+// reference within float rounding for every length, including sub-vector tails.
+void test_float_dispatch_matches_scalar() {
+    std::cout << "Testing float dispatch vs scalar reference..." << std::endl;
+#ifdef SQLITE_VEC_X86_RUNTIME_DISPATCH
+    std::cout << "  x86 runtime dispatch compiled in; AVX2+FMA "
+              << (x86::cpu_has_avx2_fma() ? "available" : "unavailable") << std::endl;
+#endif
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<std::size_t> sizes;
+    for (std::size_t n = 1; n <= 70; ++n)
+        sizes.push_back(n);
+    sizes.push_back(384);
+    sizes.push_back(768);
+    for (const std::size_t n : sizes) {
+        std::vector<float> a(n);
+        std::vector<float> b(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            a[i] = dist(rng);
+            b[i] = dist(rng);
+        }
+        const std::span<const float> sa(a);
+        const std::span<const float> sb(b);
+        const float tol = 1e-4f * static_cast<float>(n);
+        assert(std::abs(inner_product_distance(sa, sb) - inner_product_distance_float(sa, sb)) <=
+               tol);
+        assert(std::abs(l2_distance(sa, sb) - l2_distance_float(sa, sb)) <= tol);
+        assert(std::abs(cosine_distance(sa, sb) - cosine_distance_float(sa, sb)) <= 1e-5f);
+        assert(std::abs(cosine_distance(sa, sa)) <= 1e-5f);
+    }
+    std::vector<float> zeros(64, 0.0f);
+    std::vector<float> ones(64, 1.0f);
+    assert(cosine_distance(std::span<const float>(zeros), std::span<const float>(ones)) == 1.0f);
+    std::cout << "  ✓ float dispatch matches scalar" << std::endl;
 }
 
 int main() {
@@ -326,6 +364,7 @@ int main() {
         test_metric_traits();
         test_simd_consistency();
         test_int8_neon_consistency();
+        test_float_dispatch_matches_scalar();
 
         std::cout << "\nAll distance metric tests passed! ✓" << std::endl;
         return 0;

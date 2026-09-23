@@ -16,9 +16,9 @@
 #include <vector>
 #include "../distances/l2.hpp"
 #include "../index/hnsw.hpp"
+#include "../index/hnsw_persistence.hpp"
 #include "../utils/error.hpp"
 #include "parsers.hpp"
-#include "../index/hnsw_persistence.hpp"
 
 #include <unordered_map>
 #include "value.hpp"
@@ -94,9 +94,8 @@ inline void vec0_registry_remove(sqlite3* db, std::string_view schema_name,
     vec0_table_registry().erase(vec0_registry_key(db, schema_name, table_name));
 }
 template <typename Fn>
-inline auto vec0_with_table(sqlite3* db, std::string_view schema_name,
-                            std::string_view table_name, Fn&& fn)
-    -> decltype(fn(static_cast<Vec0Table*>(nullptr))) {
+inline auto vec0_with_table(sqlite3* db, std::string_view schema_name, std::string_view table_name,
+                            Fn&& fn) -> decltype(fn(static_cast<Vec0Table*>(nullptr))) {
     std::lock_guard<std::mutex> lk(vec0_registry_mutex());
     auto& reg = vec0_table_registry();
     auto it = reg.find(vec0_registry_key(db, schema_name, table_name));
@@ -341,9 +340,8 @@ vec0_run_ann_query(Vec0Table* table, const Value& query_value, size_t k, size_t 
             const size_t entry_count = std::min(kMaxRouteEntryPoints, ordered_rowids.size());
             route_entry_points.reserve(entry_count);
             for (size_t i = 0; i < entry_count; ++i) {
-                const size_t index = entry_count == 1
-                                         ? 0
-                                         : i * (ordered_rowids.size() - 1) / (entry_count - 1);
+                const size_t index =
+                    entry_count == 1 ? 0 : i * (ordered_rowids.size() - 1) / (entry_count - 1);
                 route_entry_points.push_back(static_cast<size_t>(ordered_rowids[index]));
             }
         }
@@ -605,8 +603,9 @@ inline int vec0Create(sqlite3* db, void* pAux, int argc, const char* const* argv
     parse_vec0_schema(argc, argv, embedding_col, dims);
 
     if (dims == 0 || dims > kMaxVec0Dimensions) {
-        *pzErr = sqlite3_mprintf("vec0: dimensions must be in [1, %zu], got %zu",
-                                 kMaxVec0Dimensions, dims);
+        *pzErr = sqlite3_mprintf("vec0: dimensions must be in [1, %llu], got %llu",
+                                 static_cast<unsigned long long>(kMaxVec0Dimensions),
+                                 static_cast<unsigned long long>(dims));
         return SQLITE_ERROR;
     }
     if (embedding_col.empty() || embedding_col.find('"') != std::string::npos) {

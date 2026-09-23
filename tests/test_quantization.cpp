@@ -571,7 +571,13 @@ void test_two_stage_memory_savings() {
         } else if (qtype == QuantizationType::LVQ4) {
             assert(compression > 6.0f); // ~8x expected
         } else if (qtype == QuantizationType::RaBitQ) {
-            assert(compression > 20.0f); // ~32x expected
+            // 384 dims pad to 512 for the FWHT rotation: 64 code bytes + 8 bytes of per-vector
+            // factors = 72 B vs 1536 B FP32 (21.3x per vector). With only 100 vectors the fixed
+            // centroid + rotation state (~1.7 KB) brings the total to ~17x.
+            assert(compression > 16.0f);
+            const float per_vector_bound = static_cast<float>(dim * sizeof(float)) /
+                                           static_cast<float>(512 / 8 + 2 * sizeof(float));
+            assert(compression < per_vector_bound);
         }
     }
 
