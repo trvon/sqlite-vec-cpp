@@ -17,6 +17,7 @@
 #include <sqlite-vec-cpp/distances/hamming.hpp>
 #include <sqlite-vec-cpp/distances/l2.hpp>
 #include <sqlite-vec-cpp/index/hnsw.hpp>
+#include <sqlite-vec-cpp/index/hnsw_persistence.hpp>
 #include <sqlite-vec-cpp/index/hnsw_quantized.hpp>
 #include <sqlite-vec-cpp/quantization/lvq.hpp>
 #include <sqlite-vec-cpp/quantization/rabitq.hpp>
@@ -562,6 +563,372 @@ void test_vec0_incremental_maintenance() {
     std::cout << "  PASS: incremental vec0 ANN maintenance & recall parity" << std::endl;
 }
 
+// 6. Dense-ID HNSW contiguous node table: sparse IDs, delete/isolate/compact, persistence parity
+void test_hnsw_dense_node_table_parity() {
+    std::cout << "Testing dense-ID HNSW node table (sparse IDs, delete, compact, persistence)..."
+              << std::endl;
+
+    std::mt19937 rng(20261124);
+    constexpr size_t kDim = 24;
+    constexpr size_t kN = 160;
+
+    HNSWIndex<float, L2Metric<float>>::Config cfg;
+    cfg.M = 12;
+    cfg.M_max = 12;
+    cfg.M_max_0 = 24;
+    cfg.ef_construction = 80;
+    cfg.random_seed = 77;
+    HNSWIndex<float, L2Metric<float>> index(cfg);
+
+    // Use large sparse 64-bit external IDs so flat_lookup_ is NOT used, proving dense_nodes_
+    // handles all hops without hash-table lookups.
+    std::vector<size_t> ids;
+    std::vector<std::vector<float>> vectors;
+    std::vector<std::span<const float>> spans;
+    ids.reserve(kN);
+    vectors.reserve(kN);
+    spans.reserve(kN);
+    for (size_t i = 0; i < kN; ++i) {
+        ids.push_back(1000000000ULL + i * 7919ULL);
+        vectors.push_back(make_random_f32(kDim, rng, -2.0f, 2.0f));
+        spans.emplace_back(vectors.back());
+    }
+
+    index.build_parallel(ids, spans, 2, 64);
+    INV_CHECK(index.size() == kN);
+    INV_CHECK(index.dense_node_count() == kN);
+    INV_CHECK(index.flat_lookup_size() == 0);
+
+    // Search parity: search() and search_read_mostly() must match identically
+    auto query = make_random_f32(kDim, rng, -2.0f, 2.0f);
+    auto r_locked = index.search(query, 10, 64);
+    auto r_rm = index.search_read_mostly(query, 10, 64);
+    INV_CHECK(r_locked.size() == 10);
+    INV_CHECK(r_locked == r_rm);
+
+    // Soft-delete 30 nodes + isolate_deleted
+    std::unordered_set<size_t> deleted;
+    for (size_t i = 0; i < 30; ++i) {
+        index.remove(ids[i]);
+        deleted.insert(ids[i]);
+    }
+    index.isolate_deleted();
+    INV_CHECK(index.active_size() == kN - 30);
+
+    auto r_after_del = index.search_read_mostly(query, 10, 64);
+    INV_CHECK(r_after_del.size() == 10);
+    for (const auto& [id, d] : r_after_del) {
+        INV_CHECK(!deleted.contains(id));
+    }
+
+    // Persistence round-trip (save + load) must rebuild dense_nodes_ & dense_edges identically
+    sqlite3* db = nullptr;
+    INV_CHECK(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    char* err = nullptr;
+    INV_CHECK(save_hnsw_index(db, "main", "dense_test", index, &err) == SQLITE_OK);
+
+    auto loaded = load_hnsw_index<float, L2Metric<float>>(db, "main", "dense_test", &err);
+    INV_CHECK(loaded.size() == index.size());
+    INV_CHECK(loaded.dense_node_count() == index.dense_node_count());
+    INV_CHECK(loaded.active_size() == index.active_size());
+
+    auto r_loaded = loaded.search_read_mostly(query, 10, 64);
+    INV_CHECK(r_loaded == r_after_del);
+    sqlite3_close(db);
+
+    // Compact must produce a clean dense table with active_size() nodes and high recall
+    auto compacted = index.compact();
+    INV_CHECK(compacted.size() == kN - 30);
+    INV_CHECK(compacted.dense_node_count() == kN - 30);
+    INV_CHECK(compacted.deleted_count() == 0);
+
+    auto r_compacted = compacted.search_read_mostly(query, 10, 64);
+    INV_CHECK(r_compacted.size() == 10);
+    for (const auto& [id, d] : r_compacted) {
+        INV_CHECK(!deleted.contains(id));
+    }
+
+    // Check top-1 exact recall on compacted index for an active vector
+    auto r_self = compacted.search_read_mostly(vectors[50], 1, 64);
+    INV_CHECK(r_self.size() == 1);
+    INV_CHECK(r_self[0].first == ids[50]);
+    INV_CHECK(r_self[0].second < 1e-4f);
+
+    // Clear resets dense table cleanly
+    compacted.clear();
+    INV_CHECK(compacted.empty());
+    INV_CHECK(compacted.dense_node_count() == 0);
+
+    std::cout << "  PASS: dense-ID HNSW node table parity" << std::endl;
+}
+
+// 7. Mean-centered LVQ8/LVQ4 accuracy on shifted/anisotropic clusters + SIMD-vs-scalar parity
+void test_mean_centered_lvq_accuracy_and_parity() {
+    std::cout << "Testing mean-centered LVQ8/LVQ4 accuracy and SIMD-vs-scalar parity..."
+              << std::endl;
+
+    std::mt19937 rng(424242);
+    for (size_t dim : {size_t{33}, size_t{64}, size_t{129}}) {
+        constexpr size_t kN = 128;
+
+        // Build a shifted, anisotropic cluster: large per-dimension mean + small local spread
+        std::vector<float> true_mean(dim);
+        for (size_t d = 0; d < dim; ++d) {
+            true_mean[d] = 18.0f * std::sin(static_cast<float>(d) * 0.37f) +
+                           (d % 3 == 0 ? 12.0f : -7.0f);
+        }
+
+        std::normal_distribution<float> noise(0.0f, 0.35f);
+        QuantizationSnapshot snap;
+        snap.dim = dim;
+        snap.generation = 1;
+        snap.entries.reserve(kN);
+        for (size_t i = 0; i < kN; ++i) {
+            std::vector<float> v(dim);
+            for (size_t d = 0; d < dim; ++d) {
+                v[d] = true_mean[d] + noise(rng);
+            }
+            snap.entries.push_back({i, std::move(v)});
+        }
+
+        std::vector<float> query(dim);
+        for (size_t d = 0; d < dim; ++d) {
+            query[d] = true_mean[d] + noise(rng);
+        }
+        std::span<const float> qspan(query);
+
+        // Uncentered vs Centered LVQ8 & LVQ4
+        LVQ8Store lvq8_plain, lvq8_centered;
+        LVQ4Store lvq4_plain, lvq4_centered;
+        lvq8_plain.build(snap, false);
+        lvq8_centered.build(snap, true);
+        lvq4_plain.build(snap, false);
+        lvq4_centered.build(snap, true);
+
+        INV_CHECK(!lvq8_plain.is_centered());
+        INV_CHECK(lvq8_centered.is_centered());
+        INV_CHECK(lvq8_centered.centroid().size() == dim);
+        INV_CHECK(!lvq4_plain.is_centered());
+        INV_CHECK(lvq4_centered.is_centered());
+        INV_CHECK(lvq4_centered.centroid().size() == dim);
+
+        auto qs8 = lvq8_centered.prepare_query(qspan);
+        auto qs4 = lvq4_centered.prepare_query(qspan);
+
+        double err8_plain = 0.0, err8_centered = 0.0;
+        double err4_plain = 0.0, err4_centered = 0.0;
+
+        for (size_t i = 0; i < kN; ++i) {
+            const float exact_d =
+                l2_distance(qspan, std::span<const float>(snap.entries[i].vector));
+
+            const float d8_plain = lvq8_plain.l2_distance(qspan, i);
+            const float d8_cent = lvq8_centered.l2_distance(qspan, i);
+            const float d8_qs = lvq8_centered.l2_distance(qs8, i);
+            const float d8_scalar = std::sqrt(lvq8_centered.l2_distance_squared_scalar(qspan, i));
+            INV_CHECK(rel_approx_equal(d8_cent, d8_qs, 1e-5f, 1e-5f));
+            INV_CHECK(rel_approx_equal(d8_cent, d8_scalar, 1e-4f, 1e-4f));
+
+            const float d4_plain = lvq4_plain.l2_distance(qspan, i);
+            const float d4_cent = lvq4_centered.l2_distance(qspan, i);
+            const float d4_qs = lvq4_centered.l2_distance(qs4, i);
+            const float d4_scalar = std::sqrt(lvq4_centered.l2_distance_squared_scalar(qspan, i));
+            INV_CHECK(rel_approx_equal(d4_cent, d4_qs, 1e-5f, 1e-5f));
+            INV_CHECK(rel_approx_equal(d4_cent, d4_scalar, 1e-4f, 1e-4f));
+
+            err8_plain += std::abs(d8_plain - exact_d);
+            err8_centered += std::abs(d8_cent - exact_d);
+            err4_plain += std::abs(d4_plain - exact_d);
+            err4_centered += std::abs(d4_cent - exact_d);
+        }
+
+        // Mean-centering must dramatically reduce L2 quantization error on shifted clusters
+        INV_CHECK(err8_centered < err8_plain * 0.25);
+        INV_CHECK(err4_centered < err4_plain * 0.25);
+
+        // Verify backward-compatible uncentered add() & centered fit_centroid()+add()
+        LVQ8Store lvq8_inc;
+        for (size_t i = 0; i < 8; ++i) {
+            lvq8_inc.add(i, std::span<const float>(snap.entries[i].vector));
+        }
+        INV_CHECK(!lvq8_inc.is_centered());
+        for (size_t i = 0; i < 8; ++i) {
+            INV_CHECK(rel_approx_equal(lvq8_inc.l2_distance(qspan, i),
+                                       lvq8_plain.l2_distance(qspan, i), 1e-5f, 1e-5f));
+        }
+
+        LVQ4Store lvq4_inc;
+        lvq4_inc.fit_centroid(snap);
+        for (size_t i = 0; i < 8; ++i) {
+            lvq4_inc.add(i, std::span<const float>(snap.entries[i].vector));
+        }
+        INV_CHECK(lvq4_inc.is_centered());
+        for (size_t i = 0; i < 8; ++i) {
+            INV_CHECK(rel_approx_equal(lvq4_inc.l2_distance(qspan, i),
+                                       lvq4_centered.l2_distance(qspan, i), 1e-5f, 1e-5f));
+        }
+    }
+
+    std::cout << "  PASS: mean-centered LVQ8/LVQ4 accuracy & SIMD parity" << std::endl;
+}
+
+// 8. Opt-in RaBitQ quantized vec0 mode & bounded-heap exact query parity
+void test_vec0_quantized_and_bounded_exact_query() {
+    std::cout << "Testing opt-in RaBitQ vec0 mode & bounded-heap exact query parity..."
+              << std::endl;
+
+    sqlite3* db = nullptr;
+    INV_CHECK(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    auto reg = register_vec0_module(db);
+    INV_CHECK(reg.has_value());
+
+    constexpr size_t kDim = 32;
+    constexpr int64_t kN = 120;
+    char* err = nullptr;
+
+    // Default table must remain FP32 (QuantizationType::None)
+    INV_CHECK(sqlite3_exec(db, "CREATE VIRTUAL TABLE vecs_fp32 USING vec0(embedding float[32])",
+                           nullptr, nullptr, &err) == SQLITE_OK);
+    vec0_with_table(db, "main", "vecs_fp32", [&](Vec0Table* t) {
+        INV_CHECK(t != nullptr);
+        INV_CHECK(t->quantization_type == QuantizationType::None);
+    });
+
+    // Opt-in RaBitQ table
+    INV_CHECK(sqlite3_exec(
+                  db,
+                  "CREATE VIRTUAL TABLE vecs_rq USING vec0(embedding float[32], "
+                  "quantization=rabitq, rerank_factor=4)",
+                  nullptr, nullptr, &err) == SQLITE_OK);
+    vec0_with_table(db, "main", "vecs_rq", [&](Vec0Table* t) {
+        INV_CHECK(t != nullptr);
+        INV_CHECK(t->quantization_type == QuantizationType::RaBitQ);
+        INV_CHECK(t->quantized_rerank_factor == 4);
+    });
+
+    std::mt19937 rng(98765);
+    std::unordered_map<int64_t, std::vector<float>> truth;
+
+    auto insert_row = [&](const char* tbl, int64_t rowid, const std::vector<float>& v) {
+        sqlite3_stmt* stmt = nullptr;
+        std::string sql = std::string("INSERT INTO ") + tbl + "(rowid, embedding) VALUES (?, ?)";
+        INV_CHECK(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK);
+        sqlite3_bind_int64(stmt, 1, rowid);
+        sqlite3_bind_blob(stmt, 2, v.data(), static_cast<int>(v.size() * sizeof(float)),
+                          SQLITE_TRANSIENT);
+        INV_CHECK(sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+    };
+
+    for (int64_t id = 1; id <= kN; ++id) {
+        auto v = make_random_f32(kDim, rng, -1.0f, 1.0f);
+        insert_row("vecs_rq", id, v);
+        truth[id] = std::move(v);
+    }
+
+    auto run_query = [&](const std::string& sql, const std::vector<float>& q,
+                         std::optional<int> k_val = std::nullopt) {
+        sqlite3_stmt* stmt = nullptr;
+        INV_CHECK(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK);
+        sqlite3_bind_blob(stmt, 1, q.data(), static_cast<int>(q.size() * sizeof(float)),
+                          SQLITE_TRANSIENT);
+        if (k_val) {
+            sqlite3_bind_int(stmt, 2, *k_val);
+        }
+        std::vector<std::pair<int64_t, float>> out;
+        int rc = SQLITE_OK;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            out.emplace_back(sqlite3_column_int64(stmt, 0),
+                             static_cast<float>(sqlite3_column_double(stmt, 1)));
+        }
+        INV_CHECK(rc == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        return out;
+    };
+
+    // 1. RaBitQ ANN query recall & exact reranked distance verification
+    auto q = make_random_f32(kDim, rng, -1.0f, 1.0f);
+    auto rq_res = run_query(
+        "SELECT rowid, distance FROM vecs_rq WHERE embedding MATCH ? AND k = ? AND ef_search = 64",
+        q, 10);
+    INV_CHECK(rq_res.size() == 10);
+
+    vec0_with_table(db, "main", "vecs_rq", [&](Vec0Table* t) {
+        INV_CHECK(t != nullptr);
+        INV_CHECK(t->quantized_search != nullptr);
+        INV_CHECK(t->quantized_search->has_quantization());
+        INV_CHECK(!t->quantized_search->is_stale());
+    });
+
+    // Distances returned by RaBitQ mode must be exact FP32 reranked distances
+    for (size_t i = 0; i < rq_res.size(); ++i) {
+        const auto [rid, dist] = rq_res[i];
+        const float exact_d =
+            l2_distance(std::span<const float>(q), std::span<const float>(truth[rid]));
+        INV_CHECK(rel_approx_equal(dist, exact_d, 1e-4f, 1e-4f));
+        if (i > 0) {
+            INV_CHECK(rq_res[i - 1].second <= dist + 1e-6f);
+        }
+    }
+
+    // 2. Bounded-heap exact query parity (rowid range triggers exact plan)
+    auto exact_range = run_query(
+        "SELECT rowid, distance FROM vecs_rq WHERE query = ? AND k = ? AND rowid >= 20 AND "
+        "rowid <= 100",
+        q, 7);
+    INV_CHECK(exact_range.size() == 7);
+
+    std::vector<std::pair<int64_t, float>> ref_range;
+    for (int64_t id = 20; id <= 100; ++id) {
+        ref_range.emplace_back(
+            id, l2_distance(std::span<const float>(q), std::span<const float>(truth[id])));
+    }
+    std::sort(ref_range.begin(), ref_range.end(), [](const auto& a, const auto& b) {
+        return a.second < b.second || (a.second == b.second && a.first < b.first);
+    });
+    ref_range.resize(7);
+    for (size_t i = 0; i < 7; ++i) {
+        INV_CHECK(exact_range[i].first == ref_range[i].first);
+        INV_CHECK(rel_approx_equal(exact_range[i].second, ref_range[i].second, 1e-4f, 1e-4f));
+    }
+
+    // 3. Small-filter exact query parity (rowid IN (...) without k -> exact plan + small-filter SQL)
+    auto exact_in = run_query(
+        "SELECT rowid, distance FROM vecs_rq WHERE query = ? AND rowid IN (5, 17, 42, 88, 119)",
+        q);
+    INV_CHECK(exact_in.size() == 5);
+    std::vector<std::pair<int64_t, float>> ref_in;
+    for (int64_t id : {int64_t{5}, int64_t{17}, int64_t{42}, int64_t{88}, int64_t{119}}) {
+        ref_in.emplace_back(
+            id, l2_distance(std::span<const float>(q), std::span<const float>(truth[id])));
+    }
+    std::sort(ref_in.begin(), ref_in.end(), [](const auto& a, const auto& b) {
+        return a.second < b.second || (a.second == b.second && a.first < b.first);
+    });
+    for (size_t i = 0; i < 5; ++i) {
+        INV_CHECK(exact_in[i].first == ref_in[i].first);
+        INV_CHECK(rel_approx_equal(exact_in[i].second, ref_in[i].second, 1e-4f, 1e-4f));
+    }
+
+    // 4. Incremental insert into RaBitQ vec0 triggers automatic staleness rebuild on next query
+    std::vector<float> hot_vec(kDim, 7.25f);
+    insert_row("vecs_rq", kN + 1, hot_vec);
+    truth[kN + 1] = hot_vec;
+
+    auto rq_after_ins = run_query(
+        "SELECT rowid, distance FROM vecs_rq WHERE embedding MATCH ? AND k = ? AND ef_search = 64",
+        hot_vec, 1);
+    INV_CHECK(rq_after_ins.size() == 1);
+    INV_CHECK(rq_after_ins[0].first == kN + 1);
+    INV_CHECK(rq_after_ins[0].second < 1e-4f);
+
+    INV_CHECK(sqlite3_exec(db, "DROP TABLE vecs_rq; DROP TABLE vecs_fp32;", nullptr, nullptr,
+                           &err) == SQLITE_OK);
+    sqlite3_close(db);
+
+    std::cout << "  PASS: opt-in RaBitQ vec0 mode & bounded-heap exact query parity" << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -570,6 +937,9 @@ int main() {
     test_quantized_stores_odd_dims_parity();
     test_hnsw_search_stats();
     test_vec0_incremental_maintenance();
+    test_hnsw_dense_node_table_parity();
+    test_mean_centered_lvq_accuracy_and_parity();
+    test_vec0_quantized_and_bounded_exact_query();
     std::cout << "All invariant tests passed!" << std::endl;
     return 0;
 }

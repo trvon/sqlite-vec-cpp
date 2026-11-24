@@ -174,6 +174,7 @@ public:
         : config_(other.config_), nodes_mutex_(), nodes_(std::move(other.nodes_)),
           deleted_ids_(std::move(other.deleted_ids_)),
           next_dense_id_(other.next_dense_id_.load(std::memory_order_relaxed)),
+          dense_nodes_(std::move(other.dense_nodes_)),
           flat_lookup_(std::move(other.flat_lookup_)),
           entry_point_id_(other.entry_point_id_.load(std::memory_order_relaxed)),
           entry_point_layer_(other.entry_point_layer_.load(std::memory_order_relaxed)),
@@ -186,6 +187,7 @@ public:
             rng_generator_.reseed(config_.random_seed);
             nodes_ = std::move(other.nodes_);
             deleted_ids_ = std::move(other.deleted_ids_);
+            dense_nodes_ = std::move(other.dense_nodes_);
             flat_lookup_ = std::move(other.flat_lookup_);
             next_dense_id_.store(other.next_dense_id_.load(std::memory_order_relaxed),
                                  std::memory_order_relaxed);
@@ -291,7 +293,10 @@ public:
             if (!inserted) {
                 return;
             }
-            it->second.dense_id = next_dense_id_++;
+            const size_t dense_id = dense_nodes_.size();
+            it->second.dense_id = dense_id;
+            dense_nodes_.push_back(&it->second);
+            next_dense_id_.store(dense_nodes_.size(), std::memory_order_relaxed);
             if (id < flat_lookup_.size()) {
                 flat_lookup_[id] = &it->second;
             }
@@ -458,7 +463,10 @@ public:
         auto [it, inserted] = nodes_.emplace(id, NodeType(id, store_vec, layer, config_.M_max));
         if (!inserted)
             return;
-        it->second.dense_id = next_dense_id_.fetch_add(1, std::memory_order_relaxed);
+        const size_t dense_id = dense_nodes_.size();
+        it->second.dense_id = dense_id;
+        dense_nodes_.push_back(&it->second);
+        next_dense_id_.store(dense_nodes_.size(), std::memory_order_relaxed);
         register_flat_lookup(id, &it->second);
 
         // First node
@@ -813,7 +821,22 @@ public:
     /// Call before bulk insert_single_threaded() for best performance
     void reserve(size_t expected_size) {
         nodes_.reserve(expected_size);
+        dense_nodes_.reserve(expected_size);
         flat_lookup_.reserve(expected_size);
+    }
+
+    /// Clear all nodes, edges, and deletion markers
+    void clear() {
+        std::unique_lock nodes_lock(nodes_mutex_);
+        std::unique_lock deleted_lock(deleted_mutex_);
+        nodes_.clear();
+        deleted_ids_.clear();
+        dense_nodes_.clear();
+        flat_lookup_.clear();
+        next_dense_id_.store(0, std::memory_order_relaxed);
+        entry_point_id_.store(0, std::memory_order_relaxed);
+        entry_point_layer_.store(0, std::memory_order_relaxed);
+        mutation_generation_.fetch_add(1, std::memory_order_release);
     }
 
     /// Parallel batch build from vectors
@@ -929,7 +952,10 @@ public:
                 if (!inserted) {
                     continue;
                 }
-                it->second.dense_id = next_dense_id_.fetch_add(1, std::memory_order_relaxed);
+                const size_t dense_id = dense_nodes_.size();
+                it->second.dense_id = dense_id;
+                dense_nodes_.push_back(&it->second);
+                next_dense_id_.store(dense_nodes_.size(), std::memory_order_relaxed);
 
                 size_t current_max = max_layer.load(std::memory_order_relaxed);
                 while (layer > current_max) {
@@ -993,8 +1019,8 @@ public:
                         if (!node_ptr || !neighbor_ptr)
                             continue;
 
-                        node_ptr->add_edge(neighbor_id, lc);
-                        neighbor_ptr->add_edge(ids_span[i], lc);
+                        node_ptr->add_edge(neighbor_id, lc, neighbor_ptr->dense_id);
+                        neighbor_ptr->add_edge(ids_span[i], lc, node_ptr->dense_id);
 
                         size_t M_max = (lc == 0) ? config_.M_max_0 : config_.M_max;
                         if (neighbor_ptr->neighbors(lc).size() > M_max) {
@@ -1029,6 +1055,9 @@ public:
     /// Number of pointer slots retained for dense-ID lookup. Multiply by
     /// sizeof(NodeType*) to obtain the lookup table's payload bytes.
     [[nodiscard]] size_t flat_lookup_size() const noexcept { return flat_lookup_.size(); }
+
+    /// Number of nodes indexed in the contiguous dense-ID node table.
+    [[nodiscard]] size_t dense_node_count() const noexcept { return dense_nodes_.size(); }
 
     /// Get maximum layer in index
     size_t max_layer() const { return entry_point_layer_; }
@@ -1323,11 +1352,27 @@ public:
             if (is_deleted_unlocked(id))
                 continue;
 
-            // Remove edges to deleted nodes at each layer
+            // Remove edges to deleted nodes at each layer (keeping dense_edges aligned)
             for (size_t layer = 0; layer < node.edges.size(); ++layer) {
                 auto& layer_edges = node.edges[layer];
-                std::erase_if(layer_edges,
-                              [this](size_t neighbor) { return is_deleted_unlocked(neighbor); });
+                const bool has_dense = (layer < node.dense_edges.size() &&
+                                        node.dense_edges[layer].size() == layer_edges.size());
+                size_t write_idx = 0;
+                for (size_t i = 0; i < layer_edges.size(); ++i) {
+                    if (!is_deleted_unlocked(layer_edges[i])) {
+                        if (write_idx != i) {
+                            layer_edges[write_idx] = layer_edges[i];
+                            if (has_dense) {
+                                node.dense_edges[layer][write_idx] = node.dense_edges[layer][i];
+                            }
+                        }
+                        ++write_idx;
+                    }
+                }
+                layer_edges.resize(write_idx);
+                if (has_dense) {
+                    node.dense_edges[layer].resize(write_idx);
+                }
             }
         }
         mutation_generation_.fetch_add(1, std::memory_order_release);
@@ -1402,9 +1447,14 @@ private:
     static inline TestingAfterInsertPublishHook testing_after_insert_publish_hook_{};
 #endif
 
-    // Flat lookup table for O(1) node access during single-threaded construction.
-    // Indexed by external ID. Falls back to hash lookup if ID is out of range.
-    // Only populated by insert_single_threaded() and cleared on concurrent insert().
+    // Contiguous dense_id-indexed table of NodeType* pointers into nodes_.
+    // Always populated (for both dense and sparse external IDs) so hot-path
+    // search_layer / greedy_search / beam_search index a flat std::vector
+    // instead of hashing into std::unordered_map on every neighbor hop.
+    std::vector<NodeType*> dense_nodes_;
+
+    // Flat lookup table for O(1) node access by external ID when external IDs are dense.
+    // Falls back to hash lookup if ID is out of range.
     std::vector<NodeType*> flat_lookup_;
 
     // Atomic entry point (thread-safe updates)
@@ -1418,12 +1468,43 @@ private:
     size_t random_layer() { return rng_generator_.random_layer(config_.ml_factor); }
 
     void rebuild_dense_ids_unlocked() {
+        dense_nodes_.clear();
+        dense_nodes_.reserve(nodes_.size());
         size_t dense_id = 0;
         for (auto& [id, node] : nodes_) {
             (void)id;
             node.dense_id = dense_id++;
+            dense_nodes_.push_back(&node);
         }
         next_dense_id_.store(dense_id, std::memory_order_relaxed);
+        rebuild_dense_edges_unlocked();
+    }
+
+    void rebuild_dense_edges_unlocked() {
+        for (NodeType* node : dense_nodes_) {
+            if (!node) {
+                continue;
+            }
+            node->dense_edges.resize(node->edges.size());
+            for (size_t layer = 0; layer < node->edges.size(); ++layer) {
+                auto& ext_edges = node->edges[layer];
+                auto& d_edges = node->dense_edges[layer];
+                d_edges.clear();
+                d_edges.reserve(ext_edges.size());
+                size_t write_idx = 0;
+                for (size_t i = 0; i < ext_edges.size(); ++i) {
+                    auto it = nodes_.find(ext_edges[i]);
+                    if (it != nodes_.end()) {
+                        if (write_idx != i) {
+                            ext_edges[write_idx] = ext_edges[i];
+                        }
+                        d_edges.push_back(it->second.dense_id);
+                        ++write_idx;
+                    }
+                }
+                ext_edges.resize(write_idx);
+            }
+        }
     }
 
     void rebuild_flat_lookup_if_dense_unlocked() {
@@ -1477,6 +1558,33 @@ private:
     }
 
     template <bool ReadMostly>
+    decltype(auto) search_dense_neighbors(const NodeType& node, size_t layer) const {
+        if constexpr (ReadMostly) {
+            return node.neighbors_dense_unlocked(layer);
+        } else {
+            return node.neighbors_dense(layer);
+        }
+    }
+
+    [[nodiscard]] const NodeType* try_get_node_by_dense(size_t dense_id) const noexcept {
+        return (dense_id < dense_nodes_.size()) ? dense_nodes_[dense_id] : nullptr;
+    }
+
+    void prefetch_node_ptr(const NodeType* node) const noexcept {
+        if (node && !node->vector.empty()) {
+            HNSW_PREFETCH_READ(node->vector.data());
+            constexpr size_t kCacheLineSize = 64;
+            constexpr size_t kElementsPerCacheLine = kCacheLineSize / sizeof(StorageT);
+            if (node->vector.size() > kElementsPerCacheLine) {
+                HNSW_PREFETCH_READ(node->vector.data() + kElementsPerCacheLine);
+            }
+            if (node->vector.size() > 2 * kElementsPerCacheLine) {
+                HNSW_PREFETCH_READ(node->vector.data() + 2 * kElementsPerCacheLine);
+            }
+        }
+    }
+
+    template <bool ReadMostly>
     std::vector<std::pair<size_t, float>> search_with_filter_impl(
         std::span<const float> query, size_t k, size_t ef_search, const FilterFn& filter,
         std::span<const size_t> preferred_entries = {}, SearchStats* stats = nullptr) const {
@@ -1525,50 +1633,53 @@ private:
     }
 
     /// Greedy search without any locking (single-threaded insert path)
+    /// Uses flat dense_nodes_ indexing for O(1) neighbor resolution without hash lookups.
     size_t greedy_search_layer_unlocked(std::span<const float> query, size_t entry_point,
                                         size_t layer) const {
         const float kDistanceEpsilon =
             config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
 
-        size_t current = entry_point;
-        const auto* current_node = try_get_node(current);
+        const auto* current_node = try_get_node(entry_point);
         if (!current_node)
-            return current;
+            return entry_point;
+        size_t current_dense = current_node->dense_id;
         float current_dist = comparable_distance_query_node(query, *current_node);
 
         bool changed = true;
         while (changed) {
             changed = false;
-            const auto* node = try_get_node(current);
+            const auto* node = try_get_node_by_dense(current_dense);
             if (!node)
                 break;
 
-            const auto& neighbors = node->neighbors_unlocked(layer);
+            const auto& neighbors = node->neighbors_dense_unlocked(layer);
 
             if (!neighbors.empty()) {
-                prefetch_node(neighbors[0]);
+                prefetch_node_ptr(try_get_node_by_dense(neighbors[0]));
             }
 
             for (size_t i = 0; i < neighbors.size(); ++i) {
-                size_t neighbor = neighbors[i];
+                const size_t neighbor_dense = neighbors[i];
                 if (i + 1 < neighbors.size()) {
-                    prefetch_node(neighbors[i + 1]);
+                    prefetch_node_ptr(try_get_node_by_dense(neighbors[i + 1]));
                 }
-                const auto* neighbor_node = try_get_node(neighbor);
+                const auto* neighbor_node = try_get_node_by_dense(neighbor_dense);
                 if (!neighbor_node)
                     continue;
                 float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
                 if (!(neighbor_dist >= kDistanceEpsilon && neighbor_dist < current_dist))
                     continue;
-                current = neighbor;
+                current_dense = neighbor_dense;
                 current_dist = neighbor_dist;
                 changed = true;
             }
         }
-        return current;
+        const auto* best_node = try_get_node_by_dense(current_dense);
+        return best_node ? best_node->id : entry_point;
     }
 
     /// Beam search without any locking (single-threaded insert path)
+    /// Traverses purely by dense_id into contiguous dense_nodes_ (zero hash lookups per hop).
     std::vector<std::pair<size_t, float>> beam_search_layer_unlocked(std::span<const float> query,
                                                                      size_t entry_point, size_t ef,
                                                                      size_t layer) const {
@@ -1582,17 +1693,18 @@ private:
                             decltype(cmp_min)>
             candidates(cmp_min);
 
-        auto& visited = ThreadLocalVisitedPool::get(nodes_.size() + 1);
+        auto& visited = ThreadLocalVisitedPool::get(dense_nodes_.size() + 1);
 
         const auto* entry_node = try_get_node(entry_point);
         if (!entry_node)
             return {};
 
-        float entry_dist = comparable_distance_query_node(query, *entry_node);
-        candidates.emplace(entry_dist, entry_point);
-        size_t entry_dense = entry_node->dense_id;
-        if (entry_dense == kInvalidDenseId)
+        const size_t entry_dense = entry_node->dense_id;
+        if (entry_dense >= dense_nodes_.size())
             return {};
+
+        float entry_dist = comparable_distance_query_node(query, *entry_node);
+        candidates.emplace(entry_dist, entry_dense);
         visited.visit(entry_dense);
 
         const float kDistanceEpsilon =
@@ -1600,14 +1712,14 @@ private:
         if (entry_dist >= kDistanceEpsilon) {
             float entry_score =
                 config_.clamp_negative_distances ? std::max(0.0f, entry_dist) : entry_dist;
-            top_candidates.emplace(entry_score, entry_point);
+            top_candidates.emplace(entry_score, entry_dense);
         }
 
         while (!candidates.empty()) {
-            auto [current_dist, current_id] = candidates.top();
+            auto [current_dist, current_dense] = candidates.top();
             candidates.pop();
 
-            const auto* current_node = try_get_node(current_id);
+            const auto* current_node = try_get_node_by_dense(current_dense);
             if (!current_node)
                 continue;
 
@@ -1616,46 +1728,34 @@ private:
                 break;
             }
 
-            const auto& neighbors = current_node->neighbors_unlocked(layer);
+            const auto& neighbors = current_node->neighbors_dense_unlocked(layer);
 
-            // Prefetch first unvisited neighbor via flat lookup (O(1), no hash)
-            for (size_t neighbor : neighbors) {
-                const auto* neighbor_node = try_get_node(neighbor);
-                if (!neighbor_node)
-                    continue;
-                size_t neighbor_dense = neighbor_node->dense_id;
-                if (neighbor_dense == kInvalidDenseId)
+            // Prefetch first unvisited neighbor via direct dense_nodes_ index
+            for (size_t neighbor_dense : neighbors) {
+                if (neighbor_dense >= dense_nodes_.size())
                     continue;
                 if (!visited.is_visited(neighbor_dense)) {
-                    prefetch_node(neighbor);
+                    prefetch_node_ptr(dense_nodes_[neighbor_dense]);
                     break;
                 }
             }
 
             size_t prefetch_idx = 0;
             for (size_t i = 0; i < neighbors.size(); ++i) {
-                size_t neighbor = neighbors[i];
-                const auto* neighbor_node = try_get_node(neighbor);
-                if (!neighbor_node)
-                    continue;
-                size_t neighbor_dense = neighbor_node->dense_id;
-                if (neighbor_dense == kInvalidDenseId)
-                    continue;
-                if (visited.is_visited(neighbor_dense))
+                const size_t neighbor_dense = neighbors[i];
+                if (neighbor_dense >= dense_nodes_.size() || visited.is_visited(neighbor_dense))
                     continue;
                 visited.visit(neighbor_dense);
 
+                const auto* neighbor_node = dense_nodes_[neighbor_dense];
+                if (!neighbor_node)
+                    continue;
+
                 // Prefetch next unvisited neighbor
                 for (size_t j = i + 1; j < neighbors.size() && prefetch_idx <= i; ++j) {
-                    size_t next_neighbor = neighbors[j];
-                    const auto* next_node = try_get_node(next_neighbor);
-                    if (!next_node)
-                        continue;
-                    size_t next_dense = next_node->dense_id;
-                    if (next_dense == kInvalidDenseId)
-                        continue;
-                    if (!visited.is_visited(next_dense)) {
-                        prefetch_node(next_neighbor);
+                    const size_t next_dense = neighbors[j];
+                    if (next_dense < dense_nodes_.size() && !visited.is_visited(next_dense)) {
+                        prefetch_node_ptr(dense_nodes_[next_dense]);
                         prefetch_idx = j;
                         break;
                     }
@@ -1671,13 +1771,13 @@ private:
                 if (should_explore) {
                     float scored = config_.clamp_negative_distances ? std::max(0.0f, neighbor_dist)
                                                                     : neighbor_dist;
-                    candidates.emplace(scored, neighbor);
+                    candidates.emplace(scored, neighbor_dense);
                 }
 
                 if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
                     float scored = config_.clamp_negative_distances ? std::max(0.0f, neighbor_dist)
                                                                     : neighbor_dist;
-                    top_candidates.emplace(scored, neighbor);
+                    top_candidates.emplace(scored, neighbor_dense);
                     if (top_candidates.size() > ef) {
                         top_candidates.pop();
                     }
@@ -1688,9 +1788,9 @@ private:
         std::vector<std::pair<size_t, float>> result;
         result.reserve(top_candidates.size());
         while (!top_candidates.empty()) {
-            auto [dist, id] = top_candidates.top();
+            auto [dist, dense_id] = top_candidates.top();
             top_candidates.pop();
-            result.emplace_back(id, dist);
+            result.emplace_back(dense_nodes_[dense_id]->id, dist);
         }
 
         std::sort(result.begin(), result.end(),
@@ -1719,8 +1819,8 @@ private:
             if (!neighbor_ptr)
                 continue;
 
-            node_ptr->add_edge_unlocked(neighbor_id, layer);
-            neighbor_ptr->add_edge_unlocked(node_id, layer);
+            node_ptr->add_edge_unlocked(neighbor_id, layer, neighbor_ptr->dense_id);
+            neighbor_ptr->add_edge_unlocked(node_id, layer, node_ptr->dense_id);
 
             // Check neighbor degree and prune if needed
             if (neighbor_ptr->neighbors_unlocked(layer).size() > M_max) {
@@ -1817,55 +1917,60 @@ private:
         const float kDistanceEpsilon =
             config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
 
-        size_t current = entry_point;
-        const auto* current_node = try_get_node(current);
+        const auto* current_node = try_get_node(entry_point);
         if (!current_node)
-            return current;
+            return entry_point;
+        size_t current_dense = current_node->dense_id;
         float current_dist = comparable_distance_query_node(query, *current_node);
 
         auto passes_filter = [&](size_t id) { return !is_deleted_unlocked(id); };
-        size_t best_active = passes_filter(current) ? current : static_cast<size_t>(-1);
-        float best_active_dist =
-            passes_filter(current) ? current_dist : std::numeric_limits<float>::max();
+        size_t best_active_dense =
+            passes_filter(current_node->id) ? current_dense : kInvalidDenseId;
+        float best_active_dist = passes_filter(current_node->id)
+                                     ? current_dist
+                                     : std::numeric_limits<float>::max();
 
         bool changed = true;
         while (changed) {
             changed = false;
-            const auto* node = try_get_node(current);
+            const auto* node = try_get_node_by_dense(current_dense);
             if (!node)
                 break;
 
-            auto neighbors = node->neighbors(layer);
+            auto neighbors = node->neighbors_dense(layer);
 
             if (!neighbors.empty()) {
-                prefetch_node(neighbors[0]);
+                prefetch_node_ptr(try_get_node_by_dense(neighbors[0]));
             }
 
             for (size_t i = 0; i < neighbors.size(); ++i) {
-                size_t neighbor = neighbors[i];
+                const size_t neighbor_dense = neighbors[i];
                 if (i + 1 < neighbors.size()) {
-                    prefetch_node(neighbors[i + 1]);
+                    prefetch_node_ptr(try_get_node_by_dense(neighbors[i + 1]));
                 }
 
-                const auto* neighbor_node = try_get_node(neighbor);
+                const auto* neighbor_node = try_get_node_by_dense(neighbor_dense);
                 if (!neighbor_node)
                     continue;
 
                 float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
                 if (!(neighbor_dist >= kDistanceEpsilon && neighbor_dist < current_dist))
                     continue;
-                current = neighbor;
+                current_dense = neighbor_dense;
                 current_dist = neighbor_dist;
                 changed = true;
 
-                if (passes_filter(neighbor) && neighbor_dist < best_active_dist) {
-                    best_active = neighbor;
+                if (passes_filter(neighbor_node->id) && neighbor_dist < best_active_dist) {
+                    best_active_dense = neighbor_dense;
                     best_active_dist = neighbor_dist;
                 }
             }
         }
 
-        return (best_active != static_cast<size_t>(-1)) ? best_active : current;
+        const size_t chosen_dense =
+            (best_active_dense != kInvalidDenseId) ? best_active_dense : current_dense;
+        const auto* chosen_node = try_get_node_by_dense(chosen_dense);
+        return chosen_node ? chosen_node->id : entry_point;
     }
 
     std::vector<std::pair<size_t, float>> beam_search_layer_batch(std::span<const float> query,
@@ -1881,18 +1986,19 @@ private:
                             decltype(cmp_min)>
             candidates(cmp_min);
 
-        auto& visited = ThreadLocalVisitedPool::get(nodes_.size() + 1);
+        auto& visited = ThreadLocalVisitedPool::get(dense_nodes_.size() + 1);
 
         const auto* entry_node = try_get_node(entry_point);
         if (!entry_node)
             return {};
 
-        float entry_dist = comparable_distance_query_node(query, *entry_node);
-        candidates.emplace(entry_dist, entry_point);
-        size_t entry_dense = entry_node->dense_id;
-        if (entry_dense == kInvalidDenseId) {
+        const size_t entry_dense = entry_node->dense_id;
+        if (entry_dense >= dense_nodes_.size()) {
             return {};
         }
+
+        float entry_dist = comparable_distance_query_node(query, *entry_node);
+        candidates.emplace(entry_dist, entry_dense);
         visited.visit(entry_dense);
 
         auto passes_filter = [&](size_t id) { return !is_deleted_unlocked(id); };
@@ -1902,14 +2008,14 @@ private:
         if (passes_filter(entry_point) && entry_dist >= kDistanceEpsilon) {
             float entry_score =
                 config_.clamp_negative_distances ? std::max(0.0f, entry_dist) : entry_dist;
-            top_candidates.emplace(entry_score, entry_point);
+            top_candidates.emplace(entry_score, entry_dense);
         }
 
         while (!candidates.empty()) {
-            auto [current_dist, current_id] = candidates.top();
+            auto [current_dist, current_dense] = candidates.top();
             candidates.pop();
 
-            const auto* current_node = try_get_node(current_id);
+            const auto* current_node = try_get_node_by_dense(current_dense);
             if (!current_node)
                 continue;
 
@@ -1918,44 +2024,30 @@ private:
                 break;
             }
 
-            auto neighbors = current_node->neighbors(layer);
+            auto neighbors = current_node->neighbors_dense(layer);
 
-            for (size_t neighbor : neighbors) {
-                const auto* neighbor_node = try_get_node(neighbor);
-                if (!neighbor_node)
-                    continue;
-                size_t neighbor_dense = neighbor_node->dense_id;
-                if (neighbor_dense == kInvalidDenseId)
-                    continue;
-                if (!visited.is_visited(neighbor_dense)) {
-                    prefetch_node(neighbor);
+            for (size_t neighbor_dense : neighbors) {
+                if (neighbor_dense < dense_nodes_.size() && !visited.is_visited(neighbor_dense)) {
+                    prefetch_node_ptr(dense_nodes_[neighbor_dense]);
                     break;
                 }
             }
 
             size_t prefetch_idx = 0;
             for (size_t i = 0; i < neighbors.size(); ++i) {
-                size_t neighbor = neighbors[i];
-                const auto* neighbor_node = try_get_node(neighbor);
-                if (!neighbor_node)
-                    continue;
-                size_t neighbor_dense = neighbor_node->dense_id;
-                if (neighbor_dense == kInvalidDenseId)
-                    continue;
-                if (visited.is_visited(neighbor_dense))
+                const size_t neighbor_dense = neighbors[i];
+                if (neighbor_dense >= dense_nodes_.size() || visited.is_visited(neighbor_dense))
                     continue;
                 visited.visit(neighbor_dense);
 
+                const auto* neighbor_node = dense_nodes_[neighbor_dense];
+                if (!neighbor_node)
+                    continue;
+
                 for (size_t j = i + 1; j < neighbors.size() && prefetch_idx <= i; ++j) {
-                    size_t next_neighbor = neighbors[j];
-                    const auto* next_node = try_get_node(next_neighbor);
-                    if (!next_node)
-                        continue;
-                    size_t next_dense = next_node->dense_id;
-                    if (next_dense == kInvalidDenseId)
-                        continue;
-                    if (!visited.is_visited(next_dense)) {
-                        prefetch_node(next_neighbor);
+                    const size_t next_dense = neighbors[j];
+                    if (next_dense < dense_nodes_.size() && !visited.is_visited(next_dense)) {
+                        prefetch_node_ptr(dense_nodes_[next_dense]);
                         prefetch_idx = j;
                         break;
                     }
@@ -1971,15 +2063,15 @@ private:
                 if (should_explore) {
                     float scored = config_.clamp_negative_distances ? std::max(0.0f, neighbor_dist)
                                                                     : neighbor_dist;
-                    candidates.emplace(scored, neighbor);
+                    candidates.emplace(scored, neighbor_dense);
                 }
 
-                if (passes_filter(neighbor)) {
+                if (passes_filter(neighbor_node->id)) {
                     if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
                         float scored = config_.clamp_negative_distances
                                            ? std::max(0.0f, neighbor_dist)
                                            : neighbor_dist;
-                        top_candidates.emplace(scored, neighbor);
+                        top_candidates.emplace(scored, neighbor_dense);
                         if (top_candidates.size() > ef) {
                             top_candidates.pop();
                         }
@@ -1991,9 +2083,9 @@ private:
         std::vector<std::pair<size_t, float>> result;
         result.reserve(top_candidates.size());
         while (!top_candidates.empty()) {
-            auto [dist, id] = top_candidates.top();
+            auto [dist, dense_id] = top_candidates.top();
             top_candidates.pop();
-            result.emplace_back(id, dist);
+            result.emplace_back(dense_nodes_[dense_id]->id, dist);
         }
 
         std::sort(result.begin(), result.end(),
@@ -2014,10 +2106,10 @@ private:
         const float kDistanceEpsilon =
             config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
 
-        size_t current = entry_point;
-        const auto* initial_node = try_get_node(current);
+        const auto* initial_node = try_get_node(entry_point);
         if (!initial_node)
-            return current;
+            return entry_point;
+        size_t current_dense = initial_node->dense_id;
         float current_dist = comparable_distance_query_node(query, *initial_node);
         if (stats) {
             ++stats->distance_evals;
@@ -2029,36 +2121,38 @@ private:
                 return false;
             return !filter || (*filter)(id);
         };
-        size_t best_active = passes_filter(current) ? current : static_cast<size_t>(-1);
-        float best_active_dist =
-            passes_filter(current) ? current_dist : std::numeric_limits<float>::max();
+        size_t best_active_dense =
+            passes_filter(initial_node->id) ? current_dense : kInvalidDenseId;
+        float best_active_dist = passes_filter(initial_node->id)
+                                     ? current_dist
+                                     : std::numeric_limits<float>::max();
 
         bool changed = true;
         while (changed) {
             changed = false;
-            const auto* current_node = try_get_node(current);
+            const auto* current_node = try_get_node_by_dense(current_dense);
             if (!current_node)
                 break;
             if (stats) {
                 ++stats->hops;
             }
 
-            const auto& neighbors = search_neighbors<ReadMostly>(*current_node, layer);
+            const auto& neighbors = search_dense_neighbors<ReadMostly>(*current_node, layer);
 
-            // Prefetch first neighbor's vector data
+            // Prefetch first neighbor's vector data directly via dense_nodes_
             if (!neighbors.empty()) {
-                prefetch_node(neighbors[0]);
+                prefetch_node_ptr(try_get_node_by_dense(neighbors[0]));
             }
 
             for (size_t i = 0; i < neighbors.size(); ++i) {
-                size_t neighbor = neighbors[i];
+                const size_t neighbor_dense = neighbors[i];
 
                 // Prefetch next neighbor while computing distance for current
                 if (i + 1 < neighbors.size()) {
-                    prefetch_node(neighbors[i + 1]);
+                    prefetch_node_ptr(try_get_node_by_dense(neighbors[i + 1]));
                 }
 
-                const auto* neighbor_node = try_get_node(neighbor);
+                const auto* neighbor_node = try_get_node_by_dense(neighbor_dense);
                 if (!neighbor_node)
                     continue;
                 float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
@@ -2067,18 +2161,21 @@ private:
                 }
                 if (!(neighbor_dist >= kDistanceEpsilon && neighbor_dist < current_dist))
                     continue;
-                current = neighbor;
+                current_dense = neighbor_dense;
                 current_dist = neighbor_dist;
                 changed = true;
 
-                if (passes_filter(neighbor) && neighbor_dist < best_active_dist) {
-                    best_active = neighbor;
+                if (passes_filter(neighbor_node->id) && neighbor_dist < best_active_dist) {
+                    best_active_dense = neighbor_dense;
                     best_active_dist = neighbor_dist;
                 }
             }
         }
 
-        return (best_active != static_cast<size_t>(-1)) ? best_active : current;
+        const size_t chosen_dense =
+            (best_active_dense != kInvalidDenseId) ? best_active_dense : current_dense;
+        const auto* chosen_node = try_get_node_by_dense(chosen_dense);
+        return chosen_node ? chosen_node->id : entry_point;
     }
 
     /// Greedy search (read-only, called under shared lock)
@@ -2127,7 +2224,7 @@ private:
 
         // Use thread-local visited tracker instead of allocating unordered_set
         // This avoids heap allocation per search call
-        auto& visited = ThreadLocalVisitedPool::get(nodes_.size() + 1);
+        auto& visited = ThreadLocalVisitedPool::get(dense_nodes_.size() + 1);
 
         const bool check_deleted = !deleted_ids_.empty();
         auto passes_filter = [&](size_t id) {
@@ -2143,7 +2240,8 @@ private:
             config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
         const auto add_entry_point = [&](size_t id) {
             const auto* node = try_get_node(id);
-            if (!node || node->dense_id == kInvalidDenseId || visited.is_visited(node->dense_id)) {
+            if (!node || node->dense_id >= dense_nodes_.size() ||
+                visited.is_visited(node->dense_id)) {
                 return;
             }
             const float distance = comparable_distance_query_node(query, *node);
@@ -2155,14 +2253,15 @@ private:
             }
             const float score =
                 config_.clamp_negative_distances ? std::max(0.0f, distance) : distance;
-            visited.visit(node->dense_id);
-            candidates.emplace(score, id);
-            exploration_bound.emplace(score, id);
+            const size_t dense_id = node->dense_id;
+            visited.visit(dense_id);
+            candidates.emplace(score, dense_id);
+            exploration_bound.emplace(score, dense_id);
             if (exploration_bound.size() > ef) {
                 exploration_bound.pop();
             }
             if (passes_filter(id)) {
-                top_candidates.emplace(score, id);
+                top_candidates.emplace(score, dense_id);
                 if (top_candidates.size() > ef) {
                     top_candidates.pop();
                 }
@@ -2179,10 +2278,10 @@ private:
         }
 
         while (!candidates.empty()) {
-            auto [current_dist, current_id] = candidates.top();
+            auto [current_dist, current_dense] = candidates.top();
             candidates.pop();
 
-            const auto* current_node = try_get_node(current_id);
+            const auto* current_node = try_get_node_by_dense(current_dense);
             if (!current_node)
                 continue;
 
@@ -2194,49 +2293,33 @@ private:
                 ++stats->hops;
             }
 
-            // Get neighbors and filter out already-visited ones
-            const auto& neighbors = search_neighbors<ReadMostly>(*current_node, layer);
+            // Direct dense-ID neighbor list: zero hash lookups per hop
+            const auto& neighbors = search_dense_neighbors<ReadMostly>(*current_node, layer);
 
             // Prefetch first unvisited neighbor's vector data before entering loop
-            // This hides memory latency for the first distance calculation
-            for (size_t neighbor : neighbors) {
-                const auto* neighbor_node = try_get_node(neighbor);
-                if (!neighbor_node)
-                    continue;
-                size_t neighbor_dense = neighbor_node->dense_id;
-                if (neighbor_dense == kInvalidDenseId)
-                    continue;
-                if (!visited.is_visited(neighbor_dense)) {
-                    prefetch_node(neighbor);
+            for (size_t neighbor_dense : neighbors) {
+                if (neighbor_dense < dense_nodes_.size() && !visited.is_visited(neighbor_dense)) {
+                    prefetch_node_ptr(dense_nodes_[neighbor_dense]);
                     break;
                 }
             }
 
             size_t prefetch_idx = 0;
             for (size_t i = 0; i < neighbors.size(); ++i) {
-                size_t neighbor = neighbors[i];
-                const auto* neighbor_node = try_get_node(neighbor);
-                if (!neighbor_node)
-                    continue;
-                size_t neighbor_dense = neighbor_node->dense_id;
-                if (neighbor_dense == kInvalidDenseId)
-                    continue;
-                if (visited.is_visited(neighbor_dense))
+                const size_t neighbor_dense = neighbors[i];
+                if (neighbor_dense >= dense_nodes_.size() || visited.is_visited(neighbor_dense))
                     continue;
                 visited.visit(neighbor_dense);
 
+                const auto* neighbor_node = dense_nodes_[neighbor_dense];
+                if (!neighbor_node)
+                    continue;
+
                 // Prefetch next unvisited neighbor while we compute distance for current
-                // Look ahead to find the next neighbor that hasn't been visited
                 for (size_t j = i + 1; j < neighbors.size() && prefetch_idx <= i; ++j) {
-                    size_t next_neighbor = neighbors[j];
-                    const auto* next_node = try_get_node(next_neighbor);
-                    if (!next_node)
-                        continue;
-                    size_t next_dense = next_node->dense_id;
-                    if (next_dense == kInvalidDenseId)
-                        continue;
-                    if (!visited.is_visited(next_dense)) {
-                        prefetch_node(next_neighbor);
+                    const size_t next_dense = neighbors[j];
+                    if (next_dense < dense_nodes_.size() && !visited.is_visited(next_dense)) {
+                        prefetch_node_ptr(dense_nodes_[next_dense]);
                         prefetch_idx = j;
                         break;
                     }
@@ -2256,19 +2339,19 @@ private:
                     float candidate_score = config_.clamp_negative_distances
                                                 ? std::max(0.0f, neighbor_dist)
                                                 : neighbor_dist;
-                    candidates.emplace(candidate_score, neighbor);
-                    exploration_bound.emplace(candidate_score, neighbor);
+                    candidates.emplace(candidate_score, neighbor_dense);
+                    exploration_bound.emplace(candidate_score, neighbor_dense);
                     if (exploration_bound.size() > ef) {
                         exploration_bound.pop();
                     }
                 }
 
-                if (passes_filter(neighbor)) {
+                if (passes_filter(neighbor_node->id)) {
                     if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
                         float top_score = config_.clamp_negative_distances
                                               ? std::max(0.0f, neighbor_dist)
                                               : neighbor_dist;
-                        top_candidates.emplace(top_score, neighbor);
+                        top_candidates.emplace(top_score, neighbor_dense);
                         if (top_candidates.size() > ef) {
                             top_candidates.pop();
                         }
@@ -2282,10 +2365,10 @@ private:
         std::vector<std::pair<size_t, float>> result;
         result.reserve(top_candidates.size());
         while (!top_candidates.empty()) {
-            auto [dist, id] = top_candidates.top();
+            auto [dist, dense_id] = top_candidates.top();
             top_candidates.pop();
             // Distances are already clamped to >= 0 when added
-            result.emplace_back(id, dist);
+            result.emplace_back(dense_nodes_[dense_id]->id, dist);
         }
 
         std::sort(result.begin(), result.end(),
@@ -2357,23 +2440,24 @@ private:
                                                        stats);
         }
 
-        // Stage 2: Beam search at layer 0 using quantized distances
+        // Stage 2: Beam search at layer 0 using quantized distances (returns (dense_id, approx_d))
         auto approx_candidates = beam_search_layer_quantized(
             effective_query, current, expanded_ef, 0, filter_ptr, approx_dist, prefetch_fn, stats);
 
-        // Stage 3: Rerank with exact FP32 distances
+        // Stage 3: Rerank with exact FP32 distances via direct dense_nodes_ index
         std::vector<std::pair<size_t, float>> reranked;
         reranked.reserve(approx_candidates.size());
 
-        for (const auto& [id, approx_d] : approx_candidates) {
-            const auto* node = try_get_node(id);
+        for (const auto& [dense_id, approx_d] : approx_candidates) {
+            (void)approx_d;
+            const auto* node = try_get_node_by_dense(dense_id);
             if (!node)
                 continue;
             float exact_dist = distance_query_node(effective_query, *node);
             if (stats) {
                 ++stats->rerank_evals;
             }
-            reranked.emplace_back(id, exact_dist);
+            reranked.emplace_back(node->id, exact_dist);
         }
 
         std::sort(reranked.begin(), reranked.end(),
@@ -2388,7 +2472,8 @@ private:
 
     /// Beam search using a user-supplied approximate distance function.
     /// Runs inside the HNSW internals with visited pool, prefetching, and
-    /// read-mostly unlocked neighbor access — the same hot path as standard search.
+    /// dense-ID neighbor access — zero hash lookups per hop.
+    /// Returns (dense_id, approx_dist) pairs sorted by approx_dist.
     ///
     /// @tparam ApproxDistFn float(std::span<const float> query, size_t dense_id)
     /// @tparam PrefetchFn void(size_t dense_id)
@@ -2411,25 +2496,33 @@ private:
                             decltype(cmp_min)>
             candidates(cmp_min);
 
-        auto& visited = ThreadLocalVisitedPool::get(nodes_.size() + 1);
+        auto& visited = ThreadLocalVisitedPool::get(dense_nodes_.size() + 1);
 
         const auto* entry_node = try_get_node(entry_point);
         if (!entry_node)
             return {};
 
-        size_t entry_dense = entry_node->dense_id;
-        if (entry_dense == kInvalidDenseId)
+        const size_t entry_dense = entry_node->dense_id;
+        if (entry_dense >= dense_nodes_.size())
             return {};
 
         float entry_dist = approx_dist(query, entry_dense);
         if (stats) {
             ++stats->distance_evals;
         }
-        candidates.emplace(entry_dist, entry_point);
+        candidates.emplace(entry_dist, entry_dense);
         visited.visit(entry_dense);
 
-        auto passes_filter = [&](size_t id) {
-            return !is_deleted_unlocked(id) && (!filter || (*filter)(id));
+        const bool check_deleted = !deleted_ids_.empty();
+        auto passes_filter_dense = [&](size_t dense_id) {
+            if (!check_deleted && !filter)
+                return true;
+            const auto* n = dense_nodes_[dense_id];
+            if (!n)
+                return false;
+            if (check_deleted && is_deleted_unlocked(n->id))
+                return false;
+            return !filter || (*filter)(n->id);
         };
 
         const float kDistanceEpsilon =
@@ -2438,19 +2531,19 @@ private:
         if (entry_dist >= kDistanceEpsilon) {
             float score =
                 config_.clamp_negative_distances ? std::max(0.0f, entry_dist) : entry_dist;
-            exploration_bound.emplace(score, entry_point);
-            if (passes_filter(entry_point)) {
-                top_candidates.emplace(score, entry_point);
+            exploration_bound.emplace(score, entry_dense);
+            if (passes_filter_dense(entry_dense)) {
+                top_candidates.emplace(score, entry_dense);
             } else if (stats) {
                 ++stats->filter_rejections;
             }
         }
 
         while (!candidates.empty()) {
-            auto [current_dist, current_id] = candidates.top();
+            auto [current_dist, current_dense] = candidates.top();
             candidates.pop();
 
-            const auto* current_node = try_get_node(current_id);
+            const auto* current_node = try_get_node_by_dense(current_dense);
             if (!current_node)
                 continue;
 
@@ -2462,18 +2555,13 @@ private:
                 ++stats->hops;
             }
 
-            // Read-mostly: direct reference, no mutex, no copy
-            const auto& neighbors = current_node->neighbors_unlocked(layer);
+            // Read-mostly direct dense-ID neighbor list: zero hash lookups & zero node derefs
+            // needed to check visited or prefetch quantized codes.
+            const auto& neighbors = current_node->neighbors_dense_unlocked(layer);
 
             // Prefetch first unvisited neighbor's quantized codes
-            for (size_t neighbor : neighbors) {
-                const auto* neighbor_node = try_get_node(neighbor);
-                if (!neighbor_node)
-                    continue;
-                size_t neighbor_dense = neighbor_node->dense_id;
-                if (neighbor_dense == kInvalidDenseId)
-                    continue;
-                if (!visited.is_visited(neighbor_dense)) {
+            for (size_t neighbor_dense : neighbors) {
+                if (neighbor_dense < dense_nodes_.size() && !visited.is_visited(neighbor_dense)) {
                     prefetch_fn(neighbor_dense);
                     break;
                 }
@@ -2481,26 +2569,15 @@ private:
 
             size_t prefetch_idx = 0;
             for (size_t i = 0; i < neighbors.size(); ++i) {
-                size_t neighbor = neighbors[i];
-                const auto* neighbor_node = try_get_node(neighbor);
-                if (!neighbor_node)
-                    continue;
-                size_t neighbor_dense = neighbor_node->dense_id;
-                if (neighbor_dense == kInvalidDenseId)
-                    continue;
-                if (visited.is_visited(neighbor_dense))
+                const size_t neighbor_dense = neighbors[i];
+                if (neighbor_dense >= dense_nodes_.size() || visited.is_visited(neighbor_dense))
                     continue;
                 visited.visit(neighbor_dense);
 
                 // Prefetch next unvisited neighbor's quantized codes
                 for (size_t j = i + 1; j < neighbors.size() && prefetch_idx <= i; ++j) {
-                    const auto* next_node = try_get_node(neighbors[j]);
-                    if (!next_node)
-                        continue;
-                    size_t next_dense = next_node->dense_id;
-                    if (next_dense == kInvalidDenseId)
-                        continue;
-                    if (!visited.is_visited(next_dense)) {
+                    const size_t next_dense = neighbors[j];
+                    if (next_dense < dense_nodes_.size() && !visited.is_visited(next_dense)) {
                         prefetch_fn(next_dense);
                         prefetch_idx = j;
                         break;
@@ -2520,19 +2597,19 @@ private:
                 if (should_explore) {
                     float score = config_.clamp_negative_distances ? std::max(0.0f, neighbor_dist)
                                                                    : neighbor_dist;
-                    candidates.emplace(score, neighbor);
-                    exploration_bound.emplace(score, neighbor);
+                    candidates.emplace(score, neighbor_dense);
+                    exploration_bound.emplace(score, neighbor_dense);
                     if (exploration_bound.size() > ef) {
                         exploration_bound.pop();
                     }
                 }
 
-                if (passes_filter(neighbor)) {
+                if (passes_filter_dense(neighbor_dense)) {
                     if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
                         float top_score = config_.clamp_negative_distances
                                               ? std::max(0.0f, neighbor_dist)
                                               : neighbor_dist;
-                        top_candidates.emplace(top_score, neighbor);
+                        top_candidates.emplace(top_score, neighbor_dense);
                         if (top_candidates.size() > ef) {
                             top_candidates.pop();
                         }
@@ -2546,9 +2623,9 @@ private:
         std::vector<std::pair<size_t, float>> result;
         result.reserve(top_candidates.size());
         while (!top_candidates.empty()) {
-            auto [dist, id] = top_candidates.top();
+            auto [dist, dense_id] = top_candidates.top();
             top_candidates.pop();
-            result.emplace_back(id, dist);
+            result.emplace_back(dense_id, dist);
         }
 
         std::sort(result.begin(), result.end(),
@@ -2579,8 +2656,8 @@ private:
             if (!neighbor_ptr)
                 continue;
 
-            node_ptr->add_edge(neighbor_id, layer);
-            neighbor_ptr->add_edge(node_id, layer);
+            node_ptr->add_edge(neighbor_id, layer, neighbor_ptr->dense_id);
+            neighbor_ptr->add_edge(node_id, layer, node_ptr->dense_id);
 
             if (neighbor_ptr->neighbors(layer).size() > M_max) {
                 prune_connections(neighbor_id, layer);

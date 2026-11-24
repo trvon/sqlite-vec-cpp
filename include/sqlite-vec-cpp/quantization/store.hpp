@@ -30,6 +30,8 @@
 namespace sqlite_vec_cpp::quantization {
 
 /// Flat storage for LVQ-8 codes indexed by dense_id
+/// Supports optional Aguerrebere et al. (2023) dataset mean-centering (centroid_)
+/// and fused 3-op FMA inner loops ((q - offset) - c * scale)^2.
 struct LVQ8Store {
     /// Contiguous code storage: codes[dense_id * dim .. (dense_id+1) * dim]
     std::vector<uint8_t> codes;
@@ -39,17 +41,90 @@ struct LVQ8Store {
     std::vector<float> inv_scales;
     /// Per-vector offsets: offsets[dense_id]
     std::vector<float> offsets;
+    /// Optional dataset centroid for mean-centered LVQ (empty when uncentered)
+    std::vector<float> centroid_;
     /// Dimensionality
     size_t dim = 0;
     /// Number of vectors stored
     size_t count = 0;
 
-    /// Build from a locked quantization snapshot (preferred — no live graph iteration)
-    void build(const index::QuantizationSnapshot& snap) {
+    /// Precomputed query state (centers query once per search when mean-centered)
+    struct QueryState {
+        std::vector<float> query;
+    };
+
+    /// Whether dataset mean-centering is active
+    [[nodiscard]] bool is_centered() const noexcept { return !centroid_.empty(); }
+
+    /// Access the fitted dataset centroid (empty if uncentered)
+    [[nodiscard]] const std::vector<float>& centroid() const noexcept { return centroid_; }
+
+    /// Compute and store dataset mean centroid from a snapshot
+    void fit_centroid(const index::QuantizationSnapshot& snap) {
+        if (snap.entries.empty() || snap.dim == 0) {
+            centroid_.clear();
+            return;
+        }
+        dim = snap.dim;
+        centroid_.assign(dim, 0.0f);
+        for (const auto& e : snap.entries) {
+            for (size_t i = 0; i < dim; ++i) {
+                centroid_[i] += e.vector[i];
+            }
+        }
+        const float inv_n = 1.0f / static_cast<float>(snap.entries.size());
+        for (size_t i = 0; i < dim; ++i) {
+            centroid_[i] *= inv_n;
+        }
+    }
+
+    /// Set an explicit dataset centroid for mean-centered LVQ
+    void set_centroid(std::span<const float> c) {
+        centroid_.assign(c.begin(), c.end());
+        if (!centroid_.empty()) {
+            dim = centroid_.size();
+        }
+    }
+
+    /// Disable mean-centering
+    void clear_centroid() { centroid_.clear(); }
+
+    /// Add or overwrite a single vector at dense_id (works centered or uncentered)
+    void add(size_t dense_id, std::span<const float> vec) {
+        assert(!vec.empty());
+        if (dim == 0) {
+            dim = vec.size();
+        }
+        assert(vec.size() == dim);
+        if (dense_id >= count) {
+            count = dense_id + 1;
+            codes.resize(count * dim, 0);
+            scales.resize(count, 0.0f);
+            inv_scales.resize(count, 0.0f);
+            offsets.resize(count, 0.0f);
+        }
+        auto code = is_centered() ? LVQ8::encode_centered(vec, std::span<const float>(centroid_))
+                                  : LVQ8::encode(vec);
+        const size_t base = dense_id * dim;
+        std::copy(code.codes.begin(), code.codes.end(), codes.begin() + base);
+        scales[dense_id] = code.scale;
+        inv_scales[dense_id] = code.scale > 0.0f ? (1.0f / code.scale) : 0.0f;
+        offsets[dense_id] = code.offset;
+    }
+
+    /// Build from a locked quantization snapshot (preferred — no live graph iteration).
+    /// Set center_mean=true (or call fit_centroid() beforehand) to enable mean-centered LVQ.
+    void build(const index::QuantizationSnapshot& snap, bool center_mean = false) {
         if (snap.entries.empty())
             return;
 
         dim = snap.dim;
+        if (center_mean) {
+            fit_centroid(snap);
+        } else if (centroid_.size() != dim) {
+            centroid_.clear();
+        }
+
         size_t max_dense_id = 0;
         for (const auto& e : snap.entries)
             max_dense_id = std::max(max_dense_id, e.dense_id);
@@ -60,14 +135,44 @@ struct LVQ8Store {
         inv_scales.resize(count, 0.0f);
         offsets.resize(count, 0.0f);
 
+        const bool centered = is_centered();
         for (const auto& e : snap.entries) {
-            auto code = LVQ8::encode(std::span<const float>(e.vector));
+            auto code =
+                centered ? LVQ8::encode_centered(std::span<const float>(e.vector),
+                                                 std::span<const float>(centroid_))
+                         : LVQ8::encode(std::span<const float>(e.vector));
             size_t offset = e.dense_id * dim;
             std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
             scales[e.dense_id] = code.scale;
             inv_scales[e.dense_id] = code.scale > 0.0f ? (1.0f / code.scale) : 0.0f;
             offsets[e.dense_id] = code.offset;
         }
+    }
+
+    /// Prepare query once per search (subtracts centroid_ if centered)
+    [[nodiscard]] QueryState prepare_query(std::span<const float> query) const {
+        assert(query.size() == dim);
+        QueryState qs;
+        qs.query.resize(dim);
+        if (is_centered()) {
+            for (size_t i = 0; i < dim; ++i) {
+                qs.query[i] = query[i] - centroid_[i];
+            }
+        } else {
+            std::copy(query.begin(), query.end(), qs.query.begin());
+        }
+        return qs;
+    }
+
+    /// Estimate squared L2 distance using precomputed QueryState (fastest path)
+    [[nodiscard]] float l2_distance_squared(const QueryState& qs, size_t dense_id) const {
+        assert(dense_id < count);
+        assert(qs.query.size() == dim);
+
+        const float scale = scales[dense_id];
+        const float offset = offsets[dense_id];
+        const uint8_t* code_ptr = codes.data() + dense_id * dim;
+        return l2_sq_fused_impl(qs.query.data(), code_ptr, dim, scale, offset);
     }
 
     /// Estimate squared L2 distance between float query and quantized vector at dense_id
@@ -79,19 +184,48 @@ struct LVQ8Store {
         const float offset = offsets[dense_id];
         const uint8_t* code_ptr = codes.data() + dense_id * dim;
 
-        if (scale == 0.0f) {
-            float sum = 0.0f;
-            for (size_t i = 0; i < dim; ++i) {
-                float diff = query[i] - offset;
-                sum += diff * diff;
-            }
-            return sum;
+        if (!is_centered()) {
+            return l2_sq_fused_impl(query.data(), code_ptr, dim, scale, offset);
         }
 
-        const float inv_scale =
-            (dense_id < inv_scales.size()) ? inv_scales[dense_id] : (1.0f / scale);
-        float sum_sq = l2_sq_impl(query.data(), code_ptr, dim, inv_scale, offset);
-        return sum_sq * scale * scale;
+        alignas(32) float stack_buf[1536];
+        std::vector<float> heap_buf;
+        float* q_centered = stack_buf;
+        if (dim > 1536) {
+            heap_buf.resize(dim);
+            q_centered = heap_buf.data();
+        }
+        for (size_t i = 0; i < dim; ++i) {
+            q_centered[i] = query[i] - centroid_[i];
+        }
+        return l2_sq_fused_impl(q_centered, code_ptr, dim, scale, offset);
+    }
+
+    /// Scalar reference squared L2 distance (for SIMD-vs-scalar parity testing)
+    [[nodiscard]] float l2_distance_squared_scalar(std::span<const float> query,
+                                                   size_t dense_id) const {
+        assert(dense_id < count);
+        assert(query.size() == dim);
+
+        const float scale = scales[dense_id];
+        const float offset = offsets[dense_id];
+        const uint8_t* code_ptr = codes.data() + dense_id * dim;
+
+        if (!is_centered()) {
+            return l2_sq_fused_scalar(query.data(), code_ptr, dim, scale, offset);
+        }
+        float sum = 0.0f;
+        for (size_t i = 0; i < dim; ++i) {
+            const float diff =
+                ((query[i] - centroid_[i]) - offset) - static_cast<float>(code_ptr[i]) * scale;
+            sum += diff * diff;
+        }
+        return sum;
+    }
+
+    /// Estimate L2 distance using precomputed QueryState
+    [[nodiscard]] float l2_distance(const QueryState& qs, size_t dense_id) const {
+        return std::sqrt(l2_distance_squared(qs, dense_id));
     }
 
     /// Estimate L2 distance between float query and quantized vector at dense_id
@@ -112,28 +246,28 @@ struct LVQ8Store {
     /// Memory usage in bytes
     [[nodiscard]] size_t memory_bytes() const {
         return codes.size() + scales.size() * sizeof(float) + inv_scales.size() * sizeof(float) +
-               offsets.size() * sizeof(float);
+               offsets.size() * sizeof(float) + centroid_.size() * sizeof(float);
     }
 
 private:
-    static float l2_sq_impl(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
-                            float offset) {
+    static float l2_sq_fused_impl(const float* query, const uint8_t* codes, size_t dim, float scale,
+                                  float offset) {
 #ifdef SQLITE_VEC_ENABLE_AVX2
         if (dim >= 8) {
-            return l2_sq_avx2(query, codes, dim, inv_scale, offset);
+            return l2_sq_fused_avx2(query, codes, dim, scale, offset);
         }
 #endif
 #ifdef SQLITE_VEC_ENABLE_NEON
         if (dim >= 16) {
-            return l2_sq_neon(query, codes, dim, inv_scale, offset);
+            return l2_sq_fused_neon(query, codes, dim, scale, offset);
         }
 #endif
 #ifdef SQLITE_VEC_X86_RUNTIME_DISPATCH
         if (dim >= 8 && distances::x86::cpu_has_avx2_fma()) {
-            return distances::x86::lvq8_l2_sq_avx2(query, codes, dim, inv_scale, offset);
+            return distances::x86::lvq8_l2_sq_fused_avx2(query, codes, dim, scale, offset);
         }
 #endif
-        return l2_sq_scalar(query, codes, dim, inv_scale, offset);
+        return l2_sq_fused_scalar(query, codes, dim, scale, offset);
     }
 
 #ifdef SQLITE_VEC_ENABLE_AVX2
@@ -148,10 +282,10 @@ private:
         return _mm_cvtss_f32(sums);
     }
 
-    static float l2_sq_avx2(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
-                            float offset) {
+    static float l2_sq_fused_avx2(const float* query, const uint8_t* codes, size_t dim, float scale,
+                                  float offset) {
         const __m256 voffset = _mm256_set1_ps(offset);
-        const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
+        const __m256 vscale = _mm256_set1_ps(scale);
         __m256 sum0 = _mm256_setzero_ps();
         __m256 sum1 = _mm256_setzero_ps();
 
@@ -162,17 +296,17 @@ private:
             const __m256 c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes0));
             const __m256 c1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes1));
 
-            const __m256 q0 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i), voffset),
-                                            vinv_scale);
-            const __m256 q1 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i + 8), voffset),
-                                            vinv_scale);
+            const __m256 q0 = _mm256_sub_ps(_mm256_loadu_ps(query + i), voffset);
+            const __m256 q1 = _mm256_sub_ps(_mm256_loadu_ps(query + i + 8), voffset);
 
-            const __m256 d0 = _mm256_sub_ps(q0, c0);
-            const __m256 d1 = _mm256_sub_ps(q1, c1);
 #ifdef SQLITE_VEC_ENABLE_FMA
+            const __m256 d0 = _mm256_fnmadd_ps(c0, vscale, q0);
+            const __m256 d1 = _mm256_fnmadd_ps(c1, vscale, q1);
             sum0 = _mm256_fmadd_ps(d0, d0, sum0);
             sum1 = _mm256_fmadd_ps(d1, d1, sum1);
 #else
+            const __m256 d0 = _mm256_sub_ps(q0, _mm256_mul_ps(c0, vscale));
+            const __m256 d1 = _mm256_sub_ps(q1, _mm256_mul_ps(c1, vscale));
             sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(d0, d0));
             sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(d1, d1));
 #endif
@@ -180,44 +314,42 @@ private:
         for (; i + 8 <= dim; i += 8) {
             const __m128i bytes0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes + i));
             const __m256 c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes0));
-            const __m256 q0 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i), voffset),
-                                            vinv_scale);
-            const __m256 d0 = _mm256_sub_ps(q0, c0);
+            const __m256 q0 = _mm256_sub_ps(_mm256_loadu_ps(query + i), voffset);
 #ifdef SQLITE_VEC_ENABLE_FMA
+            const __m256 d0 = _mm256_fnmadd_ps(c0, vscale, q0);
             sum0 = _mm256_fmadd_ps(d0, d0, sum0);
 #else
+            const __m256 d0 = _mm256_sub_ps(q0, _mm256_mul_ps(c0, vscale));
             sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(d0, d0));
 #endif
         }
 
         float sum = hsum256(_mm256_add_ps(sum0, sum1));
         for (; i < dim; ++i) {
-            const float q_normalized = (query[i] - offset) * inv_scale;
-            const float diff = q_normalized - static_cast<float>(codes[i]);
+            const float diff = (query[i] - offset) - static_cast<float>(codes[i]) * scale;
             sum += diff * diff;
         }
         return sum;
     }
 #endif
 
-    static float l2_sq_scalar(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
-                              float offset) {
+    static float l2_sq_fused_scalar(const float* query, const uint8_t* codes, size_t dim,
+                                    float scale, float offset) {
         float sum = 0.0f;
         for (size_t i = 0; i < dim; ++i) {
-            float q_normalized = (query[i] - offset) * inv_scale;
-            float diff = q_normalized - static_cast<float>(codes[i]);
+            const float diff = (query[i] - offset) - static_cast<float>(codes[i]) * scale;
             sum += diff * diff;
         }
         return sum;
     }
 
 #ifdef SQLITE_VEC_ENABLE_NEON
-    static float l2_sq_neon(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
-                            float offset) {
+    static float l2_sq_fused_neon(const float* query, const uint8_t* codes, size_t dim, float scale,
+                                  float offset) {
         const size_t end16 = (dim / 16) * 16;
 
         float32x4_t voffset = vdupq_n_f32(offset);
-        float32x4_t vinv_scale = vdupq_n_f32(inv_scale);
+        float32x4_t vscale = vdupq_n_f32(scale);
         float32x4_t sum0 = vdupq_n_f32(0.0f);
         float32x4_t sum1 = vdupq_n_f32(0.0f);
         float32x4_t sum2 = vdupq_n_f32(0.0f);
@@ -235,15 +367,15 @@ private:
             float32x4_t c2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16)));
             float32x4_t c3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16)));
 
-            float32x4_t q0 = vmulq_f32(vsubq_f32(vld1q_f32(query + i), voffset), vinv_scale);
-            float32x4_t q1 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 4), voffset), vinv_scale);
-            float32x4_t q2 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 8), voffset), vinv_scale);
-            float32x4_t q3 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 12), voffset), vinv_scale);
+            float32x4_t q0 = vsubq_f32(vld1q_f32(query + i), voffset);
+            float32x4_t q1 = vsubq_f32(vld1q_f32(query + i + 4), voffset);
+            float32x4_t q2 = vsubq_f32(vld1q_f32(query + i + 8), voffset);
+            float32x4_t q3 = vsubq_f32(vld1q_f32(query + i + 12), voffset);
 
-            float32x4_t d0 = vsubq_f32(q0, c0);
-            float32x4_t d1 = vsubq_f32(q1, c1);
-            float32x4_t d2 = vsubq_f32(q2, c2);
-            float32x4_t d3 = vsubq_f32(q3, c3);
+            float32x4_t d0 = vfmsq_f32(q0, c0, vscale);
+            float32x4_t d1 = vfmsq_f32(q1, c1, vscale);
+            float32x4_t d2 = vfmsq_f32(q2, c2, vscale);
+            float32x4_t d3 = vfmsq_f32(q3, c3, vscale);
 
             sum0 = vfmaq_f32(sum0, d0, d0);
             sum1 = vfmaq_f32(sum1, d1, d1);
@@ -257,8 +389,7 @@ private:
         float sum = vaddvq_f32(total);
 
         while (i < dim) {
-            float q_normalized = (query[i] - offset) * inv_scale;
-            float diff = q_normalized - static_cast<float>(codes[i]);
+            const float diff = (query[i] - offset) - static_cast<float>(codes[i]) * scale;
             sum += diff * diff;
             ++i;
         }
@@ -269,7 +400,9 @@ private:
 };
 
 /// Flat storage for LVQ-4 codes indexed by dense_id
-/// Each vector is packed: 2 nibbles per byte, so bytes_per_vec = (dim + 1) / 2
+/// Each vector is packed: 2 nibbles per byte, so bytes_per_vec = (dim + 1) / 2.
+/// Supports optional Aguerrebere et al. (2023) dataset mean-centering (centroid_)
+/// and fused 3-op FMA inner loops ((q - offset) - c * scale)^2.
 struct LVQ4Store {
     /// Contiguous packed code storage: codes[dense_id * bytes_per_vec .. ]
     std::vector<uint8_t> codes;
@@ -279,6 +412,8 @@ struct LVQ4Store {
     std::vector<float> inv_scales;
     /// Per-vector offsets
     std::vector<float> offsets;
+    /// Optional dataset centroid for mean-centered LVQ (empty when uncentered)
+    std::vector<float> centroid_;
     /// Dimensionality
     size_t dim = 0;
     /// Packed bytes per vector
@@ -286,13 +421,87 @@ struct LVQ4Store {
     /// Number of vectors stored
     size_t count = 0;
 
-    /// Build from a locked quantization snapshot (preferred — no live graph iteration)
-    void build(const index::QuantizationSnapshot& snap) {
+    /// Precomputed query state (centers query once per search when mean-centered)
+    struct QueryState {
+        std::vector<float> query;
+    };
+
+    /// Whether dataset mean-centering is active
+    [[nodiscard]] bool is_centered() const noexcept { return !centroid_.empty(); }
+
+    /// Access the fitted dataset centroid (empty if uncentered)
+    [[nodiscard]] const std::vector<float>& centroid() const noexcept { return centroid_; }
+
+    /// Compute and store dataset mean centroid from a snapshot
+    void fit_centroid(const index::QuantizationSnapshot& snap) {
+        if (snap.entries.empty() || snap.dim == 0) {
+            centroid_.clear();
+            return;
+        }
+        dim = snap.dim;
+        bytes_per_vec = (dim + 1) / 2;
+        centroid_.assign(dim, 0.0f);
+        for (const auto& e : snap.entries) {
+            for (size_t i = 0; i < dim; ++i) {
+                centroid_[i] += e.vector[i];
+            }
+        }
+        const float inv_n = 1.0f / static_cast<float>(snap.entries.size());
+        for (size_t i = 0; i < dim; ++i) {
+            centroid_[i] *= inv_n;
+        }
+    }
+
+    /// Set an explicit dataset centroid for mean-centered LVQ
+    void set_centroid(std::span<const float> c) {
+        centroid_.assign(c.begin(), c.end());
+        if (!centroid_.empty()) {
+            dim = centroid_.size();
+            bytes_per_vec = (dim + 1) / 2;
+        }
+    }
+
+    /// Disable mean-centering
+    void clear_centroid() { centroid_.clear(); }
+
+    /// Add or overwrite a single vector at dense_id (works centered or uncentered)
+    void add(size_t dense_id, std::span<const float> vec) {
+        assert(!vec.empty());
+        if (dim == 0) {
+            dim = vec.size();
+            bytes_per_vec = (dim + 1) / 2;
+        }
+        assert(vec.size() == dim);
+        if (dense_id >= count) {
+            count = dense_id + 1;
+            codes.resize(count * bytes_per_vec, 0);
+            scales.resize(count, 0.0f);
+            inv_scales.resize(count, 0.0f);
+            offsets.resize(count, 0.0f);
+        }
+        auto code = is_centered() ? LVQ4::encode_centered(vec, std::span<const float>(centroid_))
+                                  : LVQ4::encode(vec);
+        const size_t base = dense_id * bytes_per_vec;
+        std::copy(code.codes.begin(), code.codes.end(), codes.begin() + base);
+        scales[dense_id] = code.scale;
+        inv_scales[dense_id] = code.scale > 0.0f ? (1.0f / code.scale) : 0.0f;
+        offsets[dense_id] = code.offset;
+    }
+
+    /// Build from a locked quantization snapshot (preferred — no live graph iteration).
+    /// Set center_mean=true (or call fit_centroid() beforehand) to enable mean-centered LVQ.
+    void build(const index::QuantizationSnapshot& snap, bool center_mean = false) {
         if (snap.entries.empty())
             return;
 
         dim = snap.dim;
         bytes_per_vec = (dim + 1) / 2;
+        if (center_mean) {
+            fit_centroid(snap);
+        } else if (centroid_.size() != dim) {
+            centroid_.clear();
+        }
+
         size_t max_dense_id = 0;
         for (const auto& e : snap.entries)
             max_dense_id = std::max(max_dense_id, e.dense_id);
@@ -303,14 +512,44 @@ struct LVQ4Store {
         inv_scales.resize(count, 0.0f);
         offsets.resize(count, 0.0f);
 
+        const bool centered = is_centered();
         for (const auto& e : snap.entries) {
-            auto code = LVQ4::encode(std::span<const float>(e.vector));
+            auto code =
+                centered ? LVQ4::encode_centered(std::span<const float>(e.vector),
+                                                 std::span<const float>(centroid_))
+                         : LVQ4::encode(std::span<const float>(e.vector));
             size_t offset = e.dense_id * bytes_per_vec;
             std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
             scales[e.dense_id] = code.scale;
             inv_scales[e.dense_id] = code.scale > 0.0f ? (1.0f / code.scale) : 0.0f;
             offsets[e.dense_id] = code.offset;
         }
+    }
+
+    /// Prepare query once per search (subtracts centroid_ if centered)
+    [[nodiscard]] QueryState prepare_query(std::span<const float> query) const {
+        assert(query.size() == dim);
+        QueryState qs;
+        qs.query.resize(dim);
+        if (is_centered()) {
+            for (size_t i = 0; i < dim; ++i) {
+                qs.query[i] = query[i] - centroid_[i];
+            }
+        } else {
+            std::copy(query.begin(), query.end(), qs.query.begin());
+        }
+        return qs;
+    }
+
+    /// Estimate squared L2 distance using precomputed QueryState (fastest path)
+    [[nodiscard]] float l2_distance_squared(const QueryState& qs, size_t dense_id) const {
+        assert(dense_id < count);
+        assert(qs.query.size() == dim);
+
+        const float scale = scales[dense_id];
+        const float offset = offsets[dense_id];
+        const uint8_t* code_ptr = codes.data() + dense_id * bytes_per_vec;
+        return l2_sq_fused_impl(qs.query.data(), code_ptr, dim, scale, offset);
     }
 
     /// Estimate squared L2 distance between float query and quantized vector at dense_id
@@ -322,19 +561,50 @@ struct LVQ4Store {
         const float offset = offsets[dense_id];
         const uint8_t* code_ptr = codes.data() + dense_id * bytes_per_vec;
 
-        if (scale == 0.0f) {
-            float sum = 0.0f;
-            for (size_t i = 0; i < dim; ++i) {
-                float diff = query[i] - offset;
-                sum += diff * diff;
-            }
-            return sum;
+        if (!is_centered()) {
+            return l2_sq_fused_impl(query.data(), code_ptr, dim, scale, offset);
         }
 
-        const float inv_scale =
-            (dense_id < inv_scales.size()) ? inv_scales[dense_id] : (1.0f / scale);
-        float sum_sq = l2_sq_impl(query.data(), code_ptr, dim, inv_scale, offset);
-        return sum_sq * scale * scale;
+        alignas(32) float stack_buf[1536];
+        std::vector<float> heap_buf;
+        float* q_centered = stack_buf;
+        if (dim > 1536) {
+            heap_buf.resize(dim);
+            q_centered = heap_buf.data();
+        }
+        for (size_t i = 0; i < dim; ++i) {
+            q_centered[i] = query[i] - centroid_[i];
+        }
+        return l2_sq_fused_impl(q_centered, code_ptr, dim, scale, offset);
+    }
+
+    /// Scalar reference squared L2 distance (for SIMD-vs-scalar parity testing)
+    [[nodiscard]] float l2_distance_squared_scalar(std::span<const float> query,
+                                                   size_t dense_id) const {
+        assert(dense_id < count);
+        assert(query.size() == dim);
+
+        const float scale = scales[dense_id];
+        const float offset = offsets[dense_id];
+        const uint8_t* code_ptr = codes.data() + dense_id * bytes_per_vec;
+
+        if (!is_centered()) {
+            return l2_sq_fused_scalar(query.data(), code_ptr, dim, scale, offset);
+        }
+        float sum = 0.0f;
+        for (size_t i = 0; i < dim; ++i) {
+            const uint8_t c = (i % 2 == 0) ? (code_ptr[i / 2] & 0x0F)
+                                           : ((code_ptr[i / 2] >> 4) & 0x0F);
+            const float diff =
+                ((query[i] - centroid_[i]) - offset) - static_cast<float>(c) * scale;
+            sum += diff * diff;
+        }
+        return sum;
+    }
+
+    /// Estimate L2 distance using precomputed QueryState
+    [[nodiscard]] float l2_distance(const QueryState& qs, size_t dense_id) const {
+        return std::sqrt(l2_distance_squared(qs, dense_id));
     }
 
     /// Estimate L2 distance between float query and quantized vector at dense_id
@@ -355,28 +625,28 @@ struct LVQ4Store {
     /// Memory usage in bytes
     [[nodiscard]] size_t memory_bytes() const {
         return codes.size() + scales.size() * sizeof(float) + inv_scales.size() * sizeof(float) +
-               offsets.size() * sizeof(float);
+               offsets.size() * sizeof(float) + centroid_.size() * sizeof(float);
     }
 
 private:
-    static float l2_sq_impl(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
-                            float offset) {
+    static float l2_sq_fused_impl(const float* query, const uint8_t* codes, size_t dim, float scale,
+                                  float offset) {
 #ifdef SQLITE_VEC_ENABLE_AVX2
         if (dim >= 16) {
-            return l2_sq_avx2(query, codes, dim, inv_scale, offset);
+            return l2_sq_fused_avx2(query, codes, dim, scale, offset);
         }
 #endif
 #ifdef SQLITE_VEC_ENABLE_NEON
         if (dim >= 32) {
-            return l2_sq_neon(query, codes, dim, inv_scale, offset);
+            return l2_sq_fused_neon(query, codes, dim, scale, offset);
         }
 #endif
 #ifdef SQLITE_VEC_X86_RUNTIME_DISPATCH
         if (dim >= 16 && distances::x86::cpu_has_avx2_fma()) {
-            return distances::x86::lvq4_l2_sq_avx2(query, codes, dim, inv_scale, offset);
+            return distances::x86::lvq4_l2_sq_fused_avx2(query, codes, dim, scale, offset);
         }
 #endif
-        return l2_sq_scalar(query, codes, dim, inv_scale, offset);
+        return l2_sq_fused_scalar(query, codes, dim, scale, offset);
     }
 
 #ifdef SQLITE_VEC_ENABLE_AVX2
@@ -391,10 +661,10 @@ private:
         return _mm_cvtss_f32(sums);
     }
 
-    static float l2_sq_avx2(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
-                            float offset) {
+    static float l2_sq_fused_avx2(const float* query, const uint8_t* codes, size_t dim, float scale,
+                                  float offset) {
         const __m256 voffset = _mm256_set1_ps(offset);
-        const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
+        const __m256 vscale = _mm256_set1_ps(scale);
         const __m128i mask_0f = _mm_set1_epi8(0x0F);
         __m256 sum0 = _mm256_setzero_ps();
         __m256 sum1 = _mm256_setzero_ps();
@@ -410,17 +680,17 @@ private:
             const __m256 c1 =
                 _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(unpacked, 8)));
 
-            const __m256 q0 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i), voffset),
-                                            vinv_scale);
-            const __m256 q1 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i + 8), voffset),
-                                            vinv_scale);
+            const __m256 q0 = _mm256_sub_ps(_mm256_loadu_ps(query + i), voffset);
+            const __m256 q1 = _mm256_sub_ps(_mm256_loadu_ps(query + i + 8), voffset);
 
-            const __m256 d0 = _mm256_sub_ps(q0, c0);
-            const __m256 d1 = _mm256_sub_ps(q1, c1);
 #ifdef SQLITE_VEC_ENABLE_FMA
+            const __m256 d0 = _mm256_fnmadd_ps(c0, vscale, q0);
+            const __m256 d1 = _mm256_fnmadd_ps(c1, vscale, q1);
             sum0 = _mm256_fmadd_ps(d0, d0, sum0);
             sum1 = _mm256_fmadd_ps(d1, d1, sum1);
 #else
+            const __m256 d0 = _mm256_sub_ps(q0, _mm256_mul_ps(c0, vscale));
+            const __m256 d1 = _mm256_sub_ps(q1, _mm256_mul_ps(c1, vscale));
             sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(d0, d0));
             sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(d1, d1));
 #endif
@@ -429,33 +699,31 @@ private:
         float sum = hsum256(_mm256_add_ps(sum0, sum1));
         for (; i < dim; ++i) {
             const uint8_t c = (i % 2 == 0) ? (codes[i / 2] & 0x0F) : ((codes[i / 2] >> 4) & 0x0F);
-            const float q_normalized = (query[i] - offset) * inv_scale;
-            const float diff = q_normalized - static_cast<float>(c);
+            const float diff = (query[i] - offset) - static_cast<float>(c) * scale;
             sum += diff * diff;
         }
         return sum;
     }
 #endif
 
-    static float l2_sq_scalar(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
-                              float offset) {
+    static float l2_sq_fused_scalar(const float* query, const uint8_t* codes, size_t dim,
+                                    float scale, float offset) {
         float sum = 0.0f;
         for (size_t i = 0; i < dim; ++i) {
-            uint8_t c = (i % 2 == 0) ? (codes[i / 2] & 0x0F) : ((codes[i / 2] >> 4) & 0x0F);
-            float q_normalized = (query[i] - offset) * inv_scale;
-            float diff = q_normalized - static_cast<float>(c);
+            const uint8_t c = (i % 2 == 0) ? (codes[i / 2] & 0x0F) : ((codes[i / 2] >> 4) & 0x0F);
+            const float diff = (query[i] - offset) - static_cast<float>(c) * scale;
             sum += diff * diff;
         }
         return sum;
     }
 
 #ifdef SQLITE_VEC_ENABLE_NEON
-    static float l2_sq_neon(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
-                            float offset) {
+    static float l2_sq_fused_neon(const float* query, const uint8_t* codes, size_t dim, float scale,
+                                  float offset) {
         const size_t end32 = (dim / 32) * 32;
 
         float32x4_t voffset = vdupq_n_f32(offset);
-        float32x4_t vinv_scale = vdupq_n_f32(inv_scale);
+        float32x4_t vscale = vdupq_n_f32(scale);
         uint8x16_t mask_lo = vdupq_n_u8(0x0F);
         float32x4_t sum0 = vdupq_n_f32(0.0f);
         float32x4_t sum1 = vdupq_n_f32(0.0f);
@@ -481,15 +749,15 @@ private:
             float32x4_t c2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(a_hi16)));
             float32x4_t c3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(a_hi16)));
 
-            float32x4_t q0 = vmulq_f32(vsubq_f32(vld1q_f32(query + i), voffset), vinv_scale);
-            float32x4_t q1 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 4), voffset), vinv_scale);
-            float32x4_t q2 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 8), voffset), vinv_scale);
-            float32x4_t q3 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 12), voffset), vinv_scale);
+            float32x4_t q0 = vsubq_f32(vld1q_f32(query + i), voffset);
+            float32x4_t q1 = vsubq_f32(vld1q_f32(query + i + 4), voffset);
+            float32x4_t q2 = vsubq_f32(vld1q_f32(query + i + 8), voffset);
+            float32x4_t q3 = vsubq_f32(vld1q_f32(query + i + 12), voffset);
 
-            float32x4_t d0 = vsubq_f32(q0, c0);
-            float32x4_t d1 = vsubq_f32(q1, c1);
-            float32x4_t d2 = vsubq_f32(q2, c2);
-            float32x4_t d3 = vsubq_f32(q3, c3);
+            float32x4_t d0 = vfmsq_f32(q0, c0, vscale);
+            float32x4_t d1 = vfmsq_f32(q1, c1, vscale);
+            float32x4_t d2 = vfmsq_f32(q2, c2, vscale);
+            float32x4_t d3 = vfmsq_f32(q3, c3, vscale);
 
             sum0 = vfmaq_f32(sum0, d0, d0);
             sum1 = vfmaq_f32(sum1, d1, d1);
@@ -505,15 +773,15 @@ private:
             c2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(b_hi16)));
             c3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(b_hi16)));
 
-            q0 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 16), voffset), vinv_scale);
-            q1 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 20), voffset), vinv_scale);
-            q2 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 24), voffset), vinv_scale);
-            q3 = vmulq_f32(vsubq_f32(vld1q_f32(query + i + 28), voffset), vinv_scale);
+            q0 = vsubq_f32(vld1q_f32(query + i + 16), voffset);
+            q1 = vsubq_f32(vld1q_f32(query + i + 20), voffset);
+            q2 = vsubq_f32(vld1q_f32(query + i + 24), voffset);
+            q3 = vsubq_f32(vld1q_f32(query + i + 28), voffset);
 
-            d0 = vsubq_f32(q0, c0);
-            d1 = vsubq_f32(q1, c1);
-            d2 = vsubq_f32(q2, c2);
-            d3 = vsubq_f32(q3, c3);
+            d0 = vfmsq_f32(q0, c0, vscale);
+            d1 = vfmsq_f32(q1, c1, vscale);
+            d2 = vfmsq_f32(q2, c2, vscale);
+            d3 = vfmsq_f32(q3, c3, vscale);
 
             sum0 = vfmaq_f32(sum0, d0, d0);
             sum1 = vfmaq_f32(sum1, d1, d1);
@@ -527,9 +795,8 @@ private:
         float sum = vaddvq_f32(total);
 
         while (i < dim) {
-            uint8_t c = (i % 2 == 0) ? (codes[i / 2] & 0x0F) : ((codes[i / 2] >> 4) & 0x0F);
-            float q_normalized = (query[i] - offset) * inv_scale;
-            float diff = q_normalized - static_cast<float>(c);
+            const uint8_t c = (i % 2 == 0) ? (codes[i / 2] & 0x0F) : ((codes[i / 2] >> 4) & 0x0F);
+            const float diff = (query[i] - offset) - static_cast<float>(c) * scale;
             sum += diff * diff;
             ++i;
         }

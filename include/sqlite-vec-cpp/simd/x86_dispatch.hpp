@@ -218,6 +218,89 @@ SQLITE_VEC_TARGET_AVX2_FMA inline float lvq4_l2_sq_avx2(const float* query,
     return sum;
 }
 
+// Fused LVQ-8 squared L2 distance: sum_i ((query[i] - offset) - codes[i] * scale)^2
+// Uses 3 FP ops per vector (sub, fnmadd, fmadd) instead of 4 and avoids inv_scale division.
+SQLITE_VEC_TARGET_AVX2_FMA inline float lvq8_l2_sq_fused_avx2(const float* query,
+                                                              const std::uint8_t* codes,
+                                                              std::size_t dim, float scale,
+                                                              float offset) noexcept {
+    const __m256 voffset = _mm256_set1_ps(offset);
+    const __m256 vscale = _mm256_set1_ps(scale);
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+
+    std::size_t i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        const __m128i bytes0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes + i));
+        const __m128i bytes1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes + i + 8));
+        const __m256 c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes0));
+        const __m256 c1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes1));
+
+        const __m256 q0 = _mm256_sub_ps(_mm256_loadu_ps(query + i), voffset);
+        const __m256 q1 = _mm256_sub_ps(_mm256_loadu_ps(query + i + 8), voffset);
+
+        const __m256 d0 = _mm256_fnmadd_ps(c0, vscale, q0);
+        const __m256 d1 = _mm256_fnmadd_ps(c1, vscale, q1);
+        sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+        sum1 = _mm256_fmadd_ps(d1, d1, sum1);
+    }
+    for (; i + 8 <= dim; i += 8) {
+        const __m128i bytes0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes + i));
+        const __m256 c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes0));
+        const __m256 q0 = _mm256_sub_ps(_mm256_loadu_ps(query + i), voffset);
+        const __m256 d0 = _mm256_fnmadd_ps(c0, vscale, q0);
+        sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+    }
+
+    float sum = hsum256(_mm256_add_ps(sum0, sum1));
+    for (; i < dim; ++i) {
+        const float diff = (query[i] - offset) - static_cast<float>(codes[i]) * scale;
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+// Fused LVQ-4 squared L2 distance: sum_i ((query[i] - offset) - c[i] * scale)^2
+SQLITE_VEC_TARGET_AVX2_FMA inline float lvq4_l2_sq_fused_avx2(const float* query,
+                                                              const std::uint8_t* codes,
+                                                              std::size_t dim, float scale,
+                                                              float offset) noexcept {
+    const __m256 voffset = _mm256_set1_ps(offset);
+    const __m256 vscale = _mm256_set1_ps(scale);
+    const __m128i mask_0f = _mm_set1_epi8(0x0F);
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+
+    std::size_t i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        const __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes + i / 2));
+        const __m128i lo = _mm_and_si128(packed, mask_0f);
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_0f);
+        const __m128i unpacked = _mm_unpacklo_epi8(lo, hi);
+
+        const __m256 c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(unpacked));
+        const __m256 c1 =
+            _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(unpacked, 8)));
+
+        const __m256 q0 = _mm256_sub_ps(_mm256_loadu_ps(query + i), voffset);
+        const __m256 q1 = _mm256_sub_ps(_mm256_loadu_ps(query + i + 8), voffset);
+
+        const __m256 d0 = _mm256_fnmadd_ps(c0, vscale, q0);
+        const __m256 d1 = _mm256_fnmadd_ps(c1, vscale, q1);
+        sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+        sum1 = _mm256_fmadd_ps(d1, d1, sum1);
+    }
+
+    float sum = hsum256(_mm256_add_ps(sum0, sum1));
+    for (; i < dim; ++i) {
+        const std::uint8_t c =
+            (i % 2 == 0) ? (codes[i / 2] & 0x0F) : ((codes[i / 2] >> 4) & 0x0F);
+        const float diff = (query[i] - offset) - static_cast<float>(c) * scale;
+        sum += diff * diff;
+    }
+    return sum;
+}
+
 } // namespace sqlite_vec_cpp::distances::x86
 
 #endif
