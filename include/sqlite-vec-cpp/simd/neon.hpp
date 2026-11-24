@@ -72,34 +72,28 @@ inline float l2_distance_float_neon(std::span<const float> a, std::span<const fl
 /// Requires: NEON support, size > 7
 inline float l2_distance_int8_neon(std::span<const std::int8_t> a, std::span<const std::int8_t> b) {
     const std::size_t size = a.size();
-    std::int32_t sum_scalar = 0;
+    int32x4_t acc = vdupq_n_s32(0);
     std::size_t i = 0;
 
-    // Process 8 int8s at a time
+    // Process 8 int8s at a time using widening subtract (s8 -> s16) and widening
+    // multiply-accumulate (s16 * s16 -> s32) since |diff| <= 255 and diff^2 <= 65025
+    // overflows signed int16.
     while (i + 7 < size) {
         int8x8_t v1 = vld1_s8(&a[i]);
         int8x8_t v2 = vld1_s8(&b[i]);
 
-        // Widen to int16 to avoid overflow
-        int16x8_t v1_wide = vmovl_s8(v1);
-        int16x8_t v2_wide = vmovl_s8(v2);
-
-        int16x8_t diff = vsubq_s16(v1_wide, v2_wide);
-        int16x8_t squared_diff = vmulq_s16(diff, diff);
-
-        // Pairwise add to int32
-        int32x4_t sum = vpaddlq_s16(squared_diff);
-
-        // Extract lanes and add to scalar sum
-        sum_scalar += vgetq_lane_s32(sum, 0) + vgetq_lane_s32(sum, 1) + vgetq_lane_s32(sum, 2) +
-                      vgetq_lane_s32(sum, 3);
+        int16x8_t diff = vsubl_s8(v1, v2);
+        acc = vmlal_s16(acc, vget_low_s16(diff), vget_low_s16(diff));
+        acc = vmlal_s16(acc, vget_high_s16(diff), vget_high_s16(diff));
 
         i += 8;
     }
 
+    std::int64_t sum_scalar = static_cast<std::int64_t>(vaddvq_s32(acc));
+
     // Handle remaining elements
     while (i < size) {
-        std::int16_t diff = static_cast<std::int16_t>(a[i]) - static_cast<std::int16_t>(b[i]);
+        std::int32_t diff = static_cast<std::int32_t>(a[i]) - static_cast<std::int32_t>(b[i]);
         sum_scalar += diff * diff;
         ++i;
     }

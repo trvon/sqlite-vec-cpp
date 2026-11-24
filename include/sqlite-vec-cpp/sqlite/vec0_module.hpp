@@ -119,7 +119,44 @@ struct Vec0Table {
     bool ann_ready = false;
     mutable std::mutex ann_mutex;
 
+    // Cached prepared statements for xUpdate and xColumn (lazy-prepared, finalized on disconnect/destroy)
+    sqlite3_stmt* stmt_select_embedding = nullptr;
+    sqlite3_stmt* stmt_delete = nullptr;
+    sqlite3_stmt* stmt_insert_with_rowid = nullptr;
+    sqlite3_stmt* stmt_insert_auto_rowid = nullptr;
+    sqlite3_stmt* stmt_update = nullptr;
+
     Vec0Table() = default;
+
+    ~Vec0Table() { finalize_cached_stmts(); }
+
+    void finalize_cached_stmts() {
+        auto fin = [](sqlite3_stmt*& s) {
+            if (s) {
+                sqlite3_finalize(s);
+                s = nullptr;
+            }
+        };
+        fin(stmt_select_embedding);
+        fin(stmt_delete);
+        fin(stmt_insert_with_rowid);
+        fin(stmt_insert_auto_rowid);
+        fin(stmt_update);
+    }
+
+    int prepare_cached_stmt(sqlite3_stmt*& slot, const std::string& sql) {
+        if (!slot) {
+            int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &slot, nullptr);
+            if (rc != SQLITE_OK) {
+                slot = nullptr;
+                return rc;
+            }
+        } else {
+            sqlite3_reset(slot);
+            sqlite3_clear_bindings(slot);
+        }
+        return SQLITE_OK;
+    }
 };
 
 struct Vec0Cursor {
@@ -194,6 +231,78 @@ inline void vec0_invalidate_ann_index(Vec0Table* table) {
     std::lock_guard<std::mutex> lock(table->ann_mutex);
     table->ann_index.reset();
     table->ann_ready = false;
+}
+
+inline void vec0_ann_on_delete(Vec0Table* table, int64_t old_rowid) {
+    std::lock_guard<std::mutex> lock(table->ann_mutex);
+    if (!table->ann_ready || !table->ann_index) {
+        return;
+    }
+    try {
+        table->ann_index->remove(static_cast<size_t>(old_rowid));
+        if (table->ann_index->needs_compaction()) {
+            table->ann_index = std::make_shared<Vec0AnnIndex>(table->ann_index->compact());
+        }
+    } catch (...) {
+        table->ann_index.reset();
+        table->ann_ready = false;
+    }
+}
+
+inline void vec0_ann_on_insert(Vec0Table* table, int64_t new_rowid, const void* blob, int bytes) {
+    std::lock_guard<std::mutex> lock(table->ann_mutex);
+    if (!table->ann_ready || !table->ann_index) {
+        return;
+    }
+    if (!blob || bytes <= 0 ||
+        static_cast<size_t>(bytes) != table->dimensions * sizeof(float)) {
+        return;
+    }
+    try {
+        std::vector<float> vec(table->dimensions);
+        std::memcpy(vec.data(), blob, static_cast<size_t>(bytes));
+        const size_t id = static_cast<size_t>(new_rowid);
+        // If this rowid still exists in nodes_ (e.g., previously soft-deleted and now reused),
+        // compact first so insert() registers the new vector cleanly instead of no-oping.
+        if (table->ann_index->get_node(id) != nullptr) {
+            table->ann_index->remove(id);
+            table->ann_index = std::make_shared<Vec0AnnIndex>(table->ann_index->compact());
+        }
+        table->ann_index->insert(id, std::span<const float>(vec));
+    } catch (...) {
+        table->ann_index.reset();
+        table->ann_ready = false;
+    }
+}
+
+inline void vec0_ann_on_update(Vec0Table* table, int64_t old_rowid, int64_t new_rowid,
+                               const void* blob, int bytes) {
+    std::lock_guard<std::mutex> lock(table->ann_mutex);
+    if (!table->ann_ready || !table->ann_index) {
+        return;
+    }
+    try {
+        const size_t old_id = static_cast<size_t>(old_rowid);
+        const size_t new_id = static_cast<size_t>(new_rowid);
+        table->ann_index->remove(old_id);
+
+        if (blob && bytes > 0 && static_cast<size_t>(bytes) == table->dimensions * sizeof(float)) {
+            std::vector<float> vec(table->dimensions);
+            std::memcpy(vec.data(), blob, static_cast<size_t>(bytes));
+            if (table->ann_index->get_node(new_id) != nullptr) {
+                table->ann_index->remove(new_id);
+                table->ann_index = std::make_shared<Vec0AnnIndex>(table->ann_index->compact());
+            }
+            table->ann_index->insert(new_id, std::span<const float>(vec));
+        }
+
+        if (table->ann_index->needs_compaction()) {
+            table->ann_index = std::make_shared<Vec0AnnIndex>(table->ann_index->compact());
+        }
+    } catch (...) {
+        table->ann_index.reset();
+        table->ann_ready = false;
+    }
 }
 
 inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* table) {
@@ -662,6 +771,7 @@ inline int vec0Connect(sqlite3* db, void* pAux, int argc, const char* const* arg
 inline int vec0Disconnect(sqlite3_vtab* pVTab) {
     auto* table = reinterpret_cast<Vec0Table*>(pVTab);
     vec0_registry_remove(table->db, table->schema_name, table->table_name);
+    table->finalize_cached_stmts();
     delete table;
     return SQLITE_OK;
 }
@@ -670,6 +780,8 @@ inline int vec0Disconnect(sqlite3_vtab* pVTab) {
 inline int vec0Destroy(sqlite3_vtab* pVTab) {
     auto* table = reinterpret_cast<Vec0Table*>(pVTab);
     vec0_registry_remove(table->db, table->schema_name, table->table_name);
+    // Finalize cached statements before dropping shadow tables
+    table->finalize_cached_stmts();
 
     // Drop shadow tables
     std::ostringstream drop_meta;
@@ -1082,17 +1194,15 @@ inline int vec0Column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int co
                 }
             }
 
-            sqlite3_stmt* stmt = nullptr;
             std::string sql = "SELECT \"" + cursor->table->embedding_column + "\" FROM " +
                               vec0_vectors_table_name(*cursor->table) + " WHERE rowid=?";
-            int rc = sqlite3_prepare_v2(cursor->table->db, sql.c_str(), -1, &stmt, nullptr);
-            if (rc != SQLITE_OK || !stmt) {
+            int rc =
+                cursor->table->prepare_cached_stmt(cursor->table->stmt_select_embedding, sql);
+            if (rc != SQLITE_OK || !cursor->table->stmt_select_embedding) {
                 sqlite3_result_null(ctx);
-                if (stmt) {
-                    sqlite3_finalize(stmt);
-                }
                 return SQLITE_OK;
             }
+            sqlite3_stmt* stmt = cursor->table->stmt_select_embedding;
             sqlite3_bind_int64(stmt, 1, cursor->current_rowid);
             rc = sqlite3_step(stmt);
             if (rc == SQLITE_ROW) {
@@ -1106,7 +1216,8 @@ inline int vec0Column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int co
             } else {
                 sqlite3_result_null(ctx);
             }
-            sqlite3_finalize(stmt);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
             return SQLITE_OK;
         }
 
@@ -1158,20 +1269,27 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
 
     // DELETE: argc==1, argv[0]=old_rowid
     if (argc == 1) {
-        sqlite3_stmt* stmt = nullptr;
-        std::ostringstream sql;
-        sql << "DELETE FROM \"" << table->schema_name << "\".\"" << table->table_name
-            << "_vectors\" WHERE rowid=?";
-        int rc = sqlite3_prepare_v2(table->db, sql.str().c_str(), -1, &stmt, nullptr);
-        if (rc != SQLITE_OK) {
-            return rc;
+        const int64_t old_rowid = sqlite3_value_int64(argv[0]);
+        if (!table->stmt_delete) {
+            std::ostringstream sql;
+            sql << "DELETE FROM \"" << table->schema_name << "\".\"" << table->table_name
+                << "_vectors\" WHERE rowid=?";
+            int prep_rc = table->prepare_cached_stmt(table->stmt_delete, sql.str());
+            if (prep_rc != SQLITE_OK) {
+                return prep_rc;
+            }
+        } else {
+            sqlite3_reset(table->stmt_delete);
+            sqlite3_clear_bindings(table->stmt_delete);
         }
 
-        sqlite3_bind_int64(stmt, 1, sqlite3_value_int64(argv[0]));
-        rc = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
+        sqlite3_stmt* stmt = table->stmt_delete;
+        sqlite3_bind_int64(stmt, 1, old_rowid);
+        int rc = sqlite3_step(stmt);
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
         if (rc == SQLITE_DONE) {
-            vec0_invalidate_ann_index(table);
+            vec0_ann_on_delete(table, old_rowid);
             return SQLITE_OK;
         }
         return rc;
@@ -1235,23 +1353,31 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
         }
 
         if (is_insert) {
-            std::ostringstream sql;
-            if (has_declared_rowid || has_new_rowid) {
-                sql << "INSERT INTO \"" << table->schema_name << "\".\"" << table->table_name
-                    << "_vectors\" (rowid, \"" << table->embedding_column << "\") VALUES (?, ?)";
+            const bool explicit_rowid = (has_declared_rowid || has_new_rowid);
+            sqlite3_stmt*& slot =
+                explicit_rowid ? table->stmt_insert_with_rowid : table->stmt_insert_auto_rowid;
+            if (!slot) {
+                std::ostringstream sql;
+                if (explicit_rowid) {
+                    sql << "INSERT INTO \"" << table->schema_name << "\".\"" << table->table_name
+                        << "_vectors\" (rowid, \"" << table->embedding_column
+                        << "\") VALUES (?, ?)";
+                } else {
+                    sql << "INSERT INTO \"" << table->schema_name << "\".\"" << table->table_name
+                        << "_vectors\" (\"" << table->embedding_column << "\") VALUES (?)";
+                }
+                int prep_rc = table->prepare_cached_stmt(slot, sql.str());
+                if (prep_rc != SQLITE_OK) {
+                    return prep_rc;
+                }
             } else {
-                sql << "INSERT INTO \"" << table->schema_name << "\".\"" << table->table_name
-                    << "_vectors\" (\"" << table->embedding_column << "\") VALUES (?)";
+                sqlite3_reset(slot);
+                sqlite3_clear_bindings(slot);
             }
 
-            sqlite3_stmt* stmt;
-            int rc = sqlite3_prepare_v2(table->db, sql.str().c_str(), -1, &stmt, nullptr);
-            if (rc != SQLITE_OK) {
-                return rc;
-            }
-
+            sqlite3_stmt* stmt = slot;
             int bind_idx = 1;
-            if (has_declared_rowid || has_new_rowid) {
+            if (explicit_rowid) {
                 sqlite3_bind_int64(stmt, bind_idx++, new_rowid);
             }
 
@@ -1261,30 +1387,37 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
                 sqlite3_bind_null(stmt, bind_idx);
             }
 
-            rc = sqlite3_step(stmt);
+            int rc = sqlite3_step(stmt);
+            int64_t inserted_rowid = new_rowid;
             if (rc == SQLITE_DONE) {
-                *pRowid = (has_declared_rowid || has_new_rowid)
-                              ? new_rowid
-                              : sqlite3_last_insert_rowid(table->db);
+                inserted_rowid =
+                    explicit_rowid ? new_rowid : sqlite3_last_insert_rowid(table->db);
+                *pRowid = inserted_rowid;
                 rc = SQLITE_OK;
             }
 
-            sqlite3_finalize(stmt);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
             if (rc == SQLITE_OK) {
-                vec0_invalidate_ann_index(table);
+                vec0_ann_on_insert(table, inserted_rowid, blob, bytes);
             }
             return rc;
         } else {
-            std::ostringstream sql;
-            sql << "UPDATE \"" << table->schema_name << "\".\"" << table->table_name
-                << "_vectors\" SET rowid=?, \"" << table->embedding_column << "\"=? WHERE rowid=?";
-
-            sqlite3_stmt* stmt;
-            int rc = sqlite3_prepare_v2(table->db, sql.str().c_str(), -1, &stmt, nullptr);
-            if (rc != SQLITE_OK) {
-                return rc;
+            if (!table->stmt_update) {
+                std::ostringstream sql;
+                sql << "UPDATE \"" << table->schema_name << "\".\"" << table->table_name
+                    << "_vectors\" SET rowid=?, \"" << table->embedding_column
+                    << "\"=? WHERE rowid=?";
+                int prep_rc = table->prepare_cached_stmt(table->stmt_update, sql.str());
+                if (prep_rc != SQLITE_OK) {
+                    return prep_rc;
+                }
+            } else {
+                sqlite3_reset(table->stmt_update);
+                sqlite3_clear_bindings(table->stmt_update);
             }
 
+            sqlite3_stmt* stmt = table->stmt_update;
             sqlite3_bind_int64(stmt, 1, new_rowid);
 
             if (blob && bytes > 0) {
@@ -1295,15 +1428,16 @@ inline int vec0Update(sqlite3_vtab* pVTab, int argc, sqlite3_value** argv, sqlit
 
             sqlite3_bind_int64(stmt, 3, old_rowid);
 
-            rc = sqlite3_step(stmt);
+            int rc = sqlite3_step(stmt);
             if (rc == SQLITE_DONE) {
                 *pRowid = new_rowid;
                 rc = SQLITE_OK;
             }
 
-            sqlite3_finalize(stmt);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
             if (rc == SQLITE_OK) {
-                vec0_invalidate_ann_index(table);
+                vec0_ann_on_update(table, old_rowid, new_rowid, blob, bytes);
             }
             return rc;
         }

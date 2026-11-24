@@ -99,29 +99,31 @@ public:
     /// Delegates to HNSWIndex::search_quantized_rerank which uses the internal
     /// beam search loop with visited pool, prefetching, and lock-free neighbors.
     std::vector<std::pair<size_t, float>> search(std::span<const float> query, size_t k,
-                                                 size_t ef_search = 50) const {
-        return search_with_filter(query, k, ef_search, nullptr);
+                                                 size_t ef_search = 50,
+                                                 SearchStats* stats = nullptr) const {
+        return search_with_filter(query, k, ef_search, nullptr, stats);
     }
 
     /// Two-stage search with pre-filtering
     std::vector<std::pair<size_t, float>> search_with_filter(std::span<const float> query, size_t k,
                                                              size_t ef_search,
-                                                             const FilterFn& filter) const {
+                                                             const FilterFn& filter,
+                                                             SearchStats* stats = nullptr) const {
         // If no quantization built or index was mutated since build, fall back to base index
         if (config_.quantization == QuantizationType::None || !has_quantization() || is_stale()) {
-            return filter ? base_index_.search_with_filter(query, k, ef_search, filter)
-                          : base_index_.search(query, k, ef_search);
+            return filter ? base_index_.search_with_filter(query, k, ef_search, filter, stats)
+                          : base_index_.search(query, k, ef_search, stats);
         }
 
         switch (config_.quantization) {
             case QuantizationType::LVQ8:
-                return search_with_store(lvq8_store_, query, k, ef_search, filter);
+                return search_with_store(lvq8_store_, query, k, ef_search, filter, stats);
             case QuantizationType::LVQ4:
-                return search_with_store(lvq4_store_, query, k, ef_search, filter);
+                return search_with_store(lvq4_store_, query, k, ef_search, filter, stats);
             case QuantizationType::RaBitQ:
-                return search_rabitq(query, k, ef_search, filter);
+                return search_rabitq(query, k, ef_search, filter, stats);
             default:
-                return base_index_.search(query, k, ef_search);
+                return base_index_.search(query, k, ef_search, stats);
         }
     }
 
@@ -212,34 +214,35 @@ private:
     quantization::RaBitQStore rabitq_store_;
 
     /// Search using an LVQ store (LVQ-8 or LVQ-4)
-    /// The store provides l2_distance(query, dense_id) and prefetch(dense_id)
+    /// Uses squared distances during beam search (monotonic with L2, avoids per-hop sqrt).
     template <typename StoreT>
     std::vector<std::pair<size_t, float>>
     search_with_store(const StoreT& store, std::span<const float> query, size_t k, size_t ef_search,
-                      const FilterFn& filter) const {
+                      const FilterFn& filter, SearchStats* stats = nullptr) const {
         auto approx_dist = [&store](std::span<const float> q, size_t dense_id) -> float {
-            return store.l2_distance(q, dense_id);
+            return store.l2_distance_squared(q, dense_id);
         };
         auto prefetch_fn = [&store](size_t dense_id) { store.prefetch(dense_id); };
 
         return base_index_.search_quantized_rerank(query, k, ef_search, config_.rerank_factor,
-                                                   approx_dist, prefetch_fn, filter);
+                                                   approx_dist, prefetch_fn, filter, stats);
     }
 
-    /// Search using RaBitQ (needs precomputed query state)
+    /// Search using RaBitQ (needs precomputed query state; uses squared distance in beam search)
     std::vector<std::pair<size_t, float>> search_rabitq(std::span<const float> query, size_t k,
                                                         size_t ef_search,
-                                                        const FilterFn& filter) const {
+                                                        const FilterFn& filter,
+                                                        SearchStats* stats = nullptr) const {
         auto query_state = rabitq_store_.prepare_query(query);
 
         auto approx_dist = [this, &query_state](std::span<const float> /*q*/,
                                                 size_t dense_id) -> float {
-            return rabitq_store_.l2_distance(query_state, dense_id);
+            return rabitq_store_.l2_distance_squared(query_state, dense_id);
         };
         auto prefetch_fn = [this](size_t dense_id) { rabitq_store_.prefetch(dense_id); };
 
         return base_index_.search_quantized_rerank(query, k, ef_search, config_.rerank_factor,
-                                                   approx_dist, prefetch_fn, filter);
+                                                   approx_dist, prefetch_fn, filter, stats);
     }
 };
 
