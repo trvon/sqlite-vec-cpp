@@ -17,6 +17,7 @@
 #include "../distances/l2.hpp"
 #include "../index/hnsw.hpp"
 #include "../index/hnsw_persistence.hpp"
+#include "../index/hnsw_quantized.hpp"
 #include "../utils/error.hpp"
 #include "parsers.hpp"
 
@@ -31,6 +32,7 @@ namespace sqlite_vec_cpp::sqlite {
 // Compatible with original sqlite-vec C implementation
 
 using Vec0AnnIndex = index::HNSWIndex<float, distances::L2Metric<float>>;
+using Vec0QuantizedSearch = index::HNSWQuantizedSearch<float, distances::L2Metric<float>>;
 
 constexpr int kVec0ColRowid = 0;
 constexpr int kVec0ColEmbedding = 1;
@@ -117,6 +119,9 @@ struct Vec0Table {
     bool use_shadow_tables = true;
     std::shared_ptr<Vec0AnnIndex> ann_index;
     bool ann_ready = false;
+    index::QuantizationType quantization_type = index::QuantizationType::None;
+    size_t quantized_rerank_factor = 4;
+    std::shared_ptr<Vec0QuantizedSearch> quantized_search;
     mutable std::mutex ann_mutex;
 
     // Cached prepared statements for xUpdate and xColumn (lazy-prepared, finalized on disconnect/destroy)
@@ -229,8 +234,17 @@ inline std::string vec0_vectors_table_name(const Vec0Table& table) {
 
 inline void vec0_invalidate_ann_index(Vec0Table* table) {
     std::lock_guard<std::mutex> lock(table->ann_mutex);
+    table->quantized_search.reset();
     table->ann_index.reset();
     table->ann_ready = false;
+}
+
+inline void vec0_set_quantization(Vec0Table* table, index::QuantizationType type,
+                                  size_t rerank_factor = 4) {
+    std::lock_guard<std::mutex> lock(table->ann_mutex);
+    table->quantization_type = type;
+    table->quantized_rerank_factor = std::max<size_t>(1, rerank_factor);
+    table->quantized_search.reset();
 }
 
 inline void vec0_ann_on_delete(Vec0Table* table, int64_t old_rowid) {
@@ -241,9 +255,11 @@ inline void vec0_ann_on_delete(Vec0Table* table, int64_t old_rowid) {
     try {
         table->ann_index->remove(static_cast<size_t>(old_rowid));
         if (table->ann_index->needs_compaction()) {
+            table->quantized_search.reset();
             table->ann_index = std::make_shared<Vec0AnnIndex>(table->ann_index->compact());
         }
     } catch (...) {
+        table->quantized_search.reset();
         table->ann_index.reset();
         table->ann_ready = false;
     }
@@ -266,10 +282,12 @@ inline void vec0_ann_on_insert(Vec0Table* table, int64_t new_rowid, const void* 
         // compact first so insert() registers the new vector cleanly instead of no-oping.
         if (table->ann_index->get_node(id) != nullptr) {
             table->ann_index->remove(id);
+            table->quantized_search.reset();
             table->ann_index = std::make_shared<Vec0AnnIndex>(table->ann_index->compact());
         }
         table->ann_index->insert(id, std::span<const float>(vec));
     } catch (...) {
+        table->quantized_search.reset();
         table->ann_index.reset();
         table->ann_ready = false;
     }
@@ -291,15 +309,18 @@ inline void vec0_ann_on_update(Vec0Table* table, int64_t old_rowid, int64_t new_
             std::memcpy(vec.data(), blob, static_cast<size_t>(bytes));
             if (table->ann_index->get_node(new_id) != nullptr) {
                 table->ann_index->remove(new_id);
+                table->quantized_search.reset();
                 table->ann_index = std::make_shared<Vec0AnnIndex>(table->ann_index->compact());
             }
             table->ann_index->insert(new_id, std::span<const float>(vec));
         }
 
         if (table->ann_index->needs_compaction()) {
+            table->quantized_search.reset();
             table->ann_index = std::make_shared<Vec0AnnIndex>(table->ann_index->compact());
         }
     } catch (...) {
+        table->quantized_search.reset();
         table->ann_index.reset();
         table->ann_ready = false;
     }
@@ -401,8 +422,35 @@ inline Result<std::shared_ptr<Vec0AnnIndex>> vec0_ensure_ann_index(Vec0Table* ta
 /// This avoids the O(n log n) HNSW build on every restart.
 inline void vec0_restore_ann_index(Vec0Table* table, std::shared_ptr<Vec0AnnIndex> index) {
     std::lock_guard<std::mutex> lock(table->ann_mutex);
+    table->quantized_search.reset();
     table->ann_index = std::move(index);
     table->ann_ready = true;
+}
+
+/// Ensure a fresh quantized search wrapper is built for the current ANN index.
+/// Returns both the base ANN index and quantized search wrapper so the base index
+/// is guaranteed to stay alive for the entire query.
+inline std::pair<std::shared_ptr<Vec0AnnIndex>, std::shared_ptr<Vec0QuantizedSearch>>
+vec0_ensure_quantized_search(Vec0Table* table, const std::shared_ptr<Vec0AnnIndex>& ann_index) {
+    std::lock_guard<std::mutex> lock(table->ann_mutex);
+    if (table->quantization_type == index::QuantizationType::None || !ann_index) {
+        return {ann_index, nullptr};
+    }
+    auto active_index = (table->ann_ready && table->ann_index) ? table->ann_index : ann_index;
+    const bool needs_rebuild =
+        !table->quantized_search ||
+        &table->quantized_search->base_index() != active_index.get() ||
+        table->quantized_search->quantization_type() != table->quantization_type ||
+        !table->quantized_search->has_quantization() || table->quantized_search->is_stale();
+    if (needs_rebuild) {
+        Vec0QuantizedSearch::Config qcfg;
+        qcfg.quantization = table->quantization_type;
+        qcfg.rerank_factor = table->quantized_rerank_factor;
+        auto qsearch = std::make_shared<Vec0QuantizedSearch>(*active_index, qcfg);
+        qsearch->build_quantization();
+        table->quantized_search = std::move(qsearch);
+    }
+    return {active_index, table->quantized_search};
 }
 
 inline Result<std::vector<float>> vec0_parse_query_vector(Vec0Table* table,
@@ -464,6 +512,16 @@ vec0_run_ann_query(Vec0Table* table, const Value& query_value, size_t k, size_t 
         raw_results = ann_index.value()->search_phss_rerank_with_filter(
             std::span<const float>(parsed_query.value()), k, ef_search, cfg, filter,
             route_entry_points);
+    } else if (route_entry_points.empty() &&
+               table->quantization_type != index::QuantizationType::None) {
+        auto [live_ann, qsearch] = vec0_ensure_quantized_search(table, ann_index.value());
+        if (qsearch) {
+            raw_results = qsearch->search_with_filter(
+                std::span<const float>(parsed_query.value()), k, ef_search, filter);
+        } else {
+            raw_results = live_ann->search_read_mostly_with_filter(
+                std::span<const float>(parsed_query.value()), k, ef_search, filter);
+        }
     } else {
         raw_results = route_entry_points.empty()
                           ? ann_index.value()->search_read_mostly_with_filter(
@@ -488,20 +546,77 @@ vec0_run_exact_query(Vec0Table* table, const Value& query_value, std::optional<s
         return err<std::vector<std::pair<int64_t, float>>>(parsed_query.error());
     }
 
+    // Small-filter fast-path: if allowed_rowids is small, push an IN (...) predicate
+    // directly into SQLite's INTEGER PRIMARY KEY B-tree instead of full-scanning _vectors.
+    constexpr size_t kSmallFilterThreshold = 128;
+    std::vector<int64_t> small_filter_ids;
+    const bool use_small_filter_sql =
+        rowid_filter.active && !rowid_filter.allowed_rowids.empty() &&
+        rowid_filter.allowed_rowids.size() <= kSmallFilterThreshold;
+    if (use_small_filter_sql) {
+        small_filter_ids.reserve(rowid_filter.allowed_rowids.size());
+        for (int64_t rid : rowid_filter.allowed_rowids) {
+            if (rowid_filter.matches(rid)) {
+                small_filter_ids.push_back(rid);
+            }
+        }
+        if (small_filter_ids.empty()) {
+            return Result<std::vector<std::pair<int64_t, float>>>(
+                std::vector<std::pair<int64_t, float>>{});
+        }
+        std::sort(small_filter_ids.begin(), small_filter_ids.end());
+    }
+
     sqlite3_stmt* stmt = nullptr;
-    std::string sql = "SELECT rowid, \"" + table->embedding_column + "\" FROM " +
-                      vec0_vectors_table_name(*table) + " ORDER BY rowid";
+    std::string sql;
+    if (use_small_filter_sql) {
+        std::ostringstream oss;
+        oss << "SELECT rowid, \"" << table->embedding_column << "\" FROM "
+            << vec0_vectors_table_name(*table) << " WHERE rowid IN (";
+        for (size_t i = 0; i < small_filter_ids.size(); ++i) {
+            if (i > 0) {
+                oss << ',';
+            }
+            oss << '?';
+        }
+        oss << ") ORDER BY rowid";
+        sql = oss.str();
+    } else {
+        sql = "SELECT rowid, \"" + table->embedding_column + "\" FROM " +
+              vec0_vectors_table_name(*table) + " ORDER BY rowid";
+    }
+
     int rc = sqlite3_prepare_v2(table->db, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         return err<std::vector<std::pair<int64_t, float>>>(
             Error::sqlite_error("Failed to scan vec0 vectors for exact query", rc));
     }
 
-    std::vector<std::pair<int64_t, float>> results;
+    if (use_small_filter_sql) {
+        for (size_t i = 0; i < small_filter_ids.size(); ++i) {
+            sqlite3_bind_int64(stmt, static_cast<int>(i + 1), small_filter_ids[i]);
+        }
+    }
+
+    const std::span<const float> query_span(parsed_query.value());
     std::vector<float> buffer(table->dimensions);
+
+    // Bounded max-heap of (dist_sq, rowid) when k is specified: avoids per-row sqrt and full sort.
+    const bool use_heap = k.has_value();
+    const size_t limit_k = k.value_or(0);
+    auto heap_cmp = [](const std::pair<float, int64_t>& lhs,
+                       const std::pair<float, int64_t>& rhs) {
+        return lhs.first < rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second);
+    };
+    std::vector<std::pair<float, int64_t>> top_heap;
+    if (use_heap) {
+        top_heap.reserve(limit_k + 1);
+    }
+    std::vector<std::pair<int64_t, float>> unbounded_results;
+
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         int64_t rowid = sqlite3_column_int64(stmt, 0);
-        if (!rowid_filter.matches(rowid)) {
+        if (!use_small_filter_sql && !rowid_filter.matches(rowid)) {
             continue;
         }
 
@@ -516,9 +631,25 @@ vec0_run_exact_query(Vec0Table* table, const Value& query_value, std::optional<s
         }
 
         std::memcpy(buffer.data(), blob, static_cast<size_t>(bytes));
-        float dist = distances::l2_distance(std::span<const float>(parsed_query.value()),
-                                            std::span<const float>(buffer));
-        results.emplace_back(rowid, dist);
+        const float dist_sq =
+            distances::l2_squared_distance(query_span, std::span<const float>(buffer));
+
+        if (use_heap) {
+            if (limit_k == 0) {
+                continue;
+            }
+            if (top_heap.size() < limit_k) {
+                top_heap.emplace_back(dist_sq, rowid);
+                std::push_heap(top_heap.begin(), top_heap.end(), heap_cmp);
+            } else if (dist_sq < top_heap.front().first ||
+                       (dist_sq == top_heap.front().first && rowid < top_heap.front().second)) {
+                std::pop_heap(top_heap.begin(), top_heap.end(), heap_cmp);
+                top_heap.back() = {dist_sq, rowid};
+                std::push_heap(top_heap.begin(), top_heap.end(), heap_cmp);
+            }
+        } else {
+            unbounded_results.emplace_back(rowid, dist_sq);
+        }
     }
 
     if (rc != SQLITE_DONE) {
@@ -528,12 +659,27 @@ vec0_run_exact_query(Vec0Table* table, const Value& query_value, std::optional<s
     }
 
     sqlite3_finalize(stmt);
-    std::sort(results.begin(), results.end(),
-              [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
-    if (k && results.size() > *k) {
-        results.resize(*k);
+
+    if (use_heap) {
+        std::sort_heap(top_heap.begin(), top_heap.end(), heap_cmp);
+        std::vector<std::pair<int64_t, float>> results;
+        results.reserve(top_heap.size());
+        for (const auto& [dist_sq, rowid] : top_heap) {
+            results.emplace_back(rowid, std::sqrt(std::max(0.0f, dist_sq)));
+        }
+        return Result<std::vector<std::pair<int64_t, float>>>(std::move(results));
     }
-    return Result<std::vector<std::pair<int64_t, float>>>(std::move(results));
+
+    std::sort(unbounded_results.begin(), unbounded_results.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.second < rhs.second ||
+                         (lhs.second == rhs.second && lhs.first < rhs.first);
+              });
+    for (auto& [rowid, dist_sq] : unbounded_results) {
+        (void)rowid;
+        dist_sq = std::sqrt(std::max(0.0f, dist_sq));
+    }
+    return Result<std::vector<std::pair<int64_t, float>>>(std::move(unbounded_results));
 }
 
 inline Result<Vec0RowidFilter> vec0_extract_rowid_filter(int idxNum, int argc, sqlite3_value** argv,
@@ -616,25 +762,49 @@ inline Result<Vec0RowidFilter> vec0_extract_rowid_filter(int idxNum, int argc, s
     return Result<Vec0RowidFilter>(std::move(filter));
 }
 
-// Helper: Parse CREATE VIRTUAL TABLE statement for embedding column and dimensions
+// Helper: Parse CREATE VIRTUAL TABLE statement for embedding column, dimensions,
+// and optional quantization / rerank_factor settings.
 inline bool parse_vec0_schema(int argc, const char* const* argv, std::string& embedding_col,
-                              size_t& dims) {
-    // Format: CREATE VIRTUAL TABLE name USING vec0(embedding float[dims])
+                              size_t& dims,
+                              index::QuantizationType* out_quant = nullptr,
+                              size_t* out_rerank_factor = nullptr) {
+    // Format: CREATE VIRTUAL TABLE name USING vec0(embedding float[dims], quantization=rabitq, rerank_factor=4)
     embedding_col = "embedding"; // default
     dims = 384;                  // default
+    if (out_quant) {
+        *out_quant = index::QuantizationType::None;
+    }
+    if (out_rerank_factor) {
+        *out_rerank_factor = 4;
+    }
 
+    auto trim = [](std::string s) {
+        size_t b = 0;
+        while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) {
+            ++b;
+        }
+        size_t e = s.size();
+        while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) {
+            --e;
+        }
+        return s.substr(b, e - b);
+    };
+    auto to_lower = [](std::string s) {
+        for (char& ch : s) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        return s;
+    };
+
+    bool found_embedding = false;
     for (int i = 3; i < argc; i++) {
         std::string arg(argv[i]);
 
         // Look for pattern: column_name float[dimensions]
         auto float_pos = arg.find("float[");
-        if (float_pos != std::string::npos) {
+        if (!found_embedding && float_pos != std::string::npos) {
             // Extract column name (everything before "float[")
-            embedding_col = arg.substr(0, float_pos);
-            // Trim whitespace
-            while (!embedding_col.empty() && std::isspace(embedding_col.back())) {
-                embedding_col.pop_back();
-            }
+            embedding_col = trim(arg.substr(0, float_pos));
 
             // Extract dimensions
             auto end_bracket = arg.find(']', float_pos);
@@ -642,15 +812,45 @@ inline bool parse_vec0_schema(int argc, const char* const* argv, std::string& em
                 try {
                     std::string dim_str = arg.substr(float_pos + 6, end_bracket - float_pos - 6);
                     dims = std::stoul(dim_str);
-                    return true;
+                    found_embedding = true;
                 } catch (...) {
                     // Failed to parse dimensions - continue with defaults
-                    continue;
+                }
+            }
+            continue;
+        }
+
+        // Optional key=value options (e.g., quantization=rabitq, rerank_factor=4)
+        auto eq_pos = arg.find('=');
+        if (eq_pos != std::string::npos) {
+            std::string key = to_lower(trim(arg.substr(0, eq_pos)));
+            std::string val = to_lower(trim(arg.substr(eq_pos + 1)));
+            // Strip optional quotes around value
+            if (val.size() >= 2 &&
+                ((val.front() == '\'' && val.back() == '\'') ||
+                 (val.front() == '"' && val.back() == '"'))) {
+                val = val.substr(1, val.size() - 2);
+            }
+            if (key == "quantization" && out_quant) {
+                if (val == "rabitq") {
+                    *out_quant = index::QuantizationType::RaBitQ;
+                } else if (val == "lvq8") {
+                    *out_quant = index::QuantizationType::LVQ8;
+                } else if (val == "lvq4") {
+                    *out_quant = index::QuantizationType::LVQ4;
+                } else if (val == "none" || val == "fp32" || val == "off") {
+                    *out_quant = index::QuantizationType::None;
+                }
+            } else if (key == "rerank_factor" && out_rerank_factor) {
+                try {
+                    *out_rerank_factor = std::max<size_t>(1, std::stoul(val));
+                } catch (...) {
+                    // Ignore invalid rerank_factor and keep default
                 }
             }
         }
     }
-    return false;
+    return found_embedding;
 }
 
 // Helper: Create shadow tables for vec0 storage
@@ -709,7 +909,9 @@ inline int vec0Create(sqlite3* db, void* pAux, int argc, const char* const* argv
 
     std::string embedding_col;
     size_t dims;
-    parse_vec0_schema(argc, argv, embedding_col, dims);
+    index::QuantizationType quant_type = index::QuantizationType::None;
+    size_t rerank_factor = 4;
+    parse_vec0_schema(argc, argv, embedding_col, dims, &quant_type, &rerank_factor);
 
     if (dims == 0 || dims > kMaxVec0Dimensions) {
         *pzErr = sqlite3_mprintf("vec0: dimensions must be in [1, %llu], got %llu",
@@ -728,6 +930,8 @@ inline int vec0Create(sqlite3* db, void* pAux, int argc, const char* const* argv
     table->table_name = argv[2];
     table->embedding_column = embedding_col;
     table->dimensions = dims;
+    table->quantization_type = quant_type;
+    table->quantized_rerank_factor = rerank_factor;
 
     // Create shadow tables for actual storage
     int rc = create_shadow_tables(db, argv[1], argv[2], embedding_col.c_str(), dims, pzErr);

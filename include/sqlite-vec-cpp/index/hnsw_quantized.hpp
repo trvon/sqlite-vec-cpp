@@ -56,6 +56,7 @@ public:
         QuantizationType quantization = QuantizationType::LVQ8;
         size_t rerank_factor = 2; ///< Multiplier: fetch rerank_factor * ef_search candidates
                                   ///< from quantized search, then rerank to ef_search
+        bool center_lvq = true;   ///< Mean-center LVQ8/LVQ4 vectors around dataset centroid
     };
 
     /// Construct with reference to existing HNSW index
@@ -79,10 +80,10 @@ public:
 
         switch (config_.quantization) {
             case QuantizationType::LVQ8:
-                lvq8_store_.build(snap);
+                lvq8_store_.build(snap, config_.center_lvq);
                 break;
             case QuantizationType::LVQ4:
-                lvq4_store_.build(snap);
+                lvq4_store_.build(snap, config_.center_lvq);
                 break;
             case QuantizationType::RaBitQ:
                 rabitq_store_.build(snap);
@@ -214,13 +215,15 @@ private:
     quantization::RaBitQStore rabitq_store_;
 
     /// Search using an LVQ store (LVQ-8 or LVQ-4)
-    /// Uses squared distances during beam search (monotonic with L2, avoids per-hop sqrt).
+    /// Pre-centers the query once (when mean-centered) and uses squared distances during beam search.
     template <typename StoreT>
     std::vector<std::pair<size_t, float>>
     search_with_store(const StoreT& store, std::span<const float> query, size_t k, size_t ef_search,
                       const FilterFn& filter, SearchStats* stats = nullptr) const {
-        auto approx_dist = [&store](std::span<const float> q, size_t dense_id) -> float {
-            return store.l2_distance_squared(q, dense_id);
+        auto query_state = store.prepare_query(query);
+        auto approx_dist = [&store, &query_state](std::span<const float> /*q*/,
+                                                  size_t dense_id) -> float {
+            return store.l2_distance_squared(query_state, dense_id);
         };
         auto prefetch_fn = [&store](size_t dense_id) { store.prefetch(dense_id); };
 

@@ -100,6 +100,34 @@ struct LVQ8 {
         return result;
     }
 
+    /// Quantize a float vector after subtracting a dataset centroid (mean-centered LVQ)
+    static LVQCode<uint8_t> encode_centered(std::span<const float> vec,
+                                            std::span<const float> centroid) {
+        assert(vec.size() == centroid.size());
+        alignas(32) float stack_buf[1536];
+        std::vector<float> heap_buf;
+        float* residual = stack_buf;
+        if (vec.size() > 1536) {
+            heap_buf.resize(vec.size());
+            residual = heap_buf.data();
+        }
+        for (size_t i = 0; i < vec.size(); ++i) {
+            residual[i] = vec[i] - centroid[i];
+        }
+        return encode(std::span<const float>(residual, vec.size()));
+    }
+
+    /// Decode a mean-centered quantized vector back to original space
+    static std::vector<float> decode_centered(const LVQCode<uint8_t>& code,
+                                              std::span<const float> centroid) {
+        assert(code.codes.size() == centroid.size());
+        std::vector<float> result(code.codes.size());
+        for (size_t i = 0; i < code.codes.size(); ++i) {
+            result[i] = static_cast<float>(code.codes[i]) * code.scale + code.offset + centroid[i];
+        }
+        return result;
+    }
+
     /// Estimate L2 distance between a float query and a quantized vector.
     ///
     /// Uses the identity:
@@ -354,6 +382,36 @@ struct LVQ4 {
                 c = (code.codes[i / 2] >> 4) & 0x0F;
             }
             result[i] = static_cast<float>(c) * code.scale + code.offset;
+        }
+        return result;
+    }
+
+    /// Quantize a float vector to 4-bit codes after subtracting a dataset centroid
+    static LVQCode<uint8_t> encode_centered(std::span<const float> vec,
+                                            std::span<const float> centroid) {
+        assert(vec.size() == centroid.size());
+        alignas(32) float stack_buf[1536];
+        std::vector<float> heap_buf;
+        float* residual = stack_buf;
+        if (vec.size() > 1536) {
+            heap_buf.resize(vec.size());
+            residual = heap_buf.data();
+        }
+        for (size_t i = 0; i < vec.size(); ++i) {
+            residual[i] = vec[i] - centroid[i];
+        }
+        return encode(std::span<const float>(residual, vec.size()));
+    }
+
+    /// Decode a mean-centered 4-bit quantized vector back to original space
+    static std::vector<float> decode_centered(const LVQCode<uint8_t>& code, size_t original_dim,
+                                              std::span<const float> centroid) {
+        assert(original_dim == centroid.size());
+        std::vector<float> result(original_dim);
+        for (size_t i = 0; i < original_dim; ++i) {
+            uint8_t c =
+                (i % 2 == 0) ? (code.codes[i / 2] & 0x0F) : ((code.codes[i / 2] >> 4) & 0x0F);
+            result[i] = static_cast<float>(c) * code.scale + code.offset + centroid[i];
         }
         return result;
     }
