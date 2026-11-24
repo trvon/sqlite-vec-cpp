@@ -49,6 +49,14 @@ namespace sqlite_vec_cpp::index {
 // Forward declaration for friend access
 template <concepts::VectorElement, typename> class HNSWQuantizedSearch;
 
+/// Optional search telemetry counters (zero overhead when nullptr is passed).
+struct SearchStats {
+    size_t hops = 0;              ///< Nodes expanded during graph traversal
+    size_t distance_evals = 0;    ///< Distance evaluations during graph traversal
+    size_t rerank_evals = 0;      ///< Exact distance evaluations during reranking
+    size_t filter_rejections = 0; ///< Candidates rejected by filter or soft-delete
+};
+
 /// Hierarchical Navigable Small World (HNSW) index for approximate nearest neighbor search
 /// Provides 100-1000x speedup over brute-force for large corpora (>100K vectors)
 ///
@@ -506,10 +514,12 @@ public:
     /// @param ef_search Exploration factor (higher = better recall, slower)
     /// @return Vector of (id, distance) pairs, sorted by distance
     using FilterFn = std::function<bool(size_t node_id)>;
+    using SearchStats = sqlite_vec_cpp::index::SearchStats;
 
     std::vector<std::pair<size_t, float>> search(std::span<const float> query, size_t k,
-                                                 size_t ef_search = 50) const {
-        return search_with_filter(query, k, ef_search, nullptr);
+                                                 size_t ef_search = 50,
+                                                 SearchStats* stats = nullptr) const {
+        return search_with_filter(query, k, ef_search, nullptr, stats);
     }
 
     /// Search with pre-filtering
@@ -517,11 +527,13 @@ public:
     /// @param k Number of neighbors to return
     /// @param ef_search Exploration factor (higher = better recall, slower)
     /// @param filter Optional filter function: returns true if node should be included
+    /// @param stats Optional search telemetry output (zero overhead when nullptr)
     /// @return Vector of (id, distance) pairs, sorted by distance
     std::vector<std::pair<size_t, float>> search_with_filter(std::span<const float> query, size_t k,
                                                              size_t ef_search,
-                                                             const FilterFn& filter) const {
-        return search_with_filter_impl<false>(query, k, ef_search, filter);
+                                                             const FilterFn& filter,
+                                                             SearchStats* stats = nullptr) const {
+        return search_with_filter_impl<false>(query, k, ef_search, filter, {}, stats);
     }
 
     /// Search optimized for read-mostly workloads.
@@ -529,48 +541,51 @@ public:
     /// neighbor vector copies. Do not use concurrently with unlocked bulk-build or
     /// single-threaded insert APIs that mutate graph edges without taking nodes_mutex_.
     std::vector<std::pair<size_t, float>> search_read_mostly(std::span<const float> query, size_t k,
-                                                             size_t ef_search = 50) const {
-        return search_read_mostly_with_filter(query, k, ef_search, nullptr);
+                                                             size_t ef_search = 50,
+                                                             SearchStats* stats = nullptr) const {
+        return search_read_mostly_with_filter(query, k, ef_search, nullptr, stats);
     }
 
     std::vector<std::pair<size_t, float>> search_phss_rerank(std::span<const float> query, size_t k,
                                                              size_t ef_search,
-                                                             const PhssRerankConfig& cfg) const {
-        return search_phss_rerank_with_filter(query, k, ef_search, cfg, nullptr);
+                                                             const PhssRerankConfig& cfg,
+                                                             SearchStats* stats = nullptr) const {
+        return search_phss_rerank_with_filter(query, k, ef_search, cfg, nullptr, {}, stats);
     }
 
     /// Read-mostly search with pre-filtering.
     std::vector<std::pair<size_t, float>>
     search_read_mostly_with_filter(std::span<const float> query, size_t k, size_t ef_search,
-                                   const FilterFn& filter) const {
-        return search_with_filter_impl<true>(query, k, ef_search, filter);
+                                   const FilterFn& filter, SearchStats* stats = nullptr) const {
+        return search_with_filter_impl<true>(query, k, ef_search, filter, {}, stats);
     }
 
     /// Read-mostly filtered search seeded from route-specific entry points. Entry points
     /// participate in the same bounded beam; they do not increase ef_search.
     std::vector<std::pair<size_t, float>> search_read_mostly_with_filter_from_entries(
         std::span<const float> query, size_t k, size_t ef_search, const FilterFn& filter,
-        std::span<const size_t> entry_points) const {
-        return search_with_filter_impl<true>(query, k, ef_search, filter, entry_points);
+        std::span<const size_t> entry_points, SearchStats* stats = nullptr) const {
+        return search_with_filter_impl<true>(query, k, ef_search, filter, entry_points, stats);
     }
 
     std::vector<std::pair<size_t, float>>
     search_phss_rerank_with_filter(std::span<const float> query, size_t k, size_t ef_search,
                                    const PhssRerankConfig& cfg, const FilterFn& filter,
-                                   std::span<const size_t> entry_points = {}) const {
+                                   std::span<const size_t> entry_points = {},
+                                   SearchStats* stats = nullptr) const {
         if (!cfg.enabled) {
             return entry_points.empty()
-                       ? search_read_mostly_with_filter(query, k, ef_search, filter)
+                       ? search_read_mostly_with_filter(query, k, ef_search, filter, stats)
                        : search_read_mostly_with_filter_from_entries(query, k, ef_search, filter,
-                                                                    entry_points);
+                                                                     entry_points, stats);
         }
 
         const size_t candidate_k = std::max(k, cfg.candidates);
-        auto approx_candidates = entry_points.empty()
-                                     ? search_read_mostly_with_filter(query, candidate_k, ef_search,
-                                                                    filter)
-                                     : search_read_mostly_with_filter_from_entries(
-                                           query, candidate_k, ef_search, filter, entry_points);
+        auto approx_candidates =
+            entry_points.empty()
+                ? search_read_mostly_with_filter(query, candidate_k, ef_search, filter, stats)
+                : search_read_mostly_with_filter_from_entries(query, candidate_k, ef_search, filter,
+                                                              entry_points, stats);
         if (approx_candidates.size() <= k) {
             return approx_candidates;
         }
@@ -622,6 +637,9 @@ public:
                 const auto* nj = candidate_nodes[j];
                 if (ni && nj) {
                     const float d = distance_nodes(*ni, *nj);
+                    if (stats) {
+                        ++stats->rerank_evals;
+                    }
                     sim = 1.0f / (1.0f + std::max(0.0f, d));
                 }
                 sims_tri[tri_index(i, j)] = sim;
@@ -1459,11 +1477,13 @@ private:
     }
 
     template <bool ReadMostly>
-    std::vector<std::pair<size_t, float>> search_with_filter_impl(std::span<const float> query,
-                                                                  size_t k, size_t ef_search,
-                                                                  const FilterFn& filter,
-                                                                  std::span<const size_t>
-                                                                      preferred_entries = {}) const {
+    std::vector<std::pair<size_t, float>> search_with_filter_impl(
+        std::span<const float> query, size_t k, size_t ef_search, const FilterFn& filter,
+        std::span<const size_t> preferred_entries = {}, SearchStats* stats = nullptr) const {
+        if (stats) {
+            *stats = {};
+        }
+
         std::vector<float> norm_query;
         std::span<const float> effective_query = query;
         if (config_.normalize_vectors) {
@@ -1489,12 +1509,12 @@ private:
         } else {
             for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > 0; --lc) {
                 current = greedy_search_layer_shared<ReadMostly>(effective_query, current, lc,
-                                                                 filter_ptr);
+                                                                 filter_ptr, stats);
             }
         }
 
-        auto candidates = beam_search_layer_shared<ReadMostly>(effective_query, current, ef_search,
-                                                               0, filter_ptr, additional_entries);
+        auto candidates = beam_search_layer_shared<ReadMostly>(
+            effective_query, current, ef_search, 0, filter_ptr, additional_entries, stats);
 
         if (candidates.size() > k) {
             candidates.resize(k);
@@ -1988,7 +2008,8 @@ private:
 
     template <bool ReadMostly>
     size_t greedy_search_layer_shared(std::span<const float> query, size_t entry_point,
-                                      size_t layer, const FilterFn* filter) const {
+                                      size_t layer, const FilterFn* filter,
+                                      SearchStats* stats = nullptr) const {
         // Small negative threshold to handle floating-point error in distance calculation
         const float kDistanceEpsilon =
             config_.clamp_negative_distances ? -1e-5f : std::numeric_limits<float>::lowest();
@@ -1998,6 +2019,9 @@ private:
         if (!initial_node)
             return current;
         float current_dist = comparable_distance_query_node(query, *initial_node);
+        if (stats) {
+            ++stats->distance_evals;
+        }
 
         const bool check_deleted = !deleted_ids_.empty();
         auto passes_filter = [&](size_t id) {
@@ -2015,6 +2039,9 @@ private:
             const auto* current_node = try_get_node(current);
             if (!current_node)
                 break;
+            if (stats) {
+                ++stats->hops;
+            }
 
             const auto& neighbors = search_neighbors<ReadMostly>(*current_node, layer);
 
@@ -2035,6 +2062,9 @@ private:
                 if (!neighbor_node)
                     continue;
                 float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
+                if (stats) {
+                    ++stats->distance_evals;
+                }
                 if (!(neighbor_dist >= kDistanceEpsilon && neighbor_dist < current_dist))
                     continue;
                 current = neighbor;
@@ -2073,7 +2103,8 @@ private:
     std::vector<std::pair<size_t, float>>
     beam_search_layer_shared(std::span<const float> query, size_t entry_point, size_t ef,
                              size_t layer, const FilterFn* filter,
-                             std::span<const size_t> additional_entry_points = {}) const {
+                             std::span<const size_t> additional_entry_points = {},
+                             SearchStats* stats = nullptr) const {
         auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
         std::vector<std::pair<float, size_t>> top_storage;
         top_storage.reserve(ef + 1);
@@ -2116,6 +2147,9 @@ private:
                 return;
             }
             const float distance = comparable_distance_query_node(query, *node);
+            if (stats) {
+                ++stats->distance_evals;
+            }
             if (distance < kDistanceEpsilon) {
                 return;
             }
@@ -2132,6 +2166,8 @@ private:
                 if (top_candidates.size() > ef) {
                     top_candidates.pop();
                 }
+            } else if (stats) {
+                ++stats->filter_rejections;
             }
         };
         add_entry_point(entry_point);
@@ -2153,6 +2189,9 @@ private:
             if (!exploration_bound.empty() && current_dist > exploration_bound.top().first &&
                 exploration_bound.size() >= ef) {
                 break;
+            }
+            if (stats) {
+                ++stats->hops;
             }
 
             // Get neighbors and filter out already-visited ones
@@ -2204,6 +2243,9 @@ private:
                 }
 
                 float neighbor_dist = comparable_distance_query_node(query, *neighbor_node);
+                if (stats) {
+                    ++stats->distance_evals;
+                }
                 if (neighbor_dist < kDistanceEpsilon)
                     continue;
 
@@ -2231,6 +2273,8 @@ private:
                             top_candidates.pop();
                         }
                     }
+                } else if (stats) {
+                    ++stats->filter_rejections;
                 }
             }
         }
@@ -2282,7 +2326,12 @@ private:
     std::vector<std::pair<size_t, float>>
     search_quantized_rerank(std::span<const float> query, size_t k, size_t ef_search,
                             size_t rerank_factor, ApproxDistFn&& approx_dist,
-                            PrefetchFn&& prefetch_fn, const FilterFn& filter = nullptr) const {
+                            PrefetchFn&& prefetch_fn, const FilterFn& filter = nullptr,
+                            SearchStats* stats = nullptr) const {
+        if (stats) {
+            *stats = {};
+        }
+
         std::vector<float> norm_query;
         std::span<const float> effective_query = query;
         if (config_.normalize_vectors) {
@@ -2304,12 +2353,13 @@ private:
         // Stage 1: Greedy descent through upper layers (cheap, use FP32)
         size_t current = entry_point_id_.load(std::memory_order_acquire);
         for (size_t lc = entry_point_layer_.load(std::memory_order_acquire); lc > 0; --lc) {
-            current = greedy_search_layer_shared<true>(effective_query, current, lc, filter_ptr);
+            current = greedy_search_layer_shared<true>(effective_query, current, lc, filter_ptr,
+                                                       stats);
         }
 
         // Stage 2: Beam search at layer 0 using quantized distances
         auto approx_candidates = beam_search_layer_quantized(
-            effective_query, current, expanded_ef, 0, filter_ptr, approx_dist, prefetch_fn);
+            effective_query, current, expanded_ef, 0, filter_ptr, approx_dist, prefetch_fn, stats);
 
         // Stage 3: Rerank with exact FP32 distances
         std::vector<std::pair<size_t, float>> reranked;
@@ -2320,6 +2370,9 @@ private:
             if (!node)
                 continue;
             float exact_dist = distance_query_node(effective_query, *node);
+            if (stats) {
+                ++stats->rerank_evals;
+            }
             reranked.emplace_back(id, exact_dist);
         }
 
@@ -2344,7 +2397,7 @@ private:
     std::vector<std::pair<size_t, float>>
     beam_search_layer_quantized(std::span<const float> query, size_t entry_point, size_t ef,
                                 size_t layer, const FilterFn* filter, ApproxDistFn&& approx_dist,
-                                PrefetchFn&& prefetch_fn) const {
+                                PrefetchFn&& prefetch_fn, SearchStats* stats = nullptr) const {
         auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
         std::priority_queue<std::pair<float, size_t>, std::vector<std::pair<float, size_t>>,
                             decltype(cmp)>
@@ -2369,6 +2422,9 @@ private:
             return {};
 
         float entry_dist = approx_dist(query, entry_dense);
+        if (stats) {
+            ++stats->distance_evals;
+        }
         candidates.emplace(entry_dist, entry_point);
         visited.visit(entry_dense);
 
@@ -2385,6 +2441,8 @@ private:
             exploration_bound.emplace(score, entry_point);
             if (passes_filter(entry_point)) {
                 top_candidates.emplace(score, entry_point);
+            } else if (stats) {
+                ++stats->filter_rejections;
             }
         }
 
@@ -2399,6 +2457,9 @@ private:
             if (!exploration_bound.empty() && current_dist > exploration_bound.top().first &&
                 exploration_bound.size() >= ef) {
                 break;
+            }
+            if (stats) {
+                ++stats->hops;
             }
 
             // Read-mostly: direct reference, no mutex, no copy
@@ -2447,6 +2508,9 @@ private:
                 }
 
                 float neighbor_dist = approx_dist(query, neighbor_dense);
+                if (stats) {
+                    ++stats->distance_evals;
+                }
                 if (neighbor_dist < kDistanceEpsilon)
                     continue;
 
@@ -2473,6 +2537,8 @@ private:
                             top_candidates.pop();
                         }
                     }
+                } else if (stats) {
+                    ++stats->filter_rejections;
                 }
             }
         }

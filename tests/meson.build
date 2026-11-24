@@ -127,3 +127,16 @@ test_overflow = executable(
   cpp_args: test_cpp_args + ['-DSQLITE_VEC_CPP_ENABLED'],
 )
 test('vec0 Overflow & Validation', test_overflow, timeout: 120)
+
+test_invariants = executable(
+  'test_invariants',
+  'test_invariants.cpp',
+  include_directories: inc_dirs,
+  sources: [
+    'test_invariants.cpp',
+    '../src/sqlite_vec_c_api.cpp',
+  ],
+  dependencies: [sqlite3_dep],
+  cpp_args: test_cpp_args + ['-DSQLITE_VEC_CPP_ENABLED'],
+)
+test('Invariants, SIMD Parity, SearchStats & Incremental vec0', test_invariants, timeout: 120)
