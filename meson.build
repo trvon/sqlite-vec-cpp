@@ -319,6 +319,7 @@ install_headers(
   [
     'include/sqlite-vec-cpp/simd/avx.hpp',
     'include/sqlite-vec-cpp/simd/neon.hpp',
+    'include/sqlite-vec-cpp/simd/x86_dispatch.hpp',
   ],
   subdir: 'sqlite-vec-cpp/simd',
 )

@@ -33,9 +33,11 @@
 ///   FP32 rerank for final top-K
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <span>
@@ -52,39 +54,87 @@ inline constexpr float kRaBitQEpsilon = 1e-12f;
 
 namespace detail {
 
-inline constexpr uint8_t kPopcountTable[256] = {
-    0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4,
-    5, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5,
-    5, 6, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4,
-    5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6,
-    5, 6, 6, 7, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4,
-    5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5,
-    5, 6, 5, 6, 6, 7, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4,
-    5, 5, 6, 5, 6, 6, 7, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7,
-    5, 6, 6, 7, 6, 7, 7, 8};
-
-inline uint32_t popcount_scalar(const uint8_t* a, size_t num_bytes) {
+inline uint32_t popcount_u64(const uint8_t* a, size_t num_bytes) noexcept {
     uint32_t count = 0;
-    for (size_t i = 0; i < num_bytes; ++i) {
-        count += kPopcountTable[a[i]];
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= num_bytes; i += sizeof(uint64_t)) {
+        uint64_t word = 0;
+        std::memcpy(&word, a + i, sizeof(word));
+        count += static_cast<uint32_t>(std::popcount(word));
+    }
+    for (; i < num_bytes; ++i) {
+        count += static_cast<uint32_t>(std::popcount(static_cast<unsigned int>(a[i])));
     }
     return count;
 }
 
-inline uint32_t and_popcount_scalar(const uint8_t* a, const uint8_t* b, size_t num_bytes) {
+inline uint32_t and_popcount_u64(const uint8_t* a, const uint8_t* b, size_t num_bytes) noexcept {
     uint32_t count = 0;
-    for (size_t i = 0; i < num_bytes; ++i) {
-        count += kPopcountTable[a[i] & b[i]];
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= num_bytes; i += sizeof(uint64_t)) {
+        uint64_t wa = 0;
+        uint64_t wb = 0;
+        std::memcpy(&wa, a + i, sizeof(wa));
+        std::memcpy(&wb, b + i, sizeof(wb));
+        count += static_cast<uint32_t>(std::popcount(wa & wb));
+    }
+    for (; i < num_bytes; ++i) {
+        count += static_cast<uint32_t>(std::popcount(static_cast<unsigned int>(a[i] & b[i])));
     }
     return count;
 }
 
-inline uint32_t xor_popcount_scalar(const uint8_t* a, const uint8_t* b, size_t num_bytes) {
+inline uint32_t xor_popcount_u64(const uint8_t* a, const uint8_t* b, size_t num_bytes) noexcept {
     uint32_t count = 0;
-    for (size_t i = 0; i < num_bytes; ++i) {
-        count += kPopcountTable[a[i] ^ b[i]];
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= num_bytes; i += sizeof(uint64_t)) {
+        uint64_t wa = 0;
+        uint64_t wb = 0;
+        std::memcpy(&wa, a + i, sizeof(wa));
+        std::memcpy(&wb, b + i, sizeof(wb));
+        count += static_cast<uint32_t>(std::popcount(wa ^ wb));
+    }
+    for (; i < num_bytes; ++i) {
+        count += static_cast<uint32_t>(std::popcount(static_cast<unsigned int>(a[i] ^ b[i])));
     }
     return count;
+}
+
+/// Fused single-pass weighted 4-plane AND-popcount:
+///   sum_{j=0..3} (1 << j) * popcount(code & plane[j])
+/// Loads each code word once instead of scanning `code` 4 separate times.
+inline uint64_t and_popcount_4planes_u64(const uint8_t* code, const uint8_t* p0, const uint8_t* p1,
+                                         const uint8_t* p2, const uint8_t* p3,
+                                         size_t num_bytes) noexcept {
+    uint64_t s0 = 0;
+    uint64_t s1 = 0;
+    uint64_t s2 = 0;
+    uint64_t s3 = 0;
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= num_bytes; i += sizeof(uint64_t)) {
+        uint64_t c = 0;
+        uint64_t q0 = 0;
+        uint64_t q1 = 0;
+        uint64_t q2 = 0;
+        uint64_t q3 = 0;
+        std::memcpy(&c, code + i, sizeof(c));
+        std::memcpy(&q0, p0 + i, sizeof(q0));
+        std::memcpy(&q1, p1 + i, sizeof(q1));
+        std::memcpy(&q2, p2 + i, sizeof(q2));
+        std::memcpy(&q3, p3 + i, sizeof(q3));
+        s0 += static_cast<uint64_t>(std::popcount(c & q0));
+        s1 += static_cast<uint64_t>(std::popcount(c & q1));
+        s2 += static_cast<uint64_t>(std::popcount(c & q2));
+        s3 += static_cast<uint64_t>(std::popcount(c & q3));
+    }
+    for (; i < num_bytes; ++i) {
+        const unsigned int c = code[i];
+        s0 += static_cast<uint64_t>(std::popcount(c & static_cast<unsigned int>(p0[i])));
+        s1 += static_cast<uint64_t>(std::popcount(c & static_cast<unsigned int>(p1[i])));
+        s2 += static_cast<uint64_t>(std::popcount(c & static_cast<unsigned int>(p2[i])));
+        s3 += static_cast<uint64_t>(std::popcount(c & static_cast<unsigned int>(p3[i])));
+    }
+    return s0 + (s1 << 1) + (s2 << 2) + (s3 << 3);
 }
 
 #ifdef SQLITE_VEC_ENABLE_NEON
@@ -111,9 +161,8 @@ inline uint32_t popcount_neon(const uint8_t* a, size_t num_bytes) {
         }
     }
     total += reduce_u8x16(acc);
-    while (i < num_bytes) {
-        total += kPopcountTable[a[i]];
-        ++i;
+    if (i < num_bytes) {
+        total += popcount_u64(a + i, num_bytes - i);
     }
     return total;
 }
@@ -134,9 +183,8 @@ inline uint32_t and_popcount_neon(const uint8_t* a, const uint8_t* b, size_t num
         }
     }
     total += reduce_u8x16(acc);
-    while (i < num_bytes) {
-        total += kPopcountTable[a[i] & b[i]];
-        ++i;
+    if (i < num_bytes) {
+        total += and_popcount_u64(a + i, b + i, num_bytes - i);
     }
     return total;
 }
@@ -157,39 +205,96 @@ inline uint32_t xor_popcount_neon(const uint8_t* a, const uint8_t* b, size_t num
         }
     }
     total += reduce_u8x16(acc);
-    while (i < num_bytes) {
-        total += kPopcountTable[a[i] ^ b[i]];
-        ++i;
+    if (i < num_bytes) {
+        total += xor_popcount_u64(a + i, b + i, num_bytes - i);
+    }
+    return total;
+}
+
+inline uint64_t and_popcount_4planes_neon(const uint8_t* code, const uint8_t* p0, const uint8_t* p1,
+                                          const uint8_t* p2, const uint8_t* p3,
+                                          size_t num_bytes) noexcept {
+    uint64_t s0 = 0;
+    uint64_t s1 = 0;
+    uint64_t s2 = 0;
+    uint64_t s3 = 0;
+    size_t i = 0;
+    const size_t end16 = (num_bytes / 16) * 16;
+    uint8x16_t acc0 = vdupq_n_u8(0);
+    uint8x16_t acc1 = vdupq_n_u8(0);
+    uint8x16_t acc2 = vdupq_n_u8(0);
+    uint8x16_t acc3 = vdupq_n_u8(0);
+    size_t iters = 0;
+    while (i < end16) {
+        const uint8x16_t c = vld1q_u8(code + i);
+        acc0 = vaddq_u8(acc0, vcntq_u8(vandq_u8(c, vld1q_u8(p0 + i))));
+        acc1 = vaddq_u8(acc1, vcntq_u8(vandq_u8(c, vld1q_u8(p1 + i))));
+        acc2 = vaddq_u8(acc2, vcntq_u8(vandq_u8(c, vld1q_u8(p2 + i))));
+        acc3 = vaddq_u8(acc3, vcntq_u8(vandq_u8(c, vld1q_u8(p3 + i))));
+        i += 16;
+        if (++iters == 31) {
+            s0 += reduce_u8x16(acc0);
+            s1 += reduce_u8x16(acc1);
+            s2 += reduce_u8x16(acc2);
+            s3 += reduce_u8x16(acc3);
+            acc0 = vdupq_n_u8(0);
+            acc1 = vdupq_n_u8(0);
+            acc2 = vdupq_n_u8(0);
+            acc3 = vdupq_n_u8(0);
+            iters = 0;
+        }
+    }
+    s0 += reduce_u8x16(acc0);
+    s1 += reduce_u8x16(acc1);
+    s2 += reduce_u8x16(acc2);
+    s3 += reduce_u8x16(acc3);
+    uint64_t total = s0 + (s1 << 1) + (s2 << 2) + (s3 << 3);
+    if (i < num_bytes) {
+        total += and_popcount_4planes_u64(code + i, p0 + i, p1 + i, p2 + i, p3 + i, num_bytes - i);
     }
     return total;
 }
 #endif
 
-inline uint32_t popcount_bytes(const uint8_t* a, size_t num_bytes) {
+inline uint32_t popcount_bytes(const uint8_t* a, size_t num_bytes) noexcept {
 #ifdef SQLITE_VEC_ENABLE_NEON
     if (num_bytes >= 16) {
         return popcount_neon(a, num_bytes);
     }
 #endif
-    return popcount_scalar(a, num_bytes);
+    return popcount_u64(a, num_bytes);
 }
 
-inline uint32_t and_popcount_bytes(const uint8_t* a, const uint8_t* b, size_t num_bytes) {
+inline uint32_t and_popcount_bytes(const uint8_t* a, const uint8_t* b, size_t num_bytes) noexcept {
 #ifdef SQLITE_VEC_ENABLE_NEON
     if (num_bytes >= 16) {
         return and_popcount_neon(a, b, num_bytes);
     }
 #endif
-    return and_popcount_scalar(a, b, num_bytes);
+    return and_popcount_u64(a, b, num_bytes);
 }
 
-inline uint32_t xor_popcount_bytes(const uint8_t* a, const uint8_t* b, size_t num_bytes) {
+inline uint32_t xor_popcount_bytes(const uint8_t* a, const uint8_t* b, size_t num_bytes) noexcept {
 #ifdef SQLITE_VEC_ENABLE_NEON
     if (num_bytes >= 16) {
         return xor_popcount_neon(a, b, num_bytes);
     }
 #endif
-    return xor_popcount_scalar(a, b, num_bytes);
+    return xor_popcount_u64(a, b, num_bytes);
+}
+
+inline uint64_t and_popcount_4planes(const uint8_t* code, const uint8_t* planes,
+                                     size_t plane_bytes) noexcept {
+    const uint8_t* p0 = planes;
+    const uint8_t* p1 = planes + plane_bytes;
+    const uint8_t* p2 = planes + 2 * plane_bytes;
+    const uint8_t* p3 = planes + 3 * plane_bytes;
+#ifdef SQLITE_VEC_ENABLE_NEON
+    if (plane_bytes >= 16) {
+        return and_popcount_4planes_neon(code, p0, p1, p2, p3, plane_bytes);
+    }
+#endif
+    return and_popcount_4planes_u64(code, p0, p1, p2, p3, plane_bytes);
 }
 
 } // namespace detail
@@ -273,6 +378,7 @@ struct RaBitQCode {
     float norm = 0.0f;         ///< L2 norm of the original vector
     float dist_to_centroid = 0.0f; ///< ||v - c||, used in the distance identity
     float ip_quant = 1.0f;     ///< <x_bar, o_rot>, the per-vector correction factor
+    uint16_t code_popcount = 0; ///< Precomputed popcount(bits)
 
     /// Number of packed bytes
     [[nodiscard]] size_t byte_size() const { return bits.size(); }
@@ -348,12 +454,15 @@ public:
         rotation_.apply(std::span<const float>(residual), std::span<float>(rotated));
 
         float abs_sum = 0.0f;
+        uint32_t pc = 0;
         for (size_t i = 0; i < padded; ++i) {
             abs_sum += std::abs(rotated[i]);
             if (rotated[i] >= 0.0f) {
                 code.bits[i / 8] |= (1u << (i % 8));
+                ++pc;
             }
         }
+        code.code_popcount = static_cast<uint16_t>(std::min<uint32_t>(pc, 65535u));
         code.ip_quant = std::max(abs_sum * rotation_.inv_sqrt_padded(), kRaBitQEpsilon);
 
         return code;
@@ -455,12 +564,8 @@ public:
         const size_t nb = query.plane_bytes;
         const uint8_t* bits = code.bits.data();
 
-        const uint32_t pc = detail::popcount_bytes(bits, nb);
-        uint64_t su = 0;
-        for (size_t j = 0; j < 4; ++j) {
-            su += static_cast<uint64_t>(1u << j) *
-                  detail::and_popcount_bytes(bits, query.planes.data() + j * nb, nb);
-        }
+        const uint32_t pc = code.code_popcount;
+        const uint64_t su = detail::and_popcount_4planes(bits, query.planes.data(), nb);
 
         const float sum_selected =
             query.vl * static_cast<float>(pc) + query.delta * static_cast<float>(su);

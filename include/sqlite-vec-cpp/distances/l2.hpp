@@ -72,6 +72,11 @@ float l2_squared_distance(std::span<const T> a, std::span<const T> b) {
             return simd::l2_squared_distance_float_neon(a, b);
         }
 #endif
+#ifdef SQLITE_VEC_X86_RUNTIME_DISPATCH
+        if (a.size() >= 8 && x86::cpu_has_avx2_fma()) {
+            return x86::l2_squared_avx2(a.data(), b.data(), a.size());
+        }
+#endif
         return l2_squared_distance_float(a, b);
     } else if constexpr (std::is_same_v<T, std::int8_t>) {
         return l2_squared_distance_int(a, b);

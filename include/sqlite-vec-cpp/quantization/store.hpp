@@ -19,8 +19,13 @@
 #include <vector>
 
 #include "../index/quantization_snapshot.hpp"
+#include "../simd/x86_dispatch.hpp"
 #include "lvq.hpp"
 #include "rabitq.hpp"
+
+#ifdef SQLITE_VEC_ENABLE_AVX2
+#include <immintrin.h>
+#endif
 
 namespace sqlite_vec_cpp::quantization {
 
@@ -30,6 +35,8 @@ struct LVQ8Store {
     std::vector<uint8_t> codes;
     /// Per-vector scale factors: scales[dense_id]
     std::vector<float> scales;
+    /// Precomputed 1.0f / scales[dense_id] (0.0f when scale == 0.0f)
+    std::vector<float> inv_scales;
     /// Per-vector offsets: offsets[dense_id]
     std::vector<float> offsets;
     /// Dimensionality
@@ -50,6 +57,7 @@ struct LVQ8Store {
         count = max_dense_id + 1;
         codes.resize(count * dim, 0);
         scales.resize(count, 0.0f);
+        inv_scales.resize(count, 0.0f);
         offsets.resize(count, 0.0f);
 
         for (const auto& e : snap.entries) {
@@ -57,12 +65,13 @@ struct LVQ8Store {
             size_t offset = e.dense_id * dim;
             std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
             scales[e.dense_id] = code.scale;
+            inv_scales[e.dense_id] = code.scale > 0.0f ? (1.0f / code.scale) : 0.0f;
             offsets[e.dense_id] = code.offset;
         }
     }
 
-    /// Estimate L2 distance between float query and quantized vector at dense_id
-    [[nodiscard]] float l2_distance(std::span<const float> query, size_t dense_id) const {
+    /// Estimate squared L2 distance between float query and quantized vector at dense_id
+    [[nodiscard]] float l2_distance_squared(std::span<const float> query, size_t dense_id) const {
         assert(dense_id < count);
         assert(query.size() == dim);
 
@@ -76,12 +85,18 @@ struct LVQ8Store {
                 float diff = query[i] - offset;
                 sum += diff * diff;
             }
-            return std::sqrt(sum);
+            return sum;
         }
 
-        const float inv_scale = 1.0f / scale;
+        const float inv_scale =
+            (dense_id < inv_scales.size()) ? inv_scales[dense_id] : (1.0f / scale);
         float sum_sq = l2_sq_impl(query.data(), code_ptr, dim, inv_scale, offset);
-        return std::sqrt(sum_sq * scale * scale);
+        return sum_sq * scale * scale;
+    }
+
+    /// Estimate L2 distance between float query and quantized vector at dense_id
+    [[nodiscard]] float l2_distance(std::span<const float> query, size_t dense_id) const {
+        return std::sqrt(l2_distance_squared(query, dense_id));
     }
 
     /// Prefetch the quantized code for a given dense_id into L1 cache
@@ -96,19 +111,94 @@ struct LVQ8Store {
 
     /// Memory usage in bytes
     [[nodiscard]] size_t memory_bytes() const {
-        return codes.size() + scales.size() * sizeof(float) + offsets.size() * sizeof(float);
+        return codes.size() + scales.size() * sizeof(float) + inv_scales.size() * sizeof(float) +
+               offsets.size() * sizeof(float);
     }
 
 private:
     static float l2_sq_impl(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
                             float offset) {
+#ifdef SQLITE_VEC_ENABLE_AVX2
+        if (dim >= 8) {
+            return l2_sq_avx2(query, codes, dim, inv_scale, offset);
+        }
+#endif
 #ifdef SQLITE_VEC_ENABLE_NEON
         if (dim >= 16) {
             return l2_sq_neon(query, codes, dim, inv_scale, offset);
         }
 #endif
+#ifdef SQLITE_VEC_X86_RUNTIME_DISPATCH
+        if (dim >= 8 && distances::x86::cpu_has_avx2_fma()) {
+            return distances::x86::lvq8_l2_sq_avx2(query, codes, dim, inv_scale, offset);
+        }
+#endif
         return l2_sq_scalar(query, codes, dim, inv_scale, offset);
     }
+
+#ifdef SQLITE_VEC_ENABLE_AVX2
+    static float hsum256(__m256 v) noexcept {
+        __m128 lo = _mm256_castps256_ps128(v);
+        const __m128 hi = _mm256_extractf128_ps(v, 1);
+        lo = _mm_add_ps(lo, hi);
+        __m128 shuf = _mm_movehdup_ps(lo);
+        __m128 sums = _mm_add_ps(lo, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        return _mm_cvtss_f32(sums);
+    }
+
+    static float l2_sq_avx2(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
+                            float offset) {
+        const __m256 voffset = _mm256_set1_ps(offset);
+        const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
+        __m256 sum0 = _mm256_setzero_ps();
+        __m256 sum1 = _mm256_setzero_ps();
+
+        size_t i = 0;
+        for (; i + 16 <= dim; i += 16) {
+            const __m128i bytes0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes + i));
+            const __m128i bytes1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes + i + 8));
+            const __m256 c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes0));
+            const __m256 c1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes1));
+
+            const __m256 q0 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i), voffset),
+                                            vinv_scale);
+            const __m256 q1 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i + 8), voffset),
+                                            vinv_scale);
+
+            const __m256 d0 = _mm256_sub_ps(q0, c0);
+            const __m256 d1 = _mm256_sub_ps(q1, c1);
+#ifdef SQLITE_VEC_ENABLE_FMA
+            sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+            sum1 = _mm256_fmadd_ps(d1, d1, sum1);
+#else
+            sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(d0, d0));
+            sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(d1, d1));
+#endif
+        }
+        for (; i + 8 <= dim; i += 8) {
+            const __m128i bytes0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes + i));
+            const __m256 c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes0));
+            const __m256 q0 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i), voffset),
+                                            vinv_scale);
+            const __m256 d0 = _mm256_sub_ps(q0, c0);
+#ifdef SQLITE_VEC_ENABLE_FMA
+            sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+#else
+            sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(d0, d0));
+#endif
+        }
+
+        float sum = hsum256(_mm256_add_ps(sum0, sum1));
+        for (; i < dim; ++i) {
+            const float q_normalized = (query[i] - offset) * inv_scale;
+            const float diff = q_normalized - static_cast<float>(codes[i]);
+            sum += diff * diff;
+        }
+        return sum;
+    }
+#endif
 
     static float l2_sq_scalar(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
                               float offset) {
@@ -185,6 +275,8 @@ struct LVQ4Store {
     std::vector<uint8_t> codes;
     /// Per-vector scale factors
     std::vector<float> scales;
+    /// Precomputed 1.0f / scales[dense_id] (0.0f when scale == 0.0f)
+    std::vector<float> inv_scales;
     /// Per-vector offsets
     std::vector<float> offsets;
     /// Dimensionality
@@ -208,6 +300,7 @@ struct LVQ4Store {
         count = max_dense_id + 1;
         codes.resize(count * bytes_per_vec, 0);
         scales.resize(count, 0.0f);
+        inv_scales.resize(count, 0.0f);
         offsets.resize(count, 0.0f);
 
         for (const auto& e : snap.entries) {
@@ -215,12 +308,13 @@ struct LVQ4Store {
             size_t offset = e.dense_id * bytes_per_vec;
             std::copy(code.codes.begin(), code.codes.end(), codes.begin() + offset);
             scales[e.dense_id] = code.scale;
+            inv_scales[e.dense_id] = code.scale > 0.0f ? (1.0f / code.scale) : 0.0f;
             offsets[e.dense_id] = code.offset;
         }
     }
 
-    /// Estimate L2 distance between float query and quantized vector at dense_id
-    [[nodiscard]] float l2_distance(std::span<const float> query, size_t dense_id) const {
+    /// Estimate squared L2 distance between float query and quantized vector at dense_id
+    [[nodiscard]] float l2_distance_squared(std::span<const float> query, size_t dense_id) const {
         assert(dense_id < count);
         assert(query.size() == dim);
 
@@ -234,12 +328,18 @@ struct LVQ4Store {
                 float diff = query[i] - offset;
                 sum += diff * diff;
             }
-            return std::sqrt(sum);
+            return sum;
         }
 
-        const float inv_scale = 1.0f / scale;
+        const float inv_scale =
+            (dense_id < inv_scales.size()) ? inv_scales[dense_id] : (1.0f / scale);
         float sum_sq = l2_sq_impl(query.data(), code_ptr, dim, inv_scale, offset);
-        return std::sqrt(sum_sq * scale * scale);
+        return sum_sq * scale * scale;
+    }
+
+    /// Estimate L2 distance between float query and quantized vector at dense_id
+    [[nodiscard]] float l2_distance(std::span<const float> query, size_t dense_id) const {
+        return std::sqrt(l2_distance_squared(query, dense_id));
     }
 
     /// Prefetch the quantized code for a given dense_id into L1 cache
@@ -254,19 +354,88 @@ struct LVQ4Store {
 
     /// Memory usage in bytes
     [[nodiscard]] size_t memory_bytes() const {
-        return codes.size() + scales.size() * sizeof(float) + offsets.size() * sizeof(float);
+        return codes.size() + scales.size() * sizeof(float) + inv_scales.size() * sizeof(float) +
+               offsets.size() * sizeof(float);
     }
 
 private:
     static float l2_sq_impl(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
                             float offset) {
+#ifdef SQLITE_VEC_ENABLE_AVX2
+        if (dim >= 16) {
+            return l2_sq_avx2(query, codes, dim, inv_scale, offset);
+        }
+#endif
 #ifdef SQLITE_VEC_ENABLE_NEON
         if (dim >= 32) {
             return l2_sq_neon(query, codes, dim, inv_scale, offset);
         }
 #endif
+#ifdef SQLITE_VEC_X86_RUNTIME_DISPATCH
+        if (dim >= 16 && distances::x86::cpu_has_avx2_fma()) {
+            return distances::x86::lvq4_l2_sq_avx2(query, codes, dim, inv_scale, offset);
+        }
+#endif
         return l2_sq_scalar(query, codes, dim, inv_scale, offset);
     }
+
+#ifdef SQLITE_VEC_ENABLE_AVX2
+    static float hsum256(__m256 v) noexcept {
+        __m128 lo = _mm256_castps256_ps128(v);
+        const __m128 hi = _mm256_extractf128_ps(v, 1);
+        lo = _mm_add_ps(lo, hi);
+        __m128 shuf = _mm_movehdup_ps(lo);
+        __m128 sums = _mm_add_ps(lo, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        return _mm_cvtss_f32(sums);
+    }
+
+    static float l2_sq_avx2(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
+                            float offset) {
+        const __m256 voffset = _mm256_set1_ps(offset);
+        const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
+        const __m128i mask_0f = _mm_set1_epi8(0x0F);
+        __m256 sum0 = _mm256_setzero_ps();
+        __m256 sum1 = _mm256_setzero_ps();
+
+        size_t i = 0;
+        for (; i + 16 <= dim; i += 16) {
+            const __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes + i / 2));
+            const __m128i lo = _mm_and_si128(packed, mask_0f);
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_0f);
+            const __m128i unpacked = _mm_unpacklo_epi8(lo, hi);
+
+            const __m256 c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(unpacked));
+            const __m256 c1 =
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(unpacked, 8)));
+
+            const __m256 q0 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i), voffset),
+                                            vinv_scale);
+            const __m256 q1 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(query + i + 8), voffset),
+                                            vinv_scale);
+
+            const __m256 d0 = _mm256_sub_ps(q0, c0);
+            const __m256 d1 = _mm256_sub_ps(q1, c1);
+#ifdef SQLITE_VEC_ENABLE_FMA
+            sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+            sum1 = _mm256_fmadd_ps(d1, d1, sum1);
+#else
+            sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(d0, d0));
+            sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(d1, d1));
+#endif
+        }
+
+        float sum = hsum256(_mm256_add_ps(sum0, sum1));
+        for (; i < dim; ++i) {
+            const uint8_t c = (i % 2 == 0) ? (codes[i / 2] & 0x0F) : ((codes[i / 2] >> 4) & 0x0F);
+            const float q_normalized = (query[i] - offset) * inv_scale;
+            const float diff = q_normalized - static_cast<float>(c);
+            sum += diff * diff;
+        }
+        return sum;
+    }
+#endif
 
     static float l2_sq_scalar(const float* query, const uint8_t* codes, size_t dim, float inv_scale,
                               float offset) {
@@ -382,6 +551,8 @@ struct RaBitQStore {
     std::vector<float> dist_to_centroid;
     /// Per-vector correction factor <x_bar, o_rot>
     std::vector<float> ip_quant;
+    /// Precomputed popcount of each packed binary code
+    std::vector<uint16_t> code_popcount;
     /// Dataset centroid
     std::vector<float> centroid;
     /// Bytes per vector (padded_dim / 8)
@@ -418,6 +589,7 @@ struct RaBitQStore {
         bits.assign(count * bytes_per_vec, 0);
         dist_to_centroid.assign(count, 0.0f);
         ip_quant.assign(count, 1.0f);
+        code_popcount.assign(count, 0);
 
         std::vector<float> residual(dim);
         std::vector<float> rotated(padded);
@@ -442,12 +614,15 @@ struct RaBitQStore {
 
             uint8_t* code_ptr = bits.data() + e.dense_id * bytes_per_vec;
             float abs_sum = 0.0f;
+            uint32_t pc = 0;
             for (size_t i = 0; i < padded; ++i) {
                 abs_sum += std::abs(rotated[i]);
                 if (rotated[i] >= 0.0f) {
                     code_ptr[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+                    ++pc;
                 }
             }
+            code_popcount[e.dense_id] = static_cast<uint16_t>(std::min<uint32_t>(pc, 65535u));
             ip_quant[e.dense_id] =
                 std::max(abs_sum * rotation_->inv_sqrt_padded(), kRaBitQEpsilon);
         }
@@ -518,25 +693,23 @@ struct RaBitQStore {
         return state;
     }
 
-    /// Estimate L2 distance using precomputed query state
-    [[nodiscard]] float l2_distance(const QueryState& qs, size_t dense_id) const {
+    /// Estimate squared L2 distance using precomputed query state
+    [[nodiscard]] float l2_distance_squared(const QueryState& qs, size_t dense_id) const {
         assert(dense_id < count);
 
         const float qd = qs.dist_to_centroid;
         const float cd = dist_to_centroid[dense_id];
         if (qd <= 0.0f || cd <= 0.0f) {
-            return std::sqrt(std::max(0.0f, qd * qd + cd * cd));
+            return std::max(0.0f, qd * qd + cd * cd);
         }
 
         const uint8_t* code_ptr = bits.data() + dense_id * bytes_per_vec;
         const size_t nb = qs.plane_bytes;
 
-        const uint32_t pc = detail::popcount_bytes(code_ptr, nb);
-        uint64_t su = 0;
-        for (size_t j = 0; j < 4; ++j) {
-            su += static_cast<uint64_t>(1u << j) *
-                  detail::and_popcount_bytes(code_ptr, qs.planes.data() + j * nb, nb);
-        }
+        const uint32_t pc = (dense_id < code_popcount.size())
+                                ? static_cast<uint32_t>(code_popcount[dense_id])
+                                : detail::popcount_bytes(code_ptr, nb);
+        const uint64_t su = detail::and_popcount_4planes(code_ptr, qs.planes.data(), nb);
 
         const float sum_selected =
             qs.vl * static_cast<float>(pc) + qs.delta * static_cast<float>(su);
@@ -545,7 +718,12 @@ struct RaBitQStore {
         const float est = std::clamp(ip_xq / ip_quant[dense_id], -1.0f, 1.0f);
 
         const float dist_sq = qd * qd + cd * cd - 2.0f * qd * cd * est;
-        return std::sqrt(std::max(0.0f, dist_sq));
+        return std::max(0.0f, dist_sq);
+    }
+
+    /// Estimate L2 distance using precomputed query state
+    [[nodiscard]] float l2_distance(const QueryState& qs, size_t dense_id) const {
+        return std::sqrt(l2_distance_squared(qs, dense_id));
     }
 
     /// Prefetch bits for a given dense_id
@@ -561,7 +739,8 @@ struct RaBitQStore {
     /// Memory usage in bytes
     [[nodiscard]] size_t memory_bytes() const {
         return bits.size() + dist_to_centroid.size() * sizeof(float) +
-               ip_quant.size() * sizeof(float) + centroid.size() * sizeof(float) +
+               ip_quant.size() * sizeof(float) + code_popcount.size() * sizeof(uint16_t) +
+               centroid.size() * sizeof(float) +
                (rotation_ ? rotation_->memory_bytes() : 0);
     }
 
